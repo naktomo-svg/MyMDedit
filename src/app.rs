@@ -915,16 +915,15 @@ impl App {
     }
 
     /// The single place a settings write's failure becomes visible to the user.
-    fn persist_settings(&self, settings: AppSettings) {
-        let ok = self.state.borrow_mut().settings.save(settings);
+    fn persist_settings(&self, change: impl FnOnce(&mut AppSettings)) {
+        let ok = self.state.borrow_mut().settings.update(change);
         if !ok {
             self.report_error("SettingsStore.save", "設定を保存できませんでした。この変更は次回の起動時には元に戻ります。", None);
         }
     }
 
     pub fn update_custom_colors(&self, colors: Vec<String>) {
-        let current = self.current_settings();
-        self.persist_settings(AppSettings { custom_colors: colors, ..current });
+        self.persist_settings(|s| s.custom_colors = colors);
     }
 
     fn open_settings(&self) {
@@ -946,8 +945,7 @@ impl App {
         );
         let Some(edits) = edits else { return };
         // Applied onto the settings as of now, not as of when the dialog opened.
-        let updated = edits.apply(&self.current_settings());
-        self.persist_settings(updated);
+        self.persist_settings(|s| *s = edits.apply(s));
         self.apply_theme();
         self.apply_editor_font();
         self.rerender();
@@ -960,16 +958,16 @@ impl App {
         if folder.is_empty() {
             return;
         }
-        let current = self.current_settings();
-        let recent_folders = settings::add_recent_folder(&current.recent_folders, &folder);
-        self.persist_settings(AppSettings { recent_folders, ..current });
+        let current = self.current_settings().recent_folders;
+        if settings::add_recent_folder(&current, &folder) == current {
+            return; // Saving the same file again changes nothing worth a settings write.
+        }
+        self.persist_settings(|s| s.recent_folders = settings::add_recent_folder(&s.recent_folders, &folder));
         self.rebuild_recent_menu();
     }
 
     fn remove_recent_folder(&self, folder: &str) {
-        let current = self.current_settings();
-        let recent_folders = settings::remove_recent_folder(&current.recent_folders, folder);
-        self.persist_settings(AppSettings { recent_folders, ..current });
+        self.persist_settings(|s| s.recent_folders = settings::remove_recent_folder(&s.recent_folders, folder));
         self.rebuild_recent_menu();
     }
 

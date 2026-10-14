@@ -8,6 +8,10 @@
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+use windows::Win32::Foundation::{CloseHandle, HANDLE};
+use windows::Win32::Globalization::{CSTR_EQUAL, CompareStringOrdinal};
+use windows::Win32::System::Threading::{CreateMutexW, ReleaseMutex, WaitForSingleObject};
+use windows::core::w;
 
 use crate::document::{self, DocumentFormat};
 use crate::line_endings::LineEnding;
@@ -92,7 +96,7 @@ impl AppSettings {
 /// Puts `folder` first, dropping a case-insensitive duplicate and anything past the cap.
 pub fn add_recent_folder(current: &[String], folder: &str) -> Vec<String> {
     std::iter::once(folder.to_string())
-        .chain(current.iter().filter(|f| !f.eq_ignore_ascii_case(folder)).cloned())
+        .chain(current.iter().filter(|f| !same_folder(f, folder)).cloned())
         .take(limits::RECENT_FOLDER_COUNT)
         .collect()
 }
@@ -102,7 +106,7 @@ fn unix_seconds() -> u64 {
 }
 
 pub fn remove_recent_folder(current: &[String], folder: &str) -> Vec<String> {
-    current.iter().filter(|f| !f.eq_ignore_ascii_case(folder)).cloned().collect()
+    current.iter().filter(|f| !same_folder(f, folder)).cloned().collect()
 }
 
 /// The settings file's own on-disk form, decided here rather than borrowed from the
@@ -148,7 +152,19 @@ fn parse_settings(text: &str) -> Parsed {
             rejected.push(key);
         }
     }
-    let settings = serde_json::from_value::<AppSettings>(serde_json::Value::Object(merged)).unwrap_or_default().sanitized();
+    let raw = serde_json::from_value::<AppSettings>(serde_json::Value::Object(merged)).unwrap_or_default();
+    let settings = raw.clone().sanitized();
+    // Values the app cannot use ("red" as a color, a size of 200) are corrected, and the
+    // correction is reported like a rejected field: the next save drops the original value.
+    if let (Ok(serde_json::Value::Object(before)), Ok(serde_json::Value::Object(after))) =
+        (serde_json::to_value(&raw), serde_json::to_value(&settings))
+    {
+        for (key, value) in &before {
+            if after.get(key) != Some(value) && !rejected.contains(key) {
+                rejected.push(key.clone());
+            }
+        }
+    }
     if rejected.is_empty() { Parsed::Clean(settings) } else { Parsed::Partial(settings, rejected) }
 }
 
@@ -167,7 +183,10 @@ impl SettingsStore {
     /// degrades to defaults — but never silently, and never by later overwriting a file
     /// that held more than what was loaded.
     pub fn load() -> Self {
-        let path = std::env::var_os("APPDATA").map(|d| PathBuf::from(d).join("MyMDedit").join("settings.json"));
+        Self::open(std::env::var_os("APPDATA").map(|d| PathBuf::from(d).join("MyMDedit").join("settings.json")))
+    }
+
+    pub fn open(path: Option<PathBuf>) -> Self {
         let mut store = Self { path: path.clone(), current: AppSettings::default(), writable: true, load_warning: None };
         if let Some(path) = path {
             store.read(&path);
@@ -176,9 +195,9 @@ impl SettingsStore {
     }
 
     fn read(&mut self, path: &Path) {
-        let text = match std::fs::read(path) {
-            Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+        let parsed = match read_disk(path) {
+            Ok(Some(parsed)) => parsed,
+            Ok(None) => return,
             Err(e) => {
                 // Probably transient (a lock, a permission glitch). The file may be
                 // perfectly good, so it must not be overwritten with defaults.
@@ -190,7 +209,7 @@ impl SettingsStore {
                 return;
             }
         };
-        let (settings, problem) = match parse_settings(&text) {
+        let (settings, problem) = match parsed {
             Parsed::Clean(s) => (s, None),
             Parsed::Partial(s, fields) => (s, Some(format!("一部の項目（{}）を読み込めなかったため、既定値を使います。", fields.join(", ")))),
             Parsed::Unreadable(reason) => {
@@ -222,33 +241,97 @@ impl SettingsStore {
         self.load_warning.take()
     }
 
-    /// Makes `settings` current and writes it. `current` is replaced before the write,
-    /// so what the screen shows and `current` agree even when the write fails.
-    pub fn save(&mut self, settings: AppSettings) -> bool {
-        self.current = settings.sanitized();
-        let Some(path) = &self.path else {
-            log::error("SettingsStore.save", "APPDATA is not set");
+    /// Applies `change` to the settings as they are on disk *now* and writes the result,
+    /// so another running instance's changes to other fields survive. `current` becomes
+    /// the written value even when the write fails, so the screen and `current` agree.
+    pub fn update(&mut self, change: impl FnOnce(&mut AppSettings)) -> bool {
+        let Some(path) = self.path.clone() else {
+            change(&mut self.current);
+            log::error("SettingsStore.update", "APPDATA is not set");
             return false;
         };
         if !self.writable {
-            log::error("SettingsStore.save", "skipped: the settings file could not be read at startup");
+            change(&mut self.current);
+            log::error("SettingsStore.update", "skipped: the settings file could not be read at startup");
             return false;
         }
+        let _lock = SettingsLock::acquire();
+        let mut base = match read_disk(&path) {
+            Ok(Some(Parsed::Clean(s))) => s,
+            // Anything else: our own view is the best information there is.
+            _ => self.current.clone(),
+        };
+        change(&mut base);
+        self.current = base.sanitized();
         let result = (|| -> std::io::Result<()> {
             if let Some(dir) = path.parent() {
                 std::fs::create_dir_all(dir)?;
             }
             let json = serde_json::to_string_pretty(&self.current).map_err(std::io::Error::other)?;
-            document::save_atomic(path, &json, &SETTINGS_FILE_FORMAT)
+            document::save_atomic(&path, &json, &SETTINGS_FILE_FORMAT)
         })();
         match result {
             Ok(()) => true,
             Err(e) => {
-                log::error("SettingsStore.save", e);
+                log::error("SettingsStore.update", e);
                 false
             }
         }
     }
+}
+
+/// What is on disk right now. `Ok(None)` = no file yet.
+fn read_disk(path: &Path) -> std::io::Result<Option<Parsed>> {
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(Some(match String::from_utf8(bytes) {
+            Ok(text) => parse_settings(&text),
+            // Lossy decoding would parse fine and write U+FFFD back on the next save.
+            Err(_) => Parsed::Unreadable("設定ファイルが UTF-8 ではありません".into()),
+        })),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// Serializes read-modify-write across running instances. Waiting is bounded: a
+/// wedged instance must not freeze this one, so after the timeout the write proceeds
+/// unserialized (still atomic per file; at worst the old last-writer-wins race).
+struct SettingsLock(Option<HANDLE>);
+
+impl SettingsLock {
+    fn acquire() -> Self {
+        unsafe {
+            match CreateMutexW(None, false, w!("Local\\MyMDedit.Settings")) {
+                Ok(h) => {
+                    let _ = WaitForSingleObject(h, 2000);
+                    Self(Some(h))
+                }
+                Err(e) => {
+                    log::error("SettingsLock", &e);
+                    Self(None)
+                }
+            }
+        }
+    }
+}
+
+impl Drop for SettingsLock {
+    fn drop(&mut self) {
+        if let Some(h) = self.0 {
+            unsafe {
+                let _ = ReleaseMutex(h);
+                let _ = CloseHandle(h);
+            }
+        }
+    }
+}
+
+/// Windows paths compare case-insensitively across all of Unicode, and `C:\a\` names
+/// the same folder as `C:\a`.
+pub fn same_folder(a: &str, b: &str) -> bool {
+    let norm = |s: &str| -> Vec<u16> { s.replace('/', "\\").trim_end_matches('\\').encode_utf16().collect() };
+    let (a, b) = (norm(a), norm(b));
+    unsafe { CompareStringOrdinal(&a, &b, true) == CSTR_EQUAL }
 }
 
 #[cfg(test)]
@@ -296,22 +379,21 @@ mod tests {
         assert!(matches!(parse_settings("[]"), Parsed::Unreadable(_)));
     }
 
-    fn store_at(path: &Path) -> SettingsStore {
-        let mut store = SettingsStore { path: Some(path.to_path_buf()), current: AppSettings::default(), writable: true, load_warning: None };
-        store.read(path);
-        store
+    fn test_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("mymdedit-settings-{tag}-{}-{}", std::process::id(), unix_seconds()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
     }
 
     #[test]
     fn broken_file_is_backed_up_before_it_can_be_overwritten() {
-        let dir = std::env::temp_dir().join(format!("mymdedit-settings-{}", unix_seconds()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = test_dir("broken");
         let path = dir.join("settings.json");
         std::fs::write(&path, "{\"theme\": \"Dark\",}").unwrap();
-        let mut store = store_at(&path);
+        let mut store = SettingsStore::open(Some(path.clone()));
         assert!(store.take_load_warning().is_some_and(|w| w.contains("settings.broken-")));
-        assert!(store.save(AppSettings::default()));
+        assert!(store.update(|_| {}));
         let backups: Vec<_> = std::fs::read_dir(&dir).unwrap().filter_map(|e| e.ok()).filter(|e| e.file_name().to_string_lossy().starts_with("settings.broken-")).collect();
         assert_eq!(backups.len(), 1);
         assert_eq!(std::fs::read_to_string(backups[0].path()).unwrap(), "{\"theme\": \"Dark\",}");
@@ -320,11 +402,58 @@ mod tests {
 
     #[test]
     fn sanitizes_loaded_values() {
-        let s: AppSettings =
-            serde_json::from_str(r#"{"editor_font_size": 200, "preview_background_color": "red"}"#).unwrap();
-        let s = s.sanitized();
-        assert_eq!(s.editor_font_size, 48.0);
-        assert_eq!(s.preview_background_color, None);
-        assert_eq!(s.preview_font_family, "Segoe UI, sans-serif");
+        match parse_settings(r#"{"editor_font_size": 200, "preview_background_color": "red"}"#) {
+            Parsed::Partial(s, fields) => {
+                assert_eq!(s.editor_font_size, 48.0);
+                assert_eq!(s.preview_background_color, None);
+                assert_eq!(s.preview_font_family, "Segoe UI, sans-serif");
+                assert!(fields.contains(&"editor_font_size".to_string()));
+                assert!(fields.contains(&"preview_background_color".to_string()));
+            }
+            other => panic!("expected Partial, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn invalid_utf8_is_unreadable_not_lossy() {
+        let dir = test_dir("utf8");
+        let path = dir.join("settings.json");
+        std::fs::write(&path, b"{\"editor_font_family\": \"\xFF\"}").unwrap();
+        let mut store = SettingsStore::open(Some(path.clone()));
+        assert!(store.take_load_warning().is_some());
+        assert_eq!(store.current().editor_font_family, AppSettings::default().editor_font_family);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn sanitized_fields_are_reported() {
+        match parse_settings(r#"{"preview_background_color": "red", "editor_font_size": 20}"#) {
+            Parsed::Partial(s, fields) => {
+                assert_eq!(fields, vec!["preview_background_color"]);
+                assert_eq!(s.editor_font_size, 20.0);
+            }
+            other => panic!("expected Partial, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn two_instances_keep_each_others_changes() {
+        let dir = test_dir("rmw");
+        let path = dir.join("settings.json");
+        let mut a = SettingsStore::open(Some(path.clone()));
+        let mut b = SettingsStore::open(Some(path.clone()));
+        assert!(a.update(|s| s.theme = Theme::Dark));
+        assert!(b.update(|s| s.recent_folders = vec!["C:\\x".into()]));
+        let reloaded = SettingsStore::open(Some(path));
+        assert_eq!(reloaded.current().theme, Theme::Dark);
+        assert_eq!(reloaded.current().recent_folders, vec!["C:\\x"]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn folders_compare_unicode_case_insensitively_ignoring_trailing_separator() {
+        assert!(same_folder("C:\\Ä\\Docs\\", "c:\\ä\\docs"));
+        assert!(!same_folder("C:\\a", "C:\\ab"));
+        assert_eq!(add_recent_folder(&["C:\\Ä".into()], "c:\\ä"), vec!["c:\\ä"]);
     }
 }
