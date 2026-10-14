@@ -16,12 +16,14 @@ use webview2_com::Microsoft::Web::WebView2::Win32::{
     COREWEBVIEW2_COLOR, COREWEBVIEW2_KEY_EVENT_KIND, COREWEBVIEW2_KEY_EVENT_KIND_KEY_DOWN,
     COREWEBVIEW2_KEY_EVENT_KIND_SYSTEM_KEY_DOWN, COREWEBVIEW2_WEB_ERROR_STATUS, CreateCoreWebView2EnvironmentWithOptions,
     ICoreWebView2, ICoreWebView2Controller, ICoreWebView2Controller2, ICoreWebView2EnvironmentOptions,
-    ICoreWebView2NavigationStartingEventArgs,
+    ICoreWebView2NavigationStartingEventArgs, ICoreWebView2_18, COREWEBVIEW2_PROCESS_FAILED_KIND,
+    COREWEBVIEW2_PROCESS_FAILED_KIND_BROWSER_PROCESS_EXITED, COREWEBVIEW2_PROCESS_FAILED_KIND_RENDER_PROCESS_EXITED,
 };
 use webview2_com::{
     AcceleratorKeyPressedEventHandler, CoreWebView2EnvironmentOptions, CreateCoreWebView2ControllerCompletedHandler,
     CreateCoreWebView2EnvironmentCompletedHandler, ExecuteScriptCompletedHandler, NavigationCompletedEventHandler,
-    NavigationStartingEventHandler, NewWindowRequestedEventHandler, take_pwstr,
+    LaunchingExternalUriSchemeEventHandler, NavigationStartingEventHandler, NewWindowRequestedEventHandler,
+    ProcessFailedEventHandler, take_pwstr,
 };
 
 use crate::app::{App, app};
@@ -45,6 +47,8 @@ pub struct Preview {
     script_again: bool,
     bounds: RECT,
     background: COREWEBVIEW2_COLOR,
+    /// Browser-process restarts so far this session; capped so a crash loop ends.
+    restarts: u32,
 }
 
 /// Schemes NavigateToString can never produce, so a navigation carrying one can only
@@ -61,19 +65,46 @@ fn uses_blocked_scheme(uri: &str) -> bool {
     BLOCKED_SCHEMES.iter().any(|s| uri.as_bytes().get(..s.len()).is_some_and(|p| p.eq_ignore_ascii_case(s.as_bytes())))
 }
 
+/// The guard, as a pure decision. All three conditions only ever deny; none of them
+/// can admit a navigation the counter would not.
+fn navigation_allowed(pending_self: i32, uri: &str, user_initiated: bool) -> bool {
+    pending_self > 0 && !uses_blocked_scheme(uri) && !user_initiated
+}
+
+const STOPPED: &str = "プレビューの安全確認に失敗したため、プレビューを停止しました。編集と保存は引き続き行えます。";
+
+/// The guard could not enforce a denial. Fail closed: no further document is ever
+/// loaded, and the preview is hidden so whatever got through cannot be seen or used.
+fn stop_preview(context: &str, e: &windows::core::Error) {
+    let app = app();
+    let controller = {
+        let mut p = app.preview.borrow_mut();
+        p.ready = false;
+        p.controller.clone()
+    };
+    if let Some(c) = controller {
+        unsafe {
+            let _ = c.SetIsVisible(false);
+        }
+    }
+    app.report_error(context, STOPPED, Some(e));
+}
+
 /// The guard's decision for one NavigationStarting. Every way of failing to decide is
 /// an `Err`, which the caller turns into a cancel — the guard must fail closed.
 fn allow_navigation(args: &ICoreWebView2NavigationStartingEventArgs) -> windows::core::Result<bool> {
     let mut uri = PWSTR::null();
     let mut id = 0u64;
+    let mut user = BOOL::default();
     unsafe {
         args.Uri(&mut uri)?;
         args.NavigationId(&mut id)?;
+        args.IsUserInitiated(&mut user)?;
     }
     let uri = take_pwstr(uri);
     let app = app();
     let mut p = app.preview.borrow_mut();
-    if p.pending_self == 0 || uses_blocked_scheme(&uri) {
+    if !navigation_allowed(p.pending_self, &uri, user.as_bool()) {
         log::error("PreviewNavigationBlocked", format!("blocked navigation to {}", describe_uri(&uri)));
         return Ok(false);
     }
@@ -156,8 +187,8 @@ fn configure(controller: ICoreWebView2Controller) -> windows::core::Result<()> {
                     log::error("PreviewNavigationBlocked", format!("could not inspect navigation, cancelling: {e}"));
                     false
                 });
-                if !allow {
-                    unsafe { args.SetCancel(true)? };
+                if !allow && let Err(e) = unsafe { args.SetCancel(true) } {
+                    stop_preview("PreviewNavigationGuard", &e);
                 }
                 Ok(())
             })),
@@ -170,13 +201,70 @@ fn configure(controller: ICoreWebView2Controller) -> windows::core::Result<()> {
         webview.add_NewWindowRequested(
             &NewWindowRequestedEventHandler::create(Box::new(|_, args| {
                 let Some(args) = args else { return Ok(()) };
-                unsafe { args.SetHandled(true)? };
+                if let Err(e) = unsafe { args.SetHandled(true) } {
+                    stop_preview("PreviewNewWindowGuard", &e);
+                }
                 let mut uri = PWSTR::null();
                 let uri = match unsafe { args.Uri(&mut uri) } {
                     Ok(()) => take_pwstr(uri),
                     Err(_) => String::new(),
                 };
                 log::error("PreviewNewWindowBlocked", format!("blocked new window for {}", describe_uri(&uri)));
+                Ok(())
+            })),
+            &mut token,
+        )?;
+
+        // mailto:, ms-settings: and other OS protocols leave through this event, which a
+        // navigation that slipped into the counter's window would otherwise reach.
+        if let Ok(wv18) = webview.cast::<ICoreWebView2_18>() {
+            wv18.add_LaunchingExternalUriScheme(
+                &LaunchingExternalUriSchemeEventHandler::create(Box::new(|_, args| {
+                    let Some(args) = args else { return Ok(()) };
+                    if let Err(e) = unsafe { args.SetCancel(true) } {
+                        stop_preview("PreviewExternalSchemeGuard", &e);
+                    }
+                    log::error("PreviewExternalSchemeBlocked", "blocked an external URI scheme launch");
+                    Ok(())
+                })),
+                &mut token,
+            )?;
+        }
+
+        webview.add_ProcessFailed(
+            &ProcessFailedEventHandler::create(Box::new(|_, args| {
+                let Some(args) = args else { return Ok(()) };
+                let mut kind = COREWEBVIEW2_PROCESS_FAILED_KIND::default();
+                unsafe { args.ProcessFailedKind(&mut kind)? };
+                let app = app();
+                {
+                    // Whatever was in flight died with the process.
+                    let mut p = app.preview.borrow_mut();
+                    p.pending_self = 0;
+                    p.script_busy = false;
+                    p.script_again = false;
+                }
+                if kind == COREWEBVIEW2_PROCESS_FAILED_KIND_RENDER_PROCESS_EXITED {
+                    log::error("PreviewProcessFailed", "render process exited; re-rendering");
+                    app.refresh_preview();
+                } else if kind == COREWEBVIEW2_PROCESS_FAILED_KIND_BROWSER_PROCESS_EXITED {
+                    let attempt = {
+                        let mut p = app.preview.borrow_mut();
+                        p.restarts += 1;
+                        p.restarts
+                    };
+                    close(&app);
+                    if attempt <= 3 {
+                        log::error("PreviewProcessFailed", format!("browser process exited; restarting ({attempt}/3)"));
+                        start(&app, app.main_hwnd());
+                    } else {
+                        app.report_error(
+                            "PreviewProcessFailed",
+                            "プレビューの処理が繰り返し停止したため、再起動をやめました。編集と保存は引き続き行えます。",
+                            None,
+                        );
+                    }
+                }
                 Ok(())
             })),
             &mut token,
@@ -254,15 +342,19 @@ fn configure(controller: ICoreWebView2Controller) -> windows::core::Result<()> {
     }
 
     let app = app();
+    let (bounds, background) = {
+        let p = app.preview.borrow();
+        (p.bounds, p.background)
+    };
+    unsafe {
+        let _ = controller.SetBounds(bounds);
+        if let Ok(c2) = controller.cast::<ICoreWebView2Controller2>() {
+            let _ = c2.SetDefaultBackgroundColor(background);
+        }
+        controller.SetIsVisible(true)?;
+    }
     {
         let mut p = app.preview.borrow_mut();
-        unsafe {
-            let _ = controller.SetBounds(p.bounds);
-            if let Ok(c2) = controller.cast::<ICoreWebView2Controller2>() {
-                let _ = c2.SetDefaultBackgroundColor(p.background);
-            }
-            controller.SetIsVisible(true)?;
-        }
         p.controller = Some(controller);
         p.webview = Some(webview);
         p.ready = true;
@@ -302,11 +394,12 @@ pub fn navigate(app: &App, html: &str) {
             }
             p.update_failure_reported = true;
             drop(p);
-            app.report_error(
-                "NavigateToString",
-                "プレビューを更新できませんでした。文書が大きすぎる可能性があります（プレビューの上限は約2MBです）。編集内容は保持されています。",
-                Some(&e),
-            );
+            let message = if e.code() == windows::Win32::Foundation::E_INVALIDARG {
+                "プレビューを更新できませんでした。文書が大きすぎる可能性があります（プレビューの上限は約2MBです）。編集内容は保持されています。".to_string()
+            } else {
+                format!("プレビューを更新できませんでした。({}) 編集内容は保持されています。", e.message())
+            };
+            app.report_error("NavigateToString", &message, Some(&e));
         }
     }
 }
@@ -391,7 +484,8 @@ pub fn set_background(app: &App, color: COLORREF) {
 }
 
 pub fn notify_moved(app: &App) {
-    if let Some(c) = app.preview.borrow().controller.clone() {
+    let controller = app.preview.borrow().controller.clone();
+    if let Some(c) = controller {
         unsafe {
             let _ = c.NotifyParentWindowPositionChanged();
         }
@@ -428,6 +522,14 @@ mod tests {
     fn scheme_check_does_not_panic_on_non_ascii() {
         assert!(!uses_blocked_scheme("日本語"));
         assert!(!uses_blocked_scheme("ab日"));
+    }
+
+    #[test]
+    fn guard_denies_user_initiated_and_unexpected_navigations() {
+        assert!(navigation_allowed(1, "data:text/html;base64,AA", false));
+        assert!(!navigation_allowed(0, "data:text/html;base64,AA", false)); // not ours
+        assert!(!navigation_allowed(1, "https://evil/", false)); // scheme we never produce
+        assert!(!navigation_allowed(1, "data:text/html;base64,AA", true)); // a click, even mid-render
     }
 
     #[test]

@@ -366,6 +366,10 @@ impl App {
         self.ui.get().hwnd
     }
 
+    pub fn main_hwnd(&self) -> HWND {
+        self.hwnd()
+    }
+
     pub fn post_command(&self, cmd: u16) {
         unsafe {
             let _ = PostMessageW(Some(self.hwnd()), WM_COMMAND, WPARAM(cmd as usize), LPARAM(0));
