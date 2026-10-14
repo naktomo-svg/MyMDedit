@@ -32,16 +32,18 @@ fn options() -> Options<'static> {
 
 pub fn to_html_document(markdown: &str, settings: &AppSettings) -> String {
     let body = markdown_to_html(markdown, &options());
-    HTML_TEMPLATE.replace("__CSS__", &build_css(settings)).replace("__BODY__", &body)
+    // Assembled in one pass: substituting into a template would re-scan what was
+    // already substituted, so a setting containing a marker could duplicate the body.
+    [HTML_HEAD, &build_css(settings), HTML_MIDDLE, &body, HTML_TAIL].concat()
 }
 
 fn build_css(settings: &AppSettings) -> String {
     let mut css = String::from(BASE_CSS);
-    css.push_str(match settings.theme {
-        Theme::Light => "",
-        Theme::Dark => DARK_PALETTE_CSS,
-        Theme::System => DARK_PALETTE_MEDIA_QUERY_CSS,
-    });
+    match settings.theme {
+        Theme::Light => {}
+        Theme::Dark => css.push_str(DARK_PALETTE_CSS),
+        Theme::System => css.push_str(&format!("\n@media (prefers-color-scheme: dark) {{{DARK_PALETTE_CSS}}}\n")),
+    }
     css.push_str(&format!(
         "\nbody {{ font-family: {}; font-size: {}px; }}",
         format_css_font_family(&settings.preview_font_family),
@@ -96,15 +98,14 @@ pub fn format_css_font_family(value: &str) -> String {
 // credentials ride along). base-uri and form-action do NOT fall back to default-src,
 // so they are listed explicitly. CSP does not govern top-level navigation; that is the
 // navigation guard's job (preview.rs).
-const HTML_TEMPLATE: &str = r#"<!DOCTYPE html>
+const HTML_HEAD: &str = r#"<!DOCTYPE html>
 <html>
 <head>
 <meta charset="utf-8" />
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src data: https:; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'" />
-<style>__CSS__</style>
-</head>
-<body>__BODY__</body>
-</html>"#;
+<style>"#;
+const HTML_MIDDLE: &str = "</style>\n</head>\n<body>";
+const HTML_TAIL: &str = "</body>\n</html>";
 
 const BASE_CSS: &str = r#"
 body {
@@ -127,17 +128,6 @@ table { border-collapse: collapse; margin: 0.5em 0; }
 table th, table td { border: 1px solid rgba(128,128,128,0.3); padding: 6px 12px; }
 img { max-width: 100%; }
 a { color: #0067c0; }
-"#;
-
-const DARK_PALETTE_MEDIA_QUERY_CSS: &str = r#"
-@media (prefers-color-scheme: dark) {
-    body { color: #e6e6e6; background: #1e1e1e; }
-    code, pre { background: #2b2b2b !important; }
-    a { color: #6cb6ff; }
-    blockquote { border-left-color: #555; color: #bbb; }
-    table th, table td { border-color: #444; }
-    hr { border-color: #444; }
-}
 "#;
 
 const DARK_PALETTE_CSS: &str = r#"
@@ -176,6 +166,20 @@ mod tests {
     fn invalid_background_is_not_emitted() {
         let s = AppSettings { preview_background_color: Some("red;}".into()), ..AppSettings::default() };
         assert!(!to_html_document("", &s).contains("red;}"));
+    }
+
+    #[test]
+    fn css_cannot_inject_template_markers() {
+        let s = AppSettings { preview_font_family: "__BODY__".into(), ..AppSettings::default() };
+        let html = to_html_document("unique-body-text", &s);
+        assert_eq!(html.matches("unique-body-text").count(), 1);
+    }
+
+    #[test]
+    fn system_theme_wraps_the_same_dark_palette_in_a_media_query() {
+        let html = to_html_document("", &AppSettings::default());
+        assert!(html.contains("@media (prefers-color-scheme: dark)"));
+        assert!(html.contains("background: #1e1e1e"));
     }
 
     #[test]
