@@ -1,7 +1,5 @@
 fn main() {
-    embed_resource::compile("res/app.rc", embed_resource::NONE)
-        .manifest_required()
-        .unwrap();
+    embed_resource::compile("res/app.rc", embed_resource::NONE).manifest_required().unwrap();
 
     // Security: static imports are resolved by the loader before main() runs, so
     // SetDefaultDllDirectories cannot reach them. 0x800 = LOAD_LIBRARY_SEARCH_SYSTEM32:

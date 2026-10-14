@@ -2,8 +2,8 @@
 
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    CLEARTYPE_QUALITY, CreateFontIndirectW, CreateFontW, DEFAULT_CHARSET, DeleteObject, FW_BOLD,
-    FW_NORMAL, HFONT, HGDIOBJ, LOGFONTW, OUT_DEFAULT_PRECIS,
+    CLEARTYPE_QUALITY, CreateFontIndirectW, CreateFontW, DEFAULT_CHARSET, DeleteObject, FW_BOLD, FW_NORMAL, HFONT,
+    HGDIOBJ, LOGFONTW, OUT_DEFAULT_PRECIS,
 };
 use windows::Win32::UI::HiDpi::{GetDpiForWindow, SystemParametersInfoForDpi};
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -58,10 +58,7 @@ pub fn height(r: &RECT) -> i32 {
 }
 
 fn nonclient_metrics(dpi: u32) -> NONCLIENTMETRICSW {
-    let mut m = NONCLIENTMETRICSW {
-        cbSize: size_of::<NONCLIENTMETRICSW>() as u32,
-        ..Default::default()
-    };
+    let mut m = NONCLIENTMETRICSW { cbSize: size_of::<NONCLIENTMETRICSW>() as u32, ..Default::default() };
     unsafe {
         let _ = SystemParametersInfoForDpi(
             SPI_GETNONCLIENTMETRICS.0,
@@ -97,11 +94,7 @@ pub fn font(face: &str, px: i32, bold: bool) -> HFONT {
             0,
             0,
             0,
-            if bold {
-                FW_BOLD.0 as i32
-            } else {
-                FW_NORMAL.0 as i32
-            },
+            if bold { FW_BOLD.0 as i32 } else { FW_NORMAL.0 as i32 },
             0,
             0,
             0,

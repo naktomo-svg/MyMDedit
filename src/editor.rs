@@ -8,18 +8,17 @@
 use windows::Win32::Foundation::{COLORREF, HWND, RECT};
 use windows::Win32::System::LibraryLoader::{LOAD_LIBRARY_SEARCH_SYSTEM32, LoadLibraryExW};
 use windows::Win32::UI::Controls::RichEdit::{
-    CFM_COLOR, CFM_FACE, CFM_SIZE, CHARFORMAT2W, CHARRANGE, EM_EXGETSEL, EM_EXLIMITTEXT,
-    EM_EXSETSEL, EM_GETTEXTEX, EM_GETTEXTLENGTHEX, EM_REDO, EM_SETBKGNDCOLOR, EM_SETCHARFORMAT,
-    EM_SETEVENTMASK, EM_SETTEXTEX, EM_SETTEXTMODE, EM_SETZOOM, ENM_CHANGE, GETTEXTEX,
-    GETTEXTLENGTHEX, GT_DEFAULT, GTL_NUMCHARS, GTL_PRECISE, SCF_ALL, SCF_DEFAULT, SETTEXTEX,
-    ST_DEFAULT, TM_MULTILEVELUNDO, TM_PLAINTEXT,
+    CFM_COLOR, CFM_FACE, CFM_SIZE, CHARFORMAT2W, CHARRANGE, EM_EXGETSEL, EM_EXLIMITTEXT, EM_EXSETSEL, EM_GETTEXTEX,
+    EM_GETTEXTLENGTHEX, EM_REDO, EM_SETBKGNDCOLOR, EM_SETCHARFORMAT, EM_SETEVENTMASK, EM_SETTEXTEX, EM_SETTEXTMODE,
+    EM_SETZOOM, ENM_CHANGE, GETTEXTEX, GETTEXTLENGTHEX, GT_DEFAULT, GTL_NUMCHARS, GTL_PRECISE, SCF_ALL, SCF_DEFAULT,
+    SETTEXTEX, ST_DEFAULT, TM_MULTILEVELUNDO, TM_PLAINTEXT,
 };
 use windows::Win32::UI::Controls::{EM_REPLACESEL, EM_SCROLLCARET, EM_SETRECT, EM_SETSEL, EM_UNDO};
 use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, ES_AUTOVSCROLL, ES_MULTILINE, ES_NOHIDESEL, ES_WANTRETURN, GetClientRect,
-    GetScrollInfo, HMENU, SB_VERT, SCROLLINFO, SIF_ALL, WINDOW_EX_STYLE, WINDOW_STYLE, WM_COPY,
-    WM_CUT, WM_PASTE, WS_CHILD, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
+    CreateWindowExW, ES_AUTOVSCROLL, ES_MULTILINE, ES_NOHIDESEL, ES_WANTRETURN, GetClientRect, GetScrollInfo, HMENU,
+    SB_VERT, SCROLLINFO, SIF_ALL, WINDOW_EX_STYLE, WINDOW_STYLE, WM_COPY, WM_CUT, WM_PASTE, WS_CHILD, WS_TABSTOP,
+    WS_VISIBLE, WS_VSCROLL,
 };
 use windows::core::{PCSTR, w};
 
@@ -48,9 +47,7 @@ impl Editor {
                 | WS_VISIBLE
                 | WS_VSCROLL
                 | WS_TABSTOP
-                | WINDOW_STYLE(
-                    (ES_MULTILINE | ES_AUTOVSCROLL | ES_WANTRETURN | ES_NOHIDESEL) as u32,
-                );
+                | WINDOW_STYLE((ES_MULTILINE | ES_AUTOVSCROLL | ES_WANTRETURN | ES_NOHIDESEL) as u32);
             let hwnd = CreateWindowExW(
                 WINDOW_EX_STYLE(0),
                 w!("RICHEDIT50W"),
@@ -67,12 +64,7 @@ impl Editor {
             )?;
             let editor = Editor(hwnd);
             // Must be set while the control is empty.
-            send(
-                hwnd,
-                EM_SETTEXTMODE,
-                (TM_PLAINTEXT.0 | TM_MULTILEVELUNDO.0) as usize,
-                0,
-            );
+            send(hwnd, EM_SETTEXTMODE, (TM_PLAINTEXT.0 | TM_MULTILEVELUNDO.0) as usize, 0);
             // The default limit is 32K characters.
             send(hwnd, EM_EXLIMITTEXT, 0, 0x7FFF_FFFE);
             send(hwnd, EM_SETEVENTMASK, 0, ENM_CHANGE as isize);
@@ -85,10 +77,7 @@ impl Editor {
     }
 
     pub fn len(&self) -> usize {
-        let gtl = GETTEXTLENGTHEX {
-            flags: GTL_NUMCHARS | GTL_PRECISE,
-            codepage: CP_UTF16,
-        };
+        let gtl = GETTEXTLENGTHEX { flags: GTL_NUMCHARS | GTL_PRECISE, codepage: CP_UTF16 };
         send(self.0, EM_GETTEXTLENGTHEX, &gtl as *const _ as usize, 0).max(0) as usize
     }
 
@@ -103,13 +92,7 @@ impl Editor {
             lpDefaultChar: PCSTR::null(),
             lpUsedDefChar: std::ptr::null_mut(),
         };
-        let n = send(
-            self.0,
-            EM_GETTEXTEX,
-            &gt as *const _ as usize,
-            buf.as_mut_ptr() as isize,
-        )
-        .max(0) as usize;
+        let n = send(self.0, EM_GETTEXTEX, &gt as *const _ as usize, buf.as_mut_ptr() as isize).max(0) as usize;
         buf.truncate(n.min(len));
         buf
     }
@@ -117,16 +100,8 @@ impl Editor {
     /// Replaces the whole text and clears the undo history.
     pub fn set_text(&self, text: &str) {
         let buf = wide(text);
-        let st = SETTEXTEX {
-            flags: ST_DEFAULT,
-            codepage: CP_UTF16,
-        };
-        send(
-            self.0,
-            EM_SETTEXTEX,
-            &st as *const _ as usize,
-            buf.as_ptr() as isize,
-        );
+        let st = SETTEXTEX { flags: ST_DEFAULT, codepage: CP_UTF16 };
+        send(self.0, EM_SETTEXTEX, &st as *const _ as usize, buf.as_ptr() as isize);
         self.set_selection(0, 0);
     }
 
@@ -138,10 +113,7 @@ impl Editor {
     }
 
     pub fn set_selection(&self, start: usize, len: usize) {
-        let cr = CHARRANGE {
-            cpMin: start as i32,
-            cpMax: (start + len) as i32,
-        };
+        let cr = CHARRANGE { cpMin: start as i32, cpMax: (start + len) as i32 };
         send(self.0, EM_EXSETSEL, 0, &cr as *const _ as isize);
     }
 
@@ -202,18 +174,8 @@ impl Editor {
         cf.Base.crTextColor = color;
         let face: Vec<u16> = face.encode_utf16().take(31).collect();
         cf.Base.szFaceName[..face.len()].copy_from_slice(&face);
-        send(
-            self.0,
-            EM_SETCHARFORMAT,
-            SCF_DEFAULT as usize,
-            &cf as *const _ as isize,
-        );
-        send(
-            self.0,
-            EM_SETCHARFORMAT,
-            SCF_ALL as usize,
-            &cf as *const _ as isize,
-        );
+        send(self.0, EM_SETCHARFORMAT, SCF_DEFAULT as usize, &cf as *const _ as isize);
+        send(self.0, EM_SETCHARFORMAT, SCF_ALL as usize, &cf as *const _ as isize);
     }
 
     pub fn set_background(&self, color: COLORREF) {
@@ -245,11 +207,7 @@ impl Editor {
 
     /// Vertical scroll position as 0 (top) ..= 1 (bottom).
     pub fn scroll_ratio(&self) -> f64 {
-        let mut si = SCROLLINFO {
-            cbSize: size_of::<SCROLLINFO>() as u32,
-            fMask: SIF_ALL,
-            ..Default::default()
-        };
+        let mut si = SCROLLINFO { cbSize: size_of::<SCROLLINFO>() as u32, fMask: SIF_ALL, ..Default::default() };
         unsafe {
             if GetScrollInfo(self.0, SB_VERT, &mut si).is_err() {
                 return 0.0;
@@ -258,11 +216,7 @@ impl Editor {
         // nPos rather than EM_GETSCROLLPOS: the latter is limited to 16 bits, so on a long
         // document the preview stopped following past ~65535 pixels.
         let scrollable = si.nMax - si.nMin + 1 - si.nPage as i32;
-        if scrollable <= 0 {
-            0.0
-        } else {
-            ((si.nPos - si.nMin) as f64 / scrollable as f64).clamp(0.0, 1.0)
-        }
+        if scrollable <= 0 { 0.0 } else { ((si.nPos - si.nMin) as f64 / scrollable as f64).clamp(0.0, 1.0) }
     }
 }
 

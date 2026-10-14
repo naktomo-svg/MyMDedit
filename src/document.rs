@@ -41,11 +41,7 @@ pub struct DocumentFormat {
 
 impl Default for DocumentFormat {
     fn default() -> Self {
-        Self {
-            charset: Charset::Utf8,
-            has_bom: false,
-            line_ending: LineEnding::Crlf,
-        }
+        Self { charset: Charset::Utf8, has_bom: false, line_ending: LineEnding::Crlf }
     }
 }
 
@@ -137,11 +133,7 @@ pub fn decode(bytes: &[u8]) -> Result<(String, DocumentFormat), ReadError> {
         Some(c) => (c, true),
         None => (Charset::Utf8, false),
     };
-    let mut format = DocumentFormat {
-        charset,
-        has_bom,
-        line_ending: LineEnding::Crlf,
-    };
+    let mut format = DocumentFormat { charset, has_bom, line_ending: LineEnding::Crlf };
     let body = &bytes[format.bom_len()..];
 
     let invalid = || ReadError::InvalidEncoding(charset);
@@ -154,13 +146,7 @@ pub fn decode(bytes: &[u8]) -> Result<(String, DocumentFormat), ReadError> {
             }
             let units: Vec<u16> = chunks
                 .iter()
-                .map(|&c| {
-                    if charset == Charset::Utf16Le {
-                        u16::from_le_bytes(c)
-                    } else {
-                        u16::from_be_bytes(c)
-                    }
-                })
+                .map(|&c| if charset == Charset::Utf16Le { u16::from_le_bytes(c) } else { u16::from_be_bytes(c) })
                 .collect();
             String::from_utf16(&units).map_err(|_| invalid())?
         }
@@ -172,11 +158,7 @@ pub fn decode(bytes: &[u8]) -> Result<(String, DocumentFormat), ReadError> {
             chunks
                 .iter()
                 .map(|&c| {
-                    let v = if charset == Charset::Utf32Le {
-                        u32::from_le_bytes(c)
-                    } else {
-                        u32::from_be_bytes(c)
-                    };
+                    let v = if charset == Charset::Utf32Le { u32::from_le_bytes(c) } else { u32::from_be_bytes(c) };
                     char::from_u32(v).ok_or_else(invalid)
                 })
                 .collect::<Result<String, _>>()?
@@ -204,26 +186,14 @@ pub fn encode(text: &str, format: &DocumentFormat) -> Vec<u8> {
         }
         Charset::Utf16Le | Charset::Utf16Be => {
             let le = format.charset == Charset::Utf16Le;
-            let iter = format
-                .has_bom
-                .then_some(0xFEFFu16)
-                .into_iter()
-                .chain(text.encode_utf16());
+            let iter = format.has_bom.then_some(0xFEFFu16).into_iter().chain(text.encode_utf16());
             for unit in iter {
-                out.extend_from_slice(&if le {
-                    unit.to_le_bytes()
-                } else {
-                    unit.to_be_bytes()
-                });
+                out.extend_from_slice(&if le { unit.to_le_bytes() } else { unit.to_be_bytes() });
             }
         }
         Charset::Utf32Le | Charset::Utf32Be => {
             let le = format.charset == Charset::Utf32Le;
-            let iter = format
-                .has_bom
-                .then_some(0xFEFFu32)
-                .into_iter()
-                .chain(text.chars().map(u32::from));
+            let iter = format.has_bom.then_some(0xFEFFu32).into_iter().chain(text.chars().map(u32::from));
             for v in iter {
                 out.extend_from_slice(&if le { v.to_le_bytes() } else { v.to_be_bytes() });
             }
@@ -283,10 +253,7 @@ pub struct FileStamp {
 
 pub fn stamp(path: &Path) -> io::Result<FileStamp> {
     let meta = fs::metadata(path)?;
-    Ok(FileStamp {
-        modified: meta.modified()?,
-        len: meta.len(),
-    })
+    Ok(FileStamp { modified: meta.modified()?, len: meta.len() })
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -322,12 +289,7 @@ pub fn read(path: &Path) -> Result<OpenedDocument, ReadError> {
             log::error(&format!("read({})", path.display()), e);
         }
     })?;
-    Ok(OpenedDocument {
-        path: path.to_path_buf(),
-        content,
-        format,
-        stamp,
-    })
+    Ok(OpenedDocument { path: path.to_path_buf(), content, format, stamp })
 }
 
 /// Writes `content` to `path` in `format` without ever leaving `path` half-written.
@@ -337,24 +299,15 @@ pub fn read(path: &Path) -> Result<OpenedDocument, ReadError> {
 /// crash midway leaves the original intact rather than truncated.
 pub fn save_atomic(path: &Path, content: &str, format: &DocumentFormat) -> io::Result<()> {
     let full = std::path::absolute(path)?;
-    let dir = full.parent().ok_or_else(|| {
-        io::Error::other(format!(
-            "保存先のフォルダを特定できませんでした: {}",
-            path.display()
-        ))
-    })?;
-    let file_name = full
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default();
+    let dir = full
+        .parent()
+        .ok_or_else(|| io::Error::other(format!("保存先のフォルダを特定できませんでした: {}", path.display())))?;
+    let file_name = full.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     let temp = dir.join(format!("{file_name}.{:016x}.tmp", random_u64()));
 
     let backup = dir.join(format!("{file_name}.{:016x}.bak", random_u64()));
 
-    let bytes = encode(
-        &line_endings::normalize(content, format.line_ending),
-        format,
-    );
+    let bytes = encode(&line_endings::normalize(content, format.line_ending), format);
     let existed = full.exists();
     let result = (|| {
         {
@@ -362,11 +315,7 @@ pub fn save_atomic(path: &Path, content: &str, format: &DocumentFormat) -> io::R
             file.write_all(&bytes)?;
             file.sync_all()?;
         }
-        if existed {
-            swap_into_place(&full, &temp, &backup, &SYSTEM_FILE_OPS)
-        } else {
-            move_file(&temp, &full, false)
-        }
+        if existed { swap_into_place(&full, &temp, &backup, &SYSTEM_FILE_OPS) } else { move_file(&temp, &full, false) }
     })();
 
     match &result {
@@ -375,10 +324,7 @@ pub fn save_atomic(path: &Path, content: &str, format: &DocumentFormat) -> io::R
         Err(e) if existed && !full.exists() && temp.exists() => {
             return Err(io::Error::new(
                 e.kind(),
-                format!(
-                    "{e}（保存しようとした内容は {} に残しています）",
-                    temp.display()
-                ),
+                format!("{e}（保存しようとした内容は {} に残しています）", temp.display()),
             ));
         }
         // Otherwise the target holds either the original or the new content, so a
@@ -395,10 +341,7 @@ struct FileOps {
     rename: fn(from: &Path, to: &Path, overwrite: bool) -> io::Result<()>,
 }
 
-const SYSTEM_FILE_OPS: FileOps = FileOps {
-    replace: replace_file,
-    rename: move_file,
-};
+const SYSTEM_FILE_OPS: FileOps = FileOps { replace: replace_file, rename: move_file };
 
 /// Replaces existing `full` with `temp`, keeping the original recoverable at every step.
 ///
@@ -410,20 +353,11 @@ fn swap_into_place(full: &Path, temp: &Path, backup: &Path, ops: &FileOps) -> io
     // Preferred: ReplaceFile keeps the original's attributes and ACLs.
     let replaced = (ops.replace)(full, temp, backup);
     if let Err(e) = replaced {
-        log::error(
-            &format!("save_atomic({}) ReplaceFile failed", full.display()),
-            &e,
-        );
+        log::error(&format!("save_atomic({}) ReplaceFile failed", full.display()), &e);
         if !full.exists() && backup.exists() {
             // Restore the original before trying anything else.
             (ops.rename)(backup, full, false).map_err(|restore| {
-                io::Error::new(
-                    restore.kind(),
-                    format!(
-                        "{e}（元のファイルは {} に退避されています）",
-                        backup.display()
-                    ),
-                )
+                io::Error::new(restore.kind(), format!("{e}（元のファイルは {} に退避されています）", backup.display()))
             })?;
         }
         // Not every file system supports ReplaceFile (notably some network shares).
@@ -459,30 +393,15 @@ fn replace_file(target: &Path, replacement: &Path, backup: &Path) -> io::Result<
 }
 
 fn move_file(from: &Path, to: &Path, overwrite: bool) -> io::Result<()> {
-    let flags = if overwrite {
-        MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH
-    } else {
-        MOVEFILE_WRITE_THROUGH
-    };
-    unsafe {
-        MoveFileExW(
-            &HSTRING::from(from.as_os_str()),
-            &HSTRING::from(to.as_os_str()),
-            flags,
-        )
-    }
-    .map_err(|e| io::Error::from_raw_os_error(e.code().0 & 0xFFFF))
+    let flags = if overwrite { MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH } else { MOVEFILE_WRITE_THROUGH };
+    unsafe { MoveFileExW(&HSTRING::from(from.as_os_str()), &HSTRING::from(to.as_os_str()), flags) }
+        .map_err(|e| io::Error::from_raw_os_error(e.code().0 & 0xFFFF))
 }
 
 fn random_u64() -> u64 {
     use std::hash::{BuildHasher, Hasher};
     let mut h = std::collections::hash_map::RandomState::new().build_hasher();
-    h.write_u128(
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0),
-    );
+    h.write_u128(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0));
     h.finish()
 }
 
@@ -495,30 +414,14 @@ mod tests {
         let bytes = b"\xEF\xBB\xBF# hi\r\nthere".to_vec();
         let (text, fmt) = decode(&bytes).unwrap();
         assert_eq!(text, "# hi\r\nthere");
-        assert_eq!(
-            fmt,
-            DocumentFormat {
-                charset: Charset::Utf8,
-                has_bom: true,
-                line_ending: LineEnding::Crlf
-            }
-        );
+        assert_eq!(fmt, DocumentFormat { charset: Charset::Utf8, has_bom: true, line_ending: LineEnding::Crlf });
         assert_eq!(encode(&text, &fmt), bytes);
     }
 
     #[test]
     fn utf16_and_utf32_round_trip() {
-        for charset in [
-            Charset::Utf16Le,
-            Charset::Utf16Be,
-            Charset::Utf32Le,
-            Charset::Utf32Be,
-        ] {
-            let fmt = DocumentFormat {
-                charset,
-                has_bom: true,
-                line_ending: LineEnding::Lf,
-            };
+        for charset in [Charset::Utf16Le, Charset::Utf16Be, Charset::Utf32Le, Charset::Utf32Be] {
+            let fmt = DocumentFormat { charset, has_bom: true, line_ending: LineEnding::Lf };
             let bytes = encode("日本語\n😀", &fmt);
             assert_eq!(detect_bom(&bytes), Some(charset));
             let (text, back) = decode(&bytes).unwrap();
@@ -554,17 +457,10 @@ mod tests {
     #[test]
     fn partial_replace_failure_restores_the_original() {
         let dir = temp_dir();
-        let (full, temp, backup) = (
-            dir.join("a.md"),
-            dir.join("a.md.1.tmp"),
-            dir.join("a.md.1.bak"),
-        );
+        let (full, temp, backup) = (dir.join("a.md"), dir.join("a.md.1.tmp"), dir.join("a.md.1.bak"));
         fs::write(&full, "original").unwrap();
         fs::write(&temp, "new").unwrap();
-        let ops = FileOps {
-            replace: replace_moves_original_then_fails,
-            rename: rename_refusing_temp,
-        };
+        let ops = FileOps { replace: replace_moves_original_then_fails, rename: rename_refusing_temp };
         assert!(swap_into_place(&full, &temp, &backup, &ops).is_err());
         assert_eq!(fs::read_to_string(&full).unwrap(), "original");
         assert!(!backup.exists());
@@ -575,17 +471,10 @@ mod tests {
     #[test]
     fn unsupported_replace_falls_back_to_move() {
         let dir = temp_dir();
-        let (full, temp, backup) = (
-            dir.join("a.md"),
-            dir.join("a.md.1.tmp"),
-            dir.join("a.md.1.bak"),
-        );
+        let (full, temp, backup) = (dir.join("a.md"), dir.join("a.md.1.tmp"), dir.join("a.md.1.bak"));
         fs::write(&full, "original").unwrap();
         fs::write(&temp, "new").unwrap();
-        let ops = FileOps {
-            replace: replace_unsupported,
-            rename: move_file,
-        };
+        let ops = FileOps { replace: replace_unsupported, rename: move_file };
         swap_into_place(&full, &temp, &backup, &ops).unwrap();
         assert_eq!(fs::read_to_string(&full).unwrap(), "new");
         assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
@@ -600,9 +489,7 @@ mod tests {
         let recorded = stamp(&path).unwrap();
         assert_eq!(check_disk(&path, recorded), DiskChange::Unchanged);
         fs::write(&path, "three").unwrap();
-        let DiskChange::Modified(now) = check_disk(&path, recorded) else {
-            panic!("not seen as modified")
-        };
+        let DiskChange::Modified(now) = check_disk(&path, recorded) else { panic!("not seen as modified") };
         assert_eq!(check_disk(&path, now), DiskChange::Unchanged);
         fs::remove_file(&path).unwrap();
         assert_eq!(check_disk(&path, now), DiskChange::Missing);
@@ -640,10 +527,7 @@ mod tests {
     #[test]
     fn rejects_shift_jis() {
         // "日本" in Shift-JIS
-        assert!(matches!(
-            decode(&[0x93, 0xFA, 0x96, 0x7B]),
-            Err(ReadError::InvalidEncoding(_))
-        ));
+        assert!(matches!(decode(&[0x93, 0xFA, 0x96, 0x7B]), Err(ReadError::InvalidEncoding(_))));
     }
 
     #[test]
@@ -652,12 +536,7 @@ mod tests {
         let e = decode(&bad_utf16).unwrap_err();
         assert!(matches!(e, ReadError::InvalidEncoding(Charset::Utf16Le)));
         assert!(e.to_string().contains("UTF-16"));
-        assert!(
-            decode(&[0x93, 0xFA])
-                .unwrap_err()
-                .to_string()
-                .contains("UTF-8")
-        );
+        assert!(decode(&[0x93, 0xFA]).unwrap_err().to_string().contains("UTF-8"));
     }
 
     #[test]

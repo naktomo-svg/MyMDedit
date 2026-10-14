@@ -22,10 +22,7 @@ fn is_word_char(unit: u16) -> bool {
 }
 
 pub fn units_equal(a: &[u16], b: &[u16], case_sensitive: bool) -> bool {
-    a.len() == b.len()
-        && a.iter()
-            .zip(b)
-            .all(|(&x, &y)| fold(x, case_sensitive) == fold(y, case_sensitive))
+    a.len() == b.len() && a.iter().zip(b).all(|(&x, &y)| fold(x, case_sensitive) == fold(y, case_sensitive))
 }
 
 /// Start offsets of every non-overlapping match of `query` in `text`.
@@ -38,8 +35,7 @@ pub fn find_all(text: &[u16], query: &[u16], case_sensitive: bool, whole_word: b
     while pos + query.len() <= text.len() {
         if units_equal(&text[pos..pos + query.len()], query, case_sensitive) {
             let end = pos + query.len();
-            let whole = (pos == 0 || !is_word_char(text[pos - 1]))
-                && (end >= text.len() || !is_word_char(text[end]));
+            let whole = (pos == 0 || !is_word_char(text[pos - 1])) && (end >= text.len() || !is_word_char(text[end]));
             if !whole_word || whole {
                 matches.push(pos);
                 pos = end;
@@ -53,21 +49,12 @@ pub fn find_all(text: &[u16], query: &[u16], case_sensitive: bool, whole_word: b
 
 /// The first match at or after `from`, wrapping to the first match.
 pub fn next(matches: &[usize], from: usize) -> Option<usize> {
-    matches
-        .iter()
-        .copied()
-        .find(|&m| m >= from)
-        .or(matches.first().copied())
+    matches.iter().copied().find(|&m| m >= from).or(matches.first().copied())
 }
 
 /// The last match before `from`, wrapping to the last match.
 pub fn previous(matches: &[usize], from: usize) -> Option<usize> {
-    matches
-        .iter()
-        .rev()
-        .copied()
-        .find(|&m| m < from)
-        .or(matches.last().copied())
+    matches.iter().rev().copied().find(|&m| m < from).or(matches.last().copied())
 }
 
 /// `text` with every match replaced, plus the replaced span `(start, old_end, new_text)`
@@ -105,10 +92,7 @@ mod tests {
         assert_eq!(find_all(&t, &w("cat"), false, false), vec![0, 4, 11, 15]);
         assert_eq!(find_all(&t, &w("cat"), true, false), vec![4, 11]);
         assert_eq!(find_all(&t, &w("cat"), false, true), vec![0, 4, 15]);
-        assert_eq!(
-            find_all(&w("日本語の日本"), &w("日本"), false, true),
-            Vec::<usize>::new()
-        );
+        assert_eq!(find_all(&w("日本語の日本"), &w("日本"), false, true), Vec::<usize>::new());
     }
 
     #[test]

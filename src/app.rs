@@ -12,24 +12,23 @@ use std::rc::Rc;
 
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, DT_CENTER, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, DT_WORDBREAK,
-    DrawTextW, EndPaint, GetDC, HFONT, HGDIOBJ, InvalidateRect, PAINTSTRUCT, ReleaseDC,
-    SelectObject, SetBkMode, SetTextColor, TRANSPARENT,
+    BeginPaint, DT_CENTER, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, DT_WORDBREAK, DrawTextW, EndPaint, GetDC,
+    HFONT, HGDIOBJ, InvalidateRect, PAINTSTRUCT, ReleaseDC, SelectObject, SetBkMode, SetTextColor, TRANSPARENT,
 };
 use windows::Win32::System::Diagnostics::Debug::MessageBeep;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Shutdown::{ShutdownBlockReasonCreate, ShutdownBlockReasonDestroy};
 use windows::Win32::UI::Controls::Dialogs::{
-    CommDlgExtendedError, FINDMSGSTRINGW, FINDREPLACE_FLAGS, FINDREPLACEW, FR_DIALOGTERM, FR_DOWN,
-    FR_FINDNEXT, FR_MATCHCASE, FR_REPLACE, FR_REPLACEALL, FR_WHOLEWORD, FindTextW, ReplaceTextW,
+    CommDlgExtendedError, FINDMSGSTRINGW, FINDREPLACE_FLAGS, FINDREPLACEW, FR_DIALOGTERM, FR_DOWN, FR_FINDNEXT,
+    FR_MATCHCASE, FR_REPLACE, FR_REPLACEALL, FR_WHOLEWORD, FindTextW, ReplaceTextW,
 };
 use windows::Win32::UI::Controls::{
-    DRAWITEMSTRUCT, ODS_SELECTED, TOOLTIPS_CLASSW, TTF_IDISHWND, TTF_SUBCLASS, TTM_ADDTOOLW,
-    TTM_SETMAXTIPWIDTH, TTTOOLINFOW,
+    DRAWITEMSTRUCT, ODS_SELECTED, TOOLTIPS_CLASSW, TTF_IDISHWND, TTF_SUBCLASS, TTM_ADDTOOLW, TTM_SETMAXTIPWIDTH,
+    TTTOOLINFOW,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyState, SetFocus, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent, VK_ADD, VK_CONTROL,
-    VK_MENU, VK_NUMPAD0, VK_OEM_MINUS, VK_OEM_PLUS, VK_RETURN, VK_SHIFT, VK_SUBTRACT, VK_TAB,
+    GetKeyState, SetFocus, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent, VK_ADD, VK_CONTROL, VK_MENU, VK_NUMPAD0,
+    VK_OEM_MINUS, VK_OEM_PLUS, VK_RETURN, VK_SHIFT, VK_SUBTRACT, VK_TAB,
 };
 use windows::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::*;
@@ -133,10 +132,7 @@ const ACCELERATORS: &[(u16, bool, bool, u16)] = &[
 ];
 
 pub fn accelerator_command(vk: u16, ctrl: bool, shift: bool) -> Option<u16> {
-    ACCELERATORS
-        .iter()
-        .find(|a| a.0 == vk && a.1 == ctrl && a.2 == shift)
-        .map(|a| a.3)
+    ACCELERATORS.iter().find(|a| a.0 == vk && a.1 == ctrl && a.2 == shift).map(|a| a.3)
 }
 
 struct ToolButton {
@@ -175,14 +171,7 @@ const TOOL_BUTTONS: [ToolButton; TOOL_BUTTON_COUNT] = [
         width: 32,
         tip: "斜体 (*斜体*)",
     },
-    ToolButton {
-        id: ID_HEADING,
-        label: "H",
-        font: ButtonFont::Bold,
-        dropdown: true,
-        width: 44,
-        tip: "見出し",
-    },
+    ToolButton { id: ID_HEADING, label: "H", font: ButtonFont::Bold, dropdown: true, width: 44, tip: "見出し" },
     ToolButton {
         id: ID_BULLET,
         label: "\u{E8FD}",
@@ -332,8 +321,7 @@ thread_local! {
 }
 
 pub fn app() -> Rc<App> {
-    APP.with(|a| a.borrow().clone())
-        .expect("app not initialized")
+    APP.with(|a| a.borrow().clone()).expect("app not initialized")
 }
 
 fn try_app() -> Option<Rc<App>> {
@@ -475,12 +463,7 @@ impl App {
 
     pub fn post_command(&self, cmd: u16) {
         unsafe {
-            let _ = PostMessageW(
-                Some(self.hwnd()),
-                WM_COMMAND,
-                WPARAM(cmd as usize),
-                LPARAM(0),
-            );
+            let _ = PostMessageW(Some(self.hwnd()), WM_COMMAND, WPARAM(cmd as usize), LPARAM(0));
         }
     }
 
@@ -496,11 +479,7 @@ impl App {
                 lpfnWndProc: Some(main_proc),
                 hInstance: instance.into(),
                 // MAKEINTRESOURCE(1): an integer resource id smuggled in a pointer, not an address.
-                hIcon: LoadIconW(
-                    Some(instance.into()),
-                    PCWSTR(std::ptr::without_provenance(1)),
-                )
-                .unwrap_or_default(),
+                hIcon: LoadIconW(Some(instance.into()), PCWSTR(std::ptr::without_provenance(1))).unwrap_or_default(),
                 hCursor: LoadCursorW(None, IDC_ARROW)?,
                 lpszClassName: class,
                 ..Default::default()
@@ -591,11 +570,7 @@ impl App {
 
             let find_message = RegisterWindowMessageW(FINDMSGSTRINGW);
             self.find_message.set(find_message);
-            let find = Box::leak(Box::new(FindData {
-                fr: FINDREPLACEW::default(),
-                find: [0; 512],
-                replace: [0; 512],
-            }));
+            let find = Box::leak(Box::new(FindData { fr: FINDREPLACEW::default(), find: [0; 512], replace: [0; 512] }));
             self.find.set(find);
 
             self.ui.set(Ui {
@@ -726,15 +701,7 @@ impl App {
         unsafe {
             let _ = DrawMenuBar(ui.hwnd);
             // Repaint the non-client area too: the menu bar is painted there.
-            let _ = SetWindowPos(
-                ui.hwnd,
-                None,
-                0,
-                0,
-                0,
-                0,
-                SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED,
-            );
+            let _ = SetWindowPos(ui.hwnd, None, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED);
             let _ = InvalidateRect(Some(ui.hwnd), None, true);
             for b in ui.buttons.iter().chain([&ui.error_close]) {
                 let _ = InvalidateRect(Some(*b), None, true);
@@ -766,12 +733,7 @@ impl App {
         }
         let (w, h) = (client.right, client.bottom);
 
-        let toolbar = RECT {
-            left: 0,
-            top: 0,
-            right: w,
-            bottom: s(40),
-        };
+        let toolbar = RECT { left: 0, top: 0, right: w, bottom: s(40) };
         let error_text = {
             let st = self.state.borrow();
             (!st.errors.is_empty()).then(|| st.errors.join("\n"))
@@ -780,39 +742,14 @@ impl App {
             Some(text) => self.measure_error_height(text, w),
             None => 0,
         };
-        let error = RECT {
-            left: 0,
-            top: toolbar.bottom,
-            right: w,
-            bottom: toolbar.bottom + error_h,
-        };
-        let footer = RECT {
-            left: 0,
-            top: (h - s(28)).max(error.bottom),
-            right: w,
-            bottom: h,
-        };
+        let error = RECT { left: 0, top: toolbar.bottom, right: w, bottom: toolbar.bottom + error_h };
+        let footer = RECT { left: 0, top: (h - s(28)).max(error.bottom), right: w, bottom: h };
         let body_top = error.bottom;
         let body_bottom = footer.top;
         let half = (w - 1).max(0) / 2;
-        let editor = RECT {
-            left: 0,
-            top: body_top,
-            right: half,
-            bottom: body_bottom,
-        };
-        let divider = RECT {
-            left: half,
-            top: body_top,
-            right: half + 1,
-            bottom: body_bottom,
-        };
-        let preview_rect = RECT {
-            left: half + 1,
-            top: body_top,
-            right: w,
-            bottom: body_bottom,
-        };
+        let editor = RECT { left: 0, top: body_top, right: half, bottom: body_bottom };
+        let divider = RECT { left: half, top: body_top, right: half + 1, bottom: body_bottom };
+        let preview_rect = RECT { left: half + 1, top: body_top, right: w, bottom: body_bottom };
 
         unsafe {
             // Toolbar buttons, after a short vertical separator.
@@ -824,24 +761,10 @@ impl App {
                 let _ = MoveWindow(*hb, x, by, bw, bh, true);
                 x += bw + s(4);
             }
-            let _ = MoveWindow(
-                ui.editor,
-                editor.left,
-                editor.top,
-                win::width(&editor),
-                win::height(&editor),
-                true,
-            );
+            let _ = MoveWindow(ui.editor, editor.left, editor.top, win::width(&editor), win::height(&editor), true);
             if error_h > 0 {
                 let size = s(32);
-                let _ = MoveWindow(
-                    ui.error_close,
-                    w - size - s(8),
-                    error.top + (error_h - size) / 2,
-                    size,
-                    size,
-                    true,
-                );
+                let _ = MoveWindow(ui.error_close, w - size - s(8), error.top + (error_h - size) / 2, size, size, true);
                 let _ = ShowWindow(ui.error_close, SW_SHOW);
             } else {
                 let _ = ShowWindow(ui.error_close, SW_HIDE);
@@ -849,13 +772,7 @@ impl App {
         }
         self.editor().set_padding(s(16));
         preview::set_bounds(self, preview_rect);
-        self.state.borrow_mut().layout = Layout {
-            toolbar,
-            error,
-            divider,
-            preview: preview_rect,
-            footer,
-        };
+        self.state.borrow_mut().layout = Layout { toolbar, error, divider, preview: preview_rect, footer };
         unsafe {
             let _ = InvalidateRect(Some(ui.hwnd), None, false);
         }
@@ -863,12 +780,7 @@ impl App {
 
     fn error_text_rect(&self, width: i32) -> RECT {
         let s = |v: i32| scale(v, self.ui.get().dpi);
-        RECT {
-            left: s(44),
-            top: 0,
-            right: (width - s(52)).max(s(44) + 1),
-            bottom: 0,
-        }
+        RECT { left: s(44), top: 0, right: (width - s(52)).max(s(44) + 1), bottom: 0 }
     }
 
     fn measure_error_height(&self, text: &str, width: i32) -> i32 {
@@ -879,12 +791,7 @@ impl App {
         unsafe {
             let hdc = GetDC(Some(ui.hwnd));
             let old = SelectObject(hdc, HGDIOBJ(ui.fonts.ui.0));
-            DrawTextW(
-                hdc,
-                &mut buf,
-                &mut rc,
-                DT_WORDBREAK | DT_NOPREFIX | windows::Win32::Graphics::Gdi::DT_CALCRECT,
-            );
+            DrawTextW(hdc, &mut buf, &mut rc, DT_WORDBREAK | DT_NOPREFIX | windows::Win32::Graphics::Gdi::DT_CALCRECT);
             SelectObject(hdc, old);
             ReleaseDC(Some(ui.hwnd), hdc);
         }
@@ -916,41 +823,20 @@ impl App {
 
             // Toolbar + its bottom border + the separator before the buttons.
             fill(hdc, &layout.toolbar, palette.window_bg);
-            let border = RECT {
-                top: layout.toolbar.bottom - 1,
-                ..layout.toolbar
-            };
+            let border = RECT { top: layout.toolbar.bottom - 1, ..layout.toolbar };
             fill(hdc, &border, palette.divider);
             let sep_h = s(20);
             let sep_top = (layout.toolbar.bottom - sep_h) / 2;
-            fill(
-                hdc,
-                &RECT {
-                    left: s(8),
-                    top: sep_top,
-                    right: s(8) + s(1),
-                    bottom: sep_top + sep_h,
-                },
-                palette.divider,
-            );
+            fill(hdc, &RECT { left: s(8), top: sep_top, right: s(8) + s(1), bottom: sep_top + sep_h }, palette.divider);
 
             if let Some(text) = error {
                 fill(hdc, &layout.error, palette.error_bg);
                 let old = SelectObject(hdc, HGDIOBJ(ui.fonts.icon.0));
                 SetTextColor(hdc, palette.error_icon);
                 let mut icon = "\u{EA39}".encode_utf16().collect::<Vec<_>>();
-                let mut icon_rc = RECT {
-                    left: s(12),
-                    top: layout.error.top,
-                    right: s(40),
-                    bottom: layout.error.bottom,
-                };
-                DrawTextW(
-                    hdc,
-                    &mut icon,
-                    &mut icon_rc,
-                    DT_SINGLELINE | DT_VCENTER | DT_CENTER,
-                );
+                let mut icon_rc =
+                    RECT { left: s(12), top: layout.error.top, right: s(40), bottom: layout.error.bottom };
+                DrawTextW(hdc, &mut icon, &mut icon_rc, DT_SINGLELINE | DT_VCENTER | DT_CENTER);
                 SelectObject(hdc, HGDIOBJ(ui.fonts.ui.0));
                 SetTextColor(hdc, palette.text);
                 let mut rc = self.error_text_rect(layout.error.right);
@@ -974,14 +860,7 @@ impl App {
             fill(hdc, &layout.preview, palette.editor_bg);
 
             fill(hdc, &layout.footer, palette.footer_bg);
-            fill(
-                hdc,
-                &RECT {
-                    bottom: layout.footer.top + 1,
-                    ..layout.footer
-                },
-                palette.divider,
-            );
+            fill(hdc, &RECT { bottom: layout.footer.top + 1, ..layout.footer }, palette.divider);
             let old = SelectObject(hdc, HGDIOBJ(ui.fonts.ui.0));
             SetTextColor(hdc, palette.text);
             let mut x = s(12);
@@ -1000,12 +879,7 @@ impl App {
                     right: x + win::width(&measure),
                     bottom: layout.footer.bottom,
                 };
-                DrawTextW(
-                    hdc,
-                    &mut buf,
-                    &mut rc,
-                    DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_NOPREFIX,
-                );
+                DrawTextW(hdc, &mut buf, &mut rc, DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_NOPREFIX);
                 x = rc.right + s(16);
             }
             SelectObject(hdc, old);
@@ -1019,11 +893,7 @@ impl App {
         let hovered = self.hovered.get() == dis.hwndItem;
         let pressed = dis.itemState.0 & ODS_SELECTED.0 != 0;
         let is_error_close = dis.CtlID == ID_ERROR_CLOSE as u32;
-        let base = if is_error_close {
-            palette.error_bg
-        } else {
-            palette.window_bg
-        };
+        let base = if is_error_close { palette.error_bg } else { palette.window_bg };
         let bg = if pressed {
             palette.pressed_bg
         } else if hovered {
@@ -1056,26 +926,12 @@ impl App {
                 rc.right -= s(12);
             }
             let mut buf: Vec<u16> = label.encode_utf16().collect();
-            DrawTextW(
-                dis.hDC,
-                &mut buf,
-                &mut rc,
-                DT_SINGLELINE | DT_VCENTER | DT_CENTER | DT_NOPREFIX,
-            );
+            DrawTextW(dis.hDC, &mut buf, &mut rc, DT_SINGLELINE | DT_VCENTER | DT_CENTER | DT_NOPREFIX);
             if dropdown {
                 SelectObject(dis.hDC, HGDIOBJ(ui.fonts.icon_small.0));
                 let mut chevron: Vec<u16> = "\u{E70D}".encode_utf16().collect();
-                let mut crc = RECT {
-                    left: dis.rcItem.right - s(16),
-                    right: dis.rcItem.right - s(2),
-                    ..dis.rcItem
-                };
-                DrawTextW(
-                    dis.hDC,
-                    &mut chevron,
-                    &mut crc,
-                    DT_SINGLELINE | DT_VCENTER | DT_CENTER,
-                );
+                let mut crc = RECT { left: dis.rcItem.right - s(16), right: dis.rcItem.right - s(2), ..dis.rcItem };
+                DrawTextW(dis.hDC, &mut chevron, &mut crc, DT_SINGLELINE | DT_VCENTER | DT_CENTER);
             }
             SelectObject(dis.hDC, old);
         }
@@ -1091,11 +947,7 @@ impl App {
     fn update_title(&self) {
         let title = {
             let st = self.state.borrow();
-            if st.dirty {
-                format!("{} *", st.file_name)
-            } else {
-                st.file_name.clone()
-            }
+            if st.dirty { format!("{} *", st.file_name) } else { st.file_name.clone() }
         };
         let t = wide(&title);
         unsafe {
@@ -1107,12 +959,7 @@ impl App {
 
     /// Records a failure and shows it in the banner under the toolbar — the app's only
     /// user-visible error surface. Stays until the user closes it.
-    pub fn report_error(
-        &self,
-        context: &str,
-        message: &str,
-        cause: Option<&dyn std::fmt::Display>,
-    ) {
+    pub fn report_error(&self, context: &str, message: &str, cause: Option<&dyn std::fmt::Display>) {
         match cause {
             Some(c) => log::error(context, c),
             None => log::error(context, message),
@@ -1124,9 +971,7 @@ impl App {
     fn report_file_error(&self, context: &str, message: &str, e: &ReadError) {
         match e {
             // Already written for the user.
-            ReadError::InvalidEncoding(_) | ReadError::ContainsNul => {
-                self.report_error(context, &e.to_string(), None)
-            }
+            ReadError::InvalidEncoding(_) | ReadError::ContainsNul => self.report_error(context, &e.to_string(), None),
             ReadError::Io(io) => self.report_error(context, &format!("{message} ({io})"), Some(io)),
         }
     }
@@ -1261,17 +1106,9 @@ impl App {
     fn open_settings(&self) {
         let (current, fonts, palette) = {
             let st = self.state.borrow();
-            (
-                st.settings.current().clone(),
-                st.installed_fonts.clone(),
-                st.palette,
-            )
+            (st.settings.current().clone(), st.installed_fonts.clone(), st.palette)
         };
-        let fonts = if fonts.is_empty() {
-            vec!["Segoe UI".into(), "Consolas".into()]
-        } else {
-            fonts
-        };
+        let fonts = if fonts.is_empty() { vec!["Segoe UI".into(), "Consolas".into()] } else { fonts };
         let edits = match settings_dialog::show(
             self.hwnd(),
             &current,
@@ -1287,11 +1124,7 @@ impl App {
             Ok(None) => return,
             Err(e) => {
                 // The user asked for this dialog; its absence needs explaining.
-                self.report_error(
-                    "SettingsDialog",
-                    "設定ダイアログを表示できませんでした。",
-                    Some(&e),
-                );
+                self.report_error("SettingsDialog", "設定ダイアログを表示できませんでした。", Some(&e));
                 return;
             }
         };
@@ -1313,16 +1146,12 @@ impl App {
         if settings::add_recent_folder(&current, &folder) == current {
             return; // Saving the same file again changes nothing worth a settings write.
         }
-        self.persist_settings(|s| {
-            s.recent_folders = settings::add_recent_folder(&s.recent_folders, &folder)
-        });
+        self.persist_settings(|s| s.recent_folders = settings::add_recent_folder(&s.recent_folders, &folder));
         self.rebuild_recent_menu();
     }
 
     fn remove_recent_folder(&self, folder: &str) {
-        self.persist_settings(|s| {
-            s.recent_folders = settings::remove_recent_folder(&s.recent_folders, folder)
-        });
+        self.persist_settings(|s| s.recent_folders = settings::remove_recent_folder(&s.recent_folders, folder));
         self.rebuild_recent_menu();
     }
 
@@ -1341,10 +1170,8 @@ impl App {
             let _ = InsertMenuW(menu, pos, MF_BYPOSITION | MF_SEPARATOR, 0, None);
             pos += 1;
             for (i, folder) in folders.iter().enumerate() {
-                let name = Path::new(folder)
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .filter(|n| !n.is_empty());
+                let name =
+                    Path::new(folder).file_name().map(|n| n.to_string_lossy().into_owned()).filter(|n| !n.is_empty());
                 // Win32 menus have no per-item tooltip; the full path goes in the
                 // right-hand column instead.
                 let label = match name {
@@ -1352,13 +1179,8 @@ impl App {
                     None => folder.replace('&', "&&"),
                 };
                 let t = wide(&label);
-                let _ = InsertMenuW(
-                    menu,
-                    pos,
-                    MF_BYPOSITION | MF_STRING,
-                    (ID_RECENT_BASE + i as u16) as usize,
-                    pcwstr(&t),
-                );
+                let _ =
+                    InsertMenuW(menu, pos, MF_BYPOSITION | MF_STRING, (ID_RECENT_BASE + i as u16) as usize, pcwstr(&t));
                 pos += 1;
             }
             self.state.borrow_mut().recent_items = pos - EXIT_SEPARATOR_POS;
@@ -1391,18 +1213,12 @@ impl App {
         std::thread::spawn(move || {
             // Listing must actually be attempted: one entry is enough. An empty folder
             // is a perfectly good folder; only the error matters.
-            let result =
-                std::fs::read_dir(&folder).and_then(|mut it| it.next().transpose().map(|_| ()));
+            let result = std::fs::read_dir(&folder).and_then(|mut it| it.next().transpose().map(|_| ()));
             if tx.send(result).is_err() {
                 return; // The app is gone.
             }
             unsafe {
-                if let Err(e) = PostMessageW(
-                    Some(HWND(hwnd as *mut _)),
-                    WM_APP_FOLDER_PROBED,
-                    WPARAM(0),
-                    LPARAM(0),
-                ) {
+                if let Err(e) = PostMessageW(Some(HWND(hwnd as *mut _)), WM_APP_FOLDER_PROBED, WPARAM(0), LPARAM(0)) {
                     // The result waits in the channel; the next click on a recent folder collects it.
                     log::error("open_from_recent PostMessage", &e);
                 }
@@ -1465,9 +1281,7 @@ impl App {
             return;
         }
         match dialogs::open_file(self.hwnd(), Some(Path::new(&folder))) {
-            Ok(Some(path)) => {
-                self.read_and_apply(&path, "OpenFromFolder", "ファイルを開けませんでした。")
-            }
+            Ok(Some(path)) => self.read_and_apply(&path, "OpenFromFolder", "ファイルを開けませんでした。"),
             Ok(None) => {}
             Err(e) => self.report_error(
                 "OpenFromFolder",
@@ -1524,11 +1338,7 @@ impl App {
         match dialogs::open_file(self.hwnd(), None) {
             Ok(Some(path)) => self.read_and_apply(&path, "Open", "ファイルを開けませんでした。"),
             Ok(None) => {}
-            Err(e) => self.report_error(
-                "Open",
-                &format!("ファイルを開けませんでした。 ({})", e.message()),
-                Some(&e),
-            ),
+            Err(e) => self.report_error("Open", &format!("ファイルを開けませんでした。 ({})", e.message()), Some(&e)),
         }
     }
 
@@ -1536,11 +1346,7 @@ impl App {
         if !self.confirm_discard(false) {
             return;
         }
-        self.read_and_apply(
-            path,
-            "OpenFile",
-            &format!("ファイルを開けませんでした: {}", path.display()),
-        );
+        self.read_and_apply(path, "OpenFile", &format!("ファイルを開けませんでした: {}", path.display()));
     }
 
     /// On failure the current document is deliberately left untouched.
@@ -1556,11 +1362,8 @@ impl App {
     fn apply_opened(&self, doc: OpenedDocument) {
         {
             let mut st = self.state.borrow_mut();
-            st.file_name = doc
-                .path
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_else(|| UNTITLED.into());
+            st.file_name =
+                doc.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| UNTITLED.into());
             st.file_path = Some(doc.path.clone());
             st.format = doc.format;
             st.disk_stamp = doc.stamp;
@@ -1574,12 +1377,7 @@ impl App {
     fn save(&self) {
         let (path, format, recorded, name) = {
             let st = self.state.borrow();
-            (
-                st.file_path.clone(),
-                st.format,
-                st.disk_stamp,
-                st.file_name.clone(),
-            )
+            (st.file_path.clone(), st.format, st.disk_stamp, st.file_name.clone())
         };
         let Some(path) = path else {
             self.save_as();
@@ -1602,11 +1400,7 @@ impl App {
         let (text, replaced) = document::text_from_editor(&self.editor().text());
         if let Err(e) = document::save_atomic(&path, &text, &format) {
             // The dirty flag stays: a failed save can never pass for a successful one.
-            self.report_error(
-                "Save",
-                &format!("保存できませんでした: {} ({e})", path.display()),
-                Some(&e),
-            );
+            self.report_error("Save", &format!("保存できませんでした: {} ({e})", path.display()), Some(&e));
             return;
         }
         self.record_saved(&path);
@@ -1635,19 +1429,12 @@ impl App {
         let (text, replaced) = document::text_from_editor(&self.editor().text());
         if let Err(e) = document::save_atomic(&path, &text, &format) {
             // The document was never written there, so it must not claim that path.
-            self.report_error(
-                "SaveAs",
-                &format!("保存できませんでした: {} ({e})", path.display()),
-                Some(&e),
-            );
+            self.report_error("SaveAs", &format!("保存できませんでした: {} ({e})", path.display()), Some(&e));
             return;
         }
         {
             let mut st = self.state.borrow_mut();
-            st.file_name = path
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_default();
+            st.file_name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
             st.file_path = Some(path.clone());
         }
         self.record_saved(&path);
@@ -1670,9 +1457,7 @@ impl App {
 
     /// After a successful write to `path`: clean, and what is on disk is now ours.
     fn record_saved(&self, path: &Path) {
-        let stamp = document::stamp(path)
-            .inspect_err(|e| log::error("record_saved stamp", e))
-            .ok();
+        let stamp = document::stamp(path).inspect_err(|e| log::error("record_saved stamp", e)).ok();
         let mut st = self.state.borrow_mut();
         st.dirty = false;
         st.disk_stamp = stamp;
@@ -1716,11 +1501,10 @@ impl App {
                     // longer UTF-8) must not ask again on every activation.
                     self.state.borrow_mut().disk_stamp = Some(now);
                     // An undisplayable prompt keeps the editor's text: nothing is lost.
-                    let reload =
-                        dialogs::confirm_reload(self.hwnd(), &name, dirty).unwrap_or_else(|e| {
-                            log::error("confirm_reload", &e);
-                            false
-                        });
+                    let reload = dialogs::confirm_reload(self.hwnd(), &name, dirty).unwrap_or_else(|e| {
+                        log::error("confirm_reload", &e);
+                        false
+                    });
                     if reload {
                         self.read_and_apply(
                             &path,
@@ -1856,11 +1640,7 @@ impl App {
                 let _ = AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, pcwstr(&t));
             }
             for (i, h) in headings.iter().enumerate() {
-                let title = if h.title.is_empty() {
-                    "(空の見出し)"
-                } else {
-                    &h.title
-                };
+                let title = if h.title.is_empty() { "(空の見出し)" } else { &h.title };
                 // `&` would become a mnemonic and a tab would start the shortcut column.
                 let title = title.replace('&', "&&").replace('\t', " ");
                 let t = wide(&format!("{}{title}", "\u{3000}".repeat(h.level - 1)));
@@ -1893,12 +1673,7 @@ impl App {
         let (start, _) = editor.selection();
         let current = md_ops::line_index_at(&text, start) + 1;
         let palette = self.state.borrow().palette;
-        match goto_dialog::show(
-            self.hwnd(),
-            current,
-            line_endings::count_lines(&text),
-            palette,
-        ) {
+        match goto_dialog::show(self.hwnd(), current, line_endings::count_lines(&text), palette) {
             Ok(Some(line)) => self.select_and_reveal(md_ops::line_start_of(&text, line - 1), 0),
             Ok(None) => {}
             Err(e) => self.report_error(
@@ -1917,11 +1692,7 @@ impl App {
         };
         let button = ui.buttons[index];
         let items: &[(u16, &str)] = if button_id == ID_HEADING {
-            &[
-                (ID_H1, "見出し1\t# 見出し"),
-                (ID_H2, "見出し2\t## 見出し"),
-                (ID_H3, "見出し3\t### 見出し"),
-            ]
+            &[(ID_H1, "見出し1\t# 見出し"), (ID_H2, "見出し2\t## 見出し"), (ID_H3, "見出し3\t### 見出し")]
         } else {
             &[
                 (ID_QUOTE, "引用\t> 引用文"),
@@ -1986,11 +1757,8 @@ impl App {
                 data.find[..len].copy_from_slice(sel);
             }
         }
-        let flags = if data.fr.Flags.0 == 0 {
-            FR_DOWN
-        } else {
-            data.fr.Flags & (FR_DOWN | FR_MATCHCASE | FR_WHOLEWORD)
-        };
+        let flags =
+            if data.fr.Flags.0 == 0 { FR_DOWN } else { data.fr.Flags & (FR_DOWN | FR_MATCHCASE | FR_WHOLEWORD) };
         data.fr = FINDREPLACEW {
             lStructSize: size_of::<FINDREPLACEW>() as u32,
             hwndOwner: ui.hwnd,
@@ -2001,22 +1769,10 @@ impl App {
             wReplaceWithLen: data.replace.len() as u16,
             ..Default::default()
         };
-        let dialog = unsafe {
-            if replace {
-                ReplaceTextW(&mut data.fr)
-            } else {
-                FindTextW(&mut data.fr)
-            }
-        };
+        let dialog = unsafe { if replace { ReplaceTextW(&mut data.fr) } else { FindTextW(&mut data.fr) } };
         if dialog.is_invalid() {
             let code = unsafe { CommDlgExtendedError() };
-            log::error(
-                "FindTextW",
-                format!(
-                    "could not create the dialog: CommDlgExtendedError={}",
-                    code.0
-                ),
-            );
+            log::error("FindTextW", format!("could not create the dialog: CommDlgExtendedError={}", code.0));
             return;
         }
         self.state.borrow_mut().find_is_replace = replace;
@@ -2027,19 +1783,10 @@ impl App {
 
     fn find_message_box(&self, text: &str) {
         let owner = self.ui.get().find_dialog;
-        let owner = if owner.is_invalid() {
-            self.hwnd()
-        } else {
-            owner
-        };
+        let owner = if owner.is_invalid() { self.hwnd() } else { owner };
         let t = wide(text);
         unsafe {
-            MessageBoxW(
-                Some(owner),
-                pcwstr(&t),
-                w!("MyMDedit"),
-                MB_OK | MB_ICONINFORMATION,
-            );
+            MessageBoxW(Some(owner), pcwstr(&t), w!("MyMDedit"), MB_OK | MB_ICONINFORMATION);
         }
     }
 
@@ -2074,9 +1821,7 @@ impl App {
         if flags.contains(FR_REPLACEALL) {
             let text = editor.text();
             let matches = search::find_all(&text, &query, case, whole);
-            let Some((start, end, new)) =
-                search::replace_all(&text, &matches, query.len(), &replacement)
-            else {
+            let Some((start, end, new)) = search::replace_all(&text, &matches, query.len(), &replacement) else {
                 self.find_message_box("一致する文字列が見つかりませんでした");
                 return;
             };
@@ -2118,17 +1863,9 @@ impl App {
     fn command(&self, id: u16) {
         // Commands that open modal UI must not nest (e.g. a shortcut forwarded from the
         // WebView while a dialog is already up).
-        let modal = matches!(
-            id,
-            ID_NEW
-                | ID_OPEN
-                | ID_SAVE
-                | ID_SAVE_AS
-                | ID_EXIT
-                | ID_SETTINGS
-                | ID_GOTO_LINE
-                | ID_OUTLINE
-        ) || (ID_RECENT_BASE..ID_RECENT_END).contains(&id);
+        let modal =
+            matches!(id, ID_NEW | ID_OPEN | ID_SAVE | ID_SAVE_AS | ID_EXIT | ID_SETTINGS | ID_GOTO_LINE | ID_OUTLINE)
+                || (ID_RECENT_BASE..ID_RECENT_END).contains(&id);
         if modal && self.busy.replace(true) {
             return;
         }
@@ -2159,35 +1896,17 @@ impl App {
                 let level = (id - ID_H1 + 1) as usize;
                 self.apply_op(|t, s, _| md_ops::set_heading(t, s, level));
             }
-            ID_BULLET => {
-                self.apply_op(|t, s, l| md_ops::prefix_lines(t, s, l, false, |_| "- ".into()))
-            }
-            ID_NUMBERED => self.apply_op(|t, s, l| {
-                md_ops::prefix_lines(t, s, l, false, |i| format!("{}. ", i + 1))
-            }),
-            ID_LINK => {
-                self.apply_op(|t, s, l| md_ops::insert_link(t, s, l, "[", "リンクテキスト", "url"))
-            }
+            ID_BULLET => self.apply_op(|t, s, l| md_ops::prefix_lines(t, s, l, false, |_| "- ".into())),
+            ID_NUMBERED => self.apply_op(|t, s, l| md_ops::prefix_lines(t, s, l, false, |i| format!("{}. ", i + 1))),
+            ID_LINK => self.apply_op(|t, s, l| md_ops::insert_link(t, s, l, "[", "リンクテキスト", "url")),
             ID_CODE => self.apply_op(|t, s, l| md_ops::wrap_selection(t, s, l, "`", "`", "コード")),
-            ID_QUOTE => {
-                self.apply_op(|t, s, l| md_ops::prefix_lines(t, s, l, false, |_| "> ".into()))
-            }
+            ID_QUOTE => self.apply_op(|t, s, l| md_ops::prefix_lines(t, s, l, false, |_| "> ".into())),
             ID_RULE => self.apply_op(|t, s, l| md_ops::insert_block(t, s, l, "---", true)),
-            ID_IMAGE => {
-                self.apply_op(|t, s, l| md_ops::insert_link(t, s, l, "![", "代替テキスト", "url"))
-            }
+            ID_IMAGE => self.apply_op(|t, s, l| md_ops::insert_link(t, s, l, "![", "代替テキスト", "url")),
             ID_TABLE => self.apply_op(|t, s, l| {
-                md_ops::insert_block(
-                    t,
-                    s,
-                    l,
-                    "| 見出し1 | 見出し2 |\r| --- | --- |\r| セル1 | セル2 |",
-                    true,
-                )
+                md_ops::insert_block(t, s, l, "| 見出し1 | 見出し2 |\r| --- | --- |\r| セル1 | セル2 |", true)
             }),
-            ID_STRIKE => {
-                self.apply_op(|t, s, l| md_ops::wrap_selection(t, s, l, "~~", "~~", "取り消し線"))
-            }
+            ID_STRIKE => self.apply_op(|t, s, l| md_ops::wrap_selection(t, s, l, "~~", "~~", "取り消し線")),
             ID_CODE_BLOCK => self.apply_op(md_ops::code_block),
             ID_TASK => self.apply_op(md_ops::toggle_task),
             ID_GOTO_LINE => self.goto_line(),
@@ -2197,10 +1916,7 @@ impl App {
             }
             _ => {}
         }
-        if matches!(
-            id,
-            ID_UNDO | ID_REDO | ID_CUT | ID_COPY | ID_PASTE | ID_SELECT_ALL | ID_ERROR_CLOSE
-        ) {
+        if matches!(id, ID_UNDO | ID_REDO | ID_CUT | ID_COPY | ID_PASTE | ID_SELECT_ALL | ID_ERROR_CLOSE) {
             editor.focus();
         }
         if modal {
@@ -2231,12 +1947,7 @@ impl App {
 
 // ---- window procedures ------------------------------------------------------------
 
-unsafe extern "system" fn main_proc(
-    hwnd: HWND,
-    msg: u32,
-    wparam: WPARAM,
-    lparam: LPARAM,
-) -> LRESULT {
+unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     let Some(app) = try_app() else {
         return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
     };
@@ -2246,9 +1957,7 @@ unsafe extern "system" fn main_proc(
     }
 
     let palette = app.state.borrow().palette;
-    if let Some(r) =
-        theme::handle_menu_bar_message(hwnd, msg, wparam, lparam, &palette, app.ui.get().fonts.menu)
-    {
+    if let Some(r) = theme::handle_menu_bar_message(hwnd, msg, wparam, lparam, &palette, app.ui.get().fonts.menu) {
         return r;
     }
     if msg == app.find_message.get() && msg != 0 {
@@ -2298,10 +2007,7 @@ unsafe extern "system" fn main_proc(
         WM_GETMINMAXINFO => {
             let info = unsafe { &mut *(lparam.0 as *mut MINMAXINFO) };
             let dpi = app.ui.get().dpi.max(96);
-            info.ptMinTrackSize = POINT {
-                x: scale(640, dpi),
-                y: scale(400, dpi),
-            };
+            info.ptMinTrackSize = POINT { x: scale(640, dpi), y: scale(400, dpi) };
             LRESULT(0)
         }
         WM_SETFOCUS => {
@@ -2314,9 +2020,7 @@ unsafe extern "system" fn main_proc(
             // the middle of a focus change.
             if loword(wparam.0) as u32 != WA_INACTIVE && !app.disk_check_pending.replace(true) {
                 unsafe {
-                    if let Err(e) =
-                        PostMessageW(Some(hwnd), WM_APP_CHECK_DISK, WPARAM(0), LPARAM(0))
-                    {
+                    if let Err(e) = PostMessageW(Some(hwnd), WM_APP_CHECK_DISK, WPARAM(0), LPARAM(0)) {
                         log::error("WM_ACTIVATE PostMessage", &e);
                         app.disk_check_pending.set(false);
                     }
@@ -2352,11 +2056,7 @@ unsafe extern "system" fn main_proc(
         WM_SETTINGCHANGE => {
             // Follow the OS light/dark switch when the theme is システムの既定.
             let area = if lparam.0 != 0 {
-                unsafe {
-                    PCWSTR(lparam.0 as *const u16)
-                        .to_string()
-                        .unwrap_or_default()
-                }
+                unsafe { PCWSTR(lparam.0 as *const u16).to_string().unwrap_or_default() }
             } else {
                 String::new()
             };
@@ -2407,11 +2107,7 @@ const WHEEL_DELTA: i32 = 120;
 /// remainder. High-resolution touchpads send many deltas well under 120; each used to
 /// move the zoom a full 10%. A direction change discards the old remainder.
 fn wheel_steps(accum: i32, delta: i32) -> (i32, i32) {
-    let accum = if accum.signum() * delta.signum() < 0 {
-        0
-    } else {
-        accum
-    };
+    let accum = if accum.signum() * delta.signum() < 0 { 0 } else { accum };
     let total = accum + delta;
     (total / WHEEL_DELTA, total % WHEEL_DELTA)
 }
@@ -2446,9 +2142,7 @@ unsafe extern "system" fn editor_proc(
                 app.swallow_char.set(0);
                 // Modified Enter / Tab are not plain line breaks or tabs; leave them to
                 // RichEdit. (Ctrl+Enter never gets here: it is the タスク accelerator.)
-                let modified = unsafe {
-                    GetKeyState(VK_CONTROL.0 as i32) < 0 || GetKeyState(VK_MENU.0 as i32) < 0
-                };
+                let modified = unsafe { GetKeyState(VK_CONTROL.0 as i32) < 0 || GetKeyState(VK_MENU.0 as i32) < 0 };
                 let consumed = match wparam.0 {
                     _ if modified => None,
                     k if k == VK_RETURN.0 as usize => app.on_editor_enter().then_some(0x0D),

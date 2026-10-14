@@ -24,25 +24,21 @@ use windows::core::{BOOL, HSTRING, Interface, PWSTR, w};
 use webview2_com::Microsoft::Web::WebView2::Win32::{
     COREWEBVIEW2_COLOR, COREWEBVIEW2_KEY_EVENT_KIND, COREWEBVIEW2_KEY_EVENT_KIND_KEY_DOWN,
     COREWEBVIEW2_KEY_EVENT_KIND_SYSTEM_KEY_DOWN, COREWEBVIEW2_PROCESS_FAILED_KIND,
-    COREWEBVIEW2_PROCESS_FAILED_KIND_BROWSER_PROCESS_EXITED,
-    COREWEBVIEW2_PROCESS_FAILED_KIND_RENDER_PROCESS_EXITED, COREWEBVIEW2_WEB_ERROR_STATUS,
-    COREWEBVIEW2_WEB_RESOURCE_CONTEXT, COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL,
+    COREWEBVIEW2_PROCESS_FAILED_KIND_BROWSER_PROCESS_EXITED, COREWEBVIEW2_PROCESS_FAILED_KIND_RENDER_PROCESS_EXITED,
+    COREWEBVIEW2_WEB_ERROR_STATUS, COREWEBVIEW2_WEB_RESOURCE_CONTEXT, COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL,
     COREWEBVIEW2_WEB_RESOURCE_CONTEXT_IMAGE, COREWEBVIEW2_WEB_RESOURCE_REQUEST_SOURCE_KINDS_ALL,
-    CreateCoreWebView2EnvironmentWithOptions, ICoreWebView2, ICoreWebView2_4, ICoreWebView2_5,
-    ICoreWebView2_18, ICoreWebView2_22, ICoreWebView2Controller, ICoreWebView2Controller2,
-    ICoreWebView2CreateCoreWebView2ControllerCompletedHandler, ICoreWebView2Environment,
-    ICoreWebView2Environment10, ICoreWebView2EnvironmentOptions,
-    ICoreWebView2NavigationStartingEventArgs, ICoreWebView2Settings4,
+    CreateCoreWebView2EnvironmentWithOptions, ICoreWebView2, ICoreWebView2_4, ICoreWebView2_5, ICoreWebView2_18,
+    ICoreWebView2_22, ICoreWebView2Controller, ICoreWebView2Controller2,
+    ICoreWebView2CreateCoreWebView2ControllerCompletedHandler, ICoreWebView2Environment, ICoreWebView2Environment10,
+    ICoreWebView2EnvironmentOptions, ICoreWebView2NavigationStartingEventArgs, ICoreWebView2Settings4,
     ICoreWebView2WebResourceRequestedEventArgs,
 };
 use webview2_com::{
-    AcceleratorKeyPressedEventHandler, ClientCertificateRequestedEventHandler,
-    CoreWebView2EnvironmentOptions, CreateCoreWebView2ControllerCompletedHandler,
-    CreateCoreWebView2EnvironmentCompletedHandler, DownloadStartingEventHandler,
-    ExecuteScriptCompletedHandler, LaunchingExternalUriSchemeEventHandler,
-    NavigationCompletedEventHandler, NavigationStartingEventHandler,
-    NewWindowRequestedEventHandler, ProcessFailedEventHandler, WebResourceRequestedEventHandler,
-    take_pwstr,
+    AcceleratorKeyPressedEventHandler, ClientCertificateRequestedEventHandler, CoreWebView2EnvironmentOptions,
+    CreateCoreWebView2ControllerCompletedHandler, CreateCoreWebView2EnvironmentCompletedHandler,
+    DownloadStartingEventHandler, ExecuteScriptCompletedHandler, LaunchingExternalUriSchemeEventHandler,
+    NavigationCompletedEventHandler, NavigationStartingEventHandler, NewWindowRequestedEventHandler,
+    ProcessFailedEventHandler, WebResourceRequestedEventHandler, take_pwstr,
 };
 
 use crate::app::{App, app};
@@ -95,11 +91,7 @@ enum CrashResponse {
 /// What to do about a dead WebView2 process, given how many times that has already
 /// happened. Bounded both ways: a document that reliably kills the renderer, or a
 /// runtime that keeps dying, must not turn into an endless respawn loop.
-fn crash_response(
-    process: CrashedProcess,
-    renderer_crashes: u32,
-    browser_restarts: u32,
-) -> CrashResponse {
+fn crash_response(process: CrashedProcess, renderer_crashes: u32, browser_restarts: u32) -> CrashResponse {
     match process {
         CrashedProcess::Renderer if renderer_crashes < MAX_CRASH_RETRIES => CrashResponse::Rerender,
         CrashedProcess::Browser if browser_restarts < MAX_CRASH_RETRIES => CrashResponse::Restart,
@@ -111,11 +103,7 @@ fn crash_response(
 /// Recovers from a dead process, on the main window's own message (never inside the
 /// WebView2 callback that reported it).
 pub fn on_process_failed(app: &App, browser: bool) {
-    let process = if browser {
-        CrashedProcess::Browser
-    } else {
-        CrashedProcess::Renderer
-    };
+    let process = if browser { CrashedProcess::Browser } else { CrashedProcess::Renderer };
     let response = {
         let mut p = app.preview.borrow_mut();
         // Whatever was in flight died with the process.
@@ -169,11 +157,7 @@ fn uses_blocked_scheme(uri: &str) -> bool {
     // Compared as bytes: slicing the &str at a scheme's length can land inside a
     // multi-byte character and panic — inside a WebView2 callback, where a panic aborts
     // the process and takes the unsaved document with it.
-    BLOCKED_SCHEMES.iter().any(|s| {
-        uri.as_bytes()
-            .get(..s.len())
-            .is_some_and(|p| p.eq_ignore_ascii_case(s.as_bytes()))
-    })
+    BLOCKED_SCHEMES.iter().any(|s| uri.as_bytes().get(..s.len()).is_some_and(|p| p.eq_ignore_ascii_case(s.as_bytes())))
 }
 
 /// The guard, as a pure decision. Both conditions only ever deny; neither can admit a
@@ -194,10 +178,7 @@ fn navigation_allowed(pending_self: i32, uri: &str) -> bool {
 /// locally and never sent.
 fn request_allowed(context: COREWEBVIEW2_WEB_RESOURCE_CONTEXT, uri: &str) -> bool {
     const HTTPS: &[u8] = b"https:";
-    let https = uri
-        .as_bytes()
-        .get(..HTTPS.len())
-        .is_some_and(|p| p.eq_ignore_ascii_case(HTTPS));
+    let https = uri.as_bytes().get(..HTTPS.len()).is_some_and(|p| p.eq_ignore_ascii_case(HTTPS));
     !uses_blocked_scheme(uri) || (context == COREWEBVIEW2_WEB_RESOURCE_CONTEXT_IMAGE && https)
 }
 
@@ -212,16 +193,12 @@ fn allow_request(args: &ICoreWebView2WebResourceRequestedEventArgs) -> windows::
     let uri = take_pwstr(uri);
     let allowed = request_allowed(context, &uri);
     if !allowed {
-        log::error(
-            "PreviewRequestBlocked",
-            format!("blocked request to {}", describe_uri(&uri)),
-        );
+        log::error("PreviewRequestBlocked", format!("blocked request to {}", describe_uri(&uri)));
     }
     Ok(allowed)
 }
 
-const STOPPED: &str =
-    "プレビューの安全確認に失敗したため、プレビューを停止しました。編集と保存は引き続き行えます。";
+const STOPPED: &str = "プレビューの安全確認に失敗したため、プレビューを停止しました。編集と保存は引き続き行えます。";
 
 /// The guard could not enforce a denial. Fail closed: no further document is ever
 /// loaded, and the preview is hidden so whatever got through cannot be seen or used.
@@ -242,9 +219,7 @@ fn stop_preview(context: &str, e: &windows::core::Error) {
 
 /// The guard's decision for one NavigationStarting. Every way of failing to decide is
 /// an `Err`, which the caller turns into a cancel — the guard must fail closed.
-fn allow_navigation(
-    args: &ICoreWebView2NavigationStartingEventArgs,
-) -> windows::core::Result<bool> {
+fn allow_navigation(args: &ICoreWebView2NavigationStartingEventArgs) -> windows::core::Result<bool> {
     let mut uri = PWSTR::null();
     let mut id = 0u64;
     unsafe {
@@ -255,10 +230,7 @@ fn allow_navigation(
     let app = app();
     let mut p = app.preview.borrow_mut();
     if !navigation_allowed(p.pending_self, &uri) {
-        log::error(
-            "PreviewNavigationBlocked",
-            format!("blocked navigation to {}", describe_uri(&uri)),
-        );
+        log::error("PreviewNavigationBlocked", format!("blocked navigation to {}", describe_uri(&uri)));
         return Ok(false);
     }
     p.pending_self -= 1;
@@ -279,65 +251,41 @@ const INIT_FAILED: &str = "プレビューを初期化できませんでした�
 
 pub fn start(this: &App, parent: HWND) {
     let data_dir = std::env::var_os("LOCALAPPDATA")
-        .map(|d| {
-            std::path::PathBuf::from(d)
-                .join("MyMDedit")
-                .join("WebView2")
-        })
+        .map(|d| std::path::PathBuf::from(d).join("MyMDedit").join("WebView2"))
         .unwrap_or_else(|| std::env::temp_dir().join("MyMDedit-WebView2"));
 
-    let handler =
-        CreateCoreWebView2EnvironmentCompletedHandler::create(Box::new(move |result, env| {
-            let env = match (result, env) {
-                (Ok(()), Some(env)) => env,
-                (r, _) => {
-                    app().report_error(
-                        "CreateCoreWebView2Environment",
-                        INIT_FAILED,
-                        Some(&format!("{r:?}")),
-                    );
-                    return Ok(());
-                }
-            };
-            let env_for_configure = env.clone();
-            let handler = CreateCoreWebView2ControllerCompletedHandler::create(Box::new(
-                move |result, controller| {
-                    match (result, controller) {
-                        (Ok(()), Some(controller)) => {
-                            if let Err(e) = configure(controller, &env_for_configure) {
-                                app().report_error("ConfigureWebView2", INIT_FAILED, Some(&e));
-                            }
-                        }
-                        (r, _) => app().report_error(
-                            "CreateCoreWebView2Controller",
-                            INIT_FAILED,
-                            Some(&format!("{r:?}")),
-                        ),
+    let handler = CreateCoreWebView2EnvironmentCompletedHandler::create(Box::new(move |result, env| {
+        let env = match (result, env) {
+            (Ok(()), Some(env)) => env,
+            (r, _) => {
+                app().report_error("CreateCoreWebView2Environment", INIT_FAILED, Some(&format!("{r:?}")));
+                return Ok(());
+            }
+        };
+        let env_for_configure = env.clone();
+        let handler = CreateCoreWebView2ControllerCompletedHandler::create(Box::new(move |result, controller| {
+            match (result, controller) {
+                (Ok(()), Some(controller)) => {
+                    if let Err(e) = configure(controller, &env_for_configure) {
+                        app().report_error("ConfigureWebView2", INIT_FAILED, Some(&e));
                     }
-                    Ok(())
-                },
-            ));
-            if let Err(e) = create_controller(&env, parent, &handler) {
-                app().report_error("CreateCoreWebView2Controller", INIT_FAILED, Some(&e));
+                }
+                (r, _) => app().report_error("CreateCoreWebView2Controller", INIT_FAILED, Some(&format!("{r:?}"))),
             }
             Ok(())
         }));
+        if let Err(e) = create_controller(&env, parent, &handler) {
+            app().report_error("CreateCoreWebView2Controller", INIT_FAILED, Some(&e));
+        }
+        Ok(())
+    }));
 
     let options: ICoreWebView2EnvironmentOptions = CoreWebView2EnvironmentOptions::default().into();
     let created = unsafe {
-        CreateCoreWebView2EnvironmentWithOptions(
-            None,
-            &HSTRING::from(data_dir.as_os_str()),
-            &options,
-            &handler,
-        )
+        CreateCoreWebView2EnvironmentWithOptions(None, &HSTRING::from(data_dir.as_os_str()), &options, &handler)
     };
     if let Err(e) = created {
-        this.report_error(
-            "CreateCoreWebView2EnvironmentWithOptions",
-            INIT_FAILED,
-            Some(&e),
-        );
+        this.report_error("CreateCoreWebView2EnvironmentWithOptions", INIT_FAILED, Some(&e));
     }
 }
 
@@ -365,10 +313,7 @@ fn create_controller(
 }
 
 #[allow(unused_unsafe)]
-fn configure(
-    controller: ICoreWebView2Controller,
-    env: &ICoreWebView2Environment,
-) -> windows::core::Result<()> {
+fn configure(controller: ICoreWebView2Controller, env: &ICoreWebView2Environment) -> windows::core::Result<()> {
     let webview = unsafe { controller.CoreWebView2()? };
     unsafe {
         let settings = webview.Settings()?;
@@ -405,10 +350,7 @@ fn configure(
                 let allow = allow_navigation(&args).unwrap_or_else(|e| {
                     // WebView2 ignores a handler's error and lets the navigation proceed,
                     // so an early `?` here would fail open.
-                    log::error(
-                        "PreviewNavigationBlocked",
-                        format!("could not inspect navigation, cancelling: {e}"),
-                    );
+                    log::error("PreviewNavigationBlocked", format!("could not inspect navigation, cancelling: {e}"));
                     false
                 });
                 if !allow && let Err(e) = unsafe { args.SetCancel(true) } {
@@ -433,18 +375,14 @@ fn configure(
                 "ConfigureWebView2",
                 "ICoreWebView2_22 unavailable; request filter covers document requests only",
             );
-            webview
-                .AddWebResourceRequestedFilter(w!("*"), COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL)?;
+            webview.AddWebResourceRequestedFilter(w!("*"), COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL)?;
         }
         let env = env.clone();
         webview.add_WebResourceRequested(
             &WebResourceRequestedEventHandler::create(Box::new(move |_, args| {
                 let Some(args) = args else { return Ok(()) };
                 let allow = allow_request(&args).unwrap_or_else(|e| {
-                    log::error(
-                        "PreviewRequestBlocked",
-                        format!("could not inspect request, blocking: {e}"),
-                    );
+                    log::error("PreviewRequestBlocked", format!("could not inspect request, blocking: {e}"));
                     false
                 });
                 if !allow {
@@ -490,8 +428,7 @@ fn configure(
         webview.cast::<ICoreWebView2_4>()?.add_DownloadStarting(
             &DownloadStartingEventHandler::create(Box::new(|_, args| {
                 let Some(args) = args else { return Ok(()) };
-                let cancelled =
-                    unsafe { args.SetCancel(true).and_then(|()| args.SetHandled(true)) };
+                let cancelled = unsafe { args.SetCancel(true).and_then(|()| args.SetHandled(true)) };
                 if let Err(e) = cancelled {
                     stop_preview("PreviewDownloadGuard", &e);
                 }
@@ -505,22 +442,17 @@ fn configure(
         // client certificate; unhandled, WebView2 shows the certificate picker, and the
         // one the user picks (a corporate certificate names its owner) goes to the
         // document's author. Required for the same reason as DownloadStarting.
-        webview
-            .cast::<ICoreWebView2_5>()?
-            .add_ClientCertificateRequested(
-                &ClientCertificateRequestedEventHandler::create(Box::new(|_, args| {
-                    let Some(args) = args else { return Ok(()) };
-                    if let Err(e) = unsafe { args.SetCancel(true) } {
-                        stop_preview("PreviewClientCertificateGuard", &e);
-                    }
-                    log::error(
-                        "PreviewClientCertificateBlocked",
-                        "refused a client certificate request",
-                    );
-                    Ok(())
-                })),
-                &mut token,
-            )?;
+        webview.cast::<ICoreWebView2_5>()?.add_ClientCertificateRequested(
+            &ClientCertificateRequestedEventHandler::create(Box::new(|_, args| {
+                let Some(args) = args else { return Ok(()) };
+                if let Err(e) = unsafe { args.SetCancel(true) } {
+                    stop_preview("PreviewClientCertificateGuard", &e);
+                }
+                log::error("PreviewClientCertificateBlocked", "refused a client certificate request");
+                Ok(())
+            })),
+            &mut token,
+        )?;
 
         // Ctrl/Shift/middle-click, target="_blank" and the context menu's "open in new
         // window" bypass NavigationStarting entirely: WebView2 opens a popup that inherits
@@ -536,10 +468,7 @@ fn configure(
                     Ok(()) => take_pwstr(uri),
                     Err(_) => String::new(),
                 };
-                log::error(
-                    "PreviewNewWindowBlocked",
-                    format!("blocked new window for {}", describe_uri(&uri)),
-                );
+                log::error("PreviewNewWindowBlocked", format!("blocked new window for {}", describe_uri(&uri)));
                 Ok(())
             })),
             &mut token,
@@ -554,10 +483,7 @@ fn configure(
                     if let Err(e) = unsafe { args.SetCancel(true) } {
                         stop_preview("PreviewExternalSchemeGuard", &e);
                     }
-                    log::error(
-                        "PreviewExternalSchemeBlocked",
-                        "blocked an external URI scheme launch",
-                    );
+                    log::error("PreviewExternalSchemeBlocked", "blocked an external URI scheme launch");
                     Ok(())
                 })),
                 &mut token,
@@ -582,26 +508,14 @@ fn configure(
                     CrashedProcess::Other
                 };
                 if process == CrashedProcess::Other {
-                    log::error(
-                        "PreviewProcessFailed",
-                        format!("ignored process failure kind {}", kind.0),
-                    );
+                    log::error("PreviewProcessFailed", format!("ignored process failure kind {}", kind.0));
                     return Ok(());
                 }
                 // Handled after this callback returns: recovery closes the controller that
                 // is raising this very event, which must not happen from inside it.
-                let wparam = WPARAM(if process == CrashedProcess::Browser {
-                    1
-                } else {
-                    0
-                });
+                let wparam = WPARAM(if process == CrashedProcess::Browser { 1 } else { 0 });
                 unsafe {
-                    if let Err(e) = PostMessageW(
-                        Some(app().main_hwnd()),
-                        WM_APP_PREVIEW_FAILED,
-                        wparam,
-                        LPARAM(0),
-                    ) {
+                    if let Err(e) = PostMessageW(Some(app().main_hwnd()), WM_APP_PREVIEW_FAILED, wparam, LPARAM(0)) {
                         log::error("PreviewProcessFailed PostMessage", &e);
                     }
                 }
@@ -635,10 +549,7 @@ fn configure(
                             );
                             false
                         } else if p.navigation_failure_reported {
-                            log::error(
-                                "PreviewNavigationCompleted",
-                                format!("navigation failed: {}", status.0),
-                            );
+                            log::error("PreviewNavigationCompleted", format!("navigation failed: {}", status.0));
                             false
                         } else {
                             p.navigation_failure_reported = true;
@@ -648,10 +559,7 @@ fn configure(
                     if report {
                         app.report_error(
                             "PreviewNavigationCompleted",
-                            &format!(
-                                "プレビューを表示できませんでした。({}) 編集は引き続き行えます。",
-                                status.0
-                            ),
+                            &format!("プレビューを表示できませんでした。({}) 編集は引き続き行えます。", status.0),
                             None,
                         );
                     }
@@ -679,9 +587,7 @@ fn configure(
                     args.KeyEventKind(&mut kind)?;
                     args.VirtualKey(&mut vk)?;
                 }
-                if kind != COREWEBVIEW2_KEY_EVENT_KIND_KEY_DOWN
-                    && kind != COREWEBVIEW2_KEY_EVENT_KIND_SYSTEM_KEY_DOWN
-                {
+                if kind != COREWEBVIEW2_KEY_EVENT_KIND_KEY_DOWN && kind != COREWEBVIEW2_KEY_EVENT_KIND_SYSTEM_KEY_DOWN {
                     return Ok(());
                 }
                 let ctrl = unsafe { GetKeyState(VK_CONTROL.0 as i32) } < 0;
@@ -752,10 +658,7 @@ pub fn navigate(app: &App, html: &str) {
             let message = if e.code() == windows::Win32::Foundation::E_INVALIDARG {
                 "プレビューを更新できませんでした。文書が大きすぎる可能性があります（プレビューの上限は約2MBです）。編集内容は保持されています。".to_string()
             } else {
-                format!(
-                    "プレビューを更新できませんでした。({}) 編集内容は保持されています。",
-                    e.message()
-                )
+                format!("プレビューを更新できませんでした。({}) 編集内容は保持されています。", e.message())
             };
             app.report_error("NavigateToString", &message, Some(&e));
         }
@@ -872,9 +775,7 @@ mod tests {
     fn blocks_remote_and_file_schemes_only() {
         assert!(uses_blocked_scheme("HTTPS://evil/"));
         assert!(uses_blocked_scheme("file:///C:/x"));
-        assert!(!uses_blocked_scheme(
-            "data:text/html;charset=utf-8;base64,AAA"
-        ));
+        assert!(!uses_blocked_scheme("data:text/html;charset=utf-8;base64,AAA"));
         assert!(!uses_blocked_scheme("about:blank"));
     }
 
@@ -893,32 +794,14 @@ mod tests {
 
     #[test]
     fn crashes_are_retried_a_bounded_number_of_times() {
-        assert_eq!(
-            crash_response(CrashedProcess::Renderer, 0, 0),
-            CrashResponse::Rerender
-        );
-        assert_eq!(
-            crash_response(CrashedProcess::Renderer, 2, 0),
-            CrashResponse::Rerender
-        );
+        assert_eq!(crash_response(CrashedProcess::Renderer, 0, 0), CrashResponse::Rerender);
+        assert_eq!(crash_response(CrashedProcess::Renderer, 2, 0), CrashResponse::Rerender);
         // A document that kills the renderer must not loop render → crash → render.
-        assert_eq!(
-            crash_response(CrashedProcess::Renderer, 3, 0),
-            CrashResponse::GiveUp
-        );
-        assert_eq!(
-            crash_response(CrashedProcess::Browser, 0, 2),
-            CrashResponse::Restart
-        );
-        assert_eq!(
-            crash_response(CrashedProcess::Browser, 0, 3),
-            CrashResponse::GiveUp
-        );
+        assert_eq!(crash_response(CrashedProcess::Renderer, 3, 0), CrashResponse::GiveUp);
+        assert_eq!(crash_response(CrashedProcess::Browser, 0, 2), CrashResponse::Restart);
+        assert_eq!(crash_response(CrashedProcess::Browser, 0, 3), CrashResponse::GiveUp);
         // GPU/utility exits and a hung renderer leave our navigations alive: touch nothing.
-        assert_eq!(
-            crash_response(CrashedProcess::Other, 0, 0),
-            CrashResponse::Ignore
-        );
+        assert_eq!(crash_response(CrashedProcess::Other, 0, 0), CrashResponse::Ignore);
     }
 
     #[test]
@@ -936,16 +819,10 @@ mod tests {
         // this filter keeps the request itself from being sent.
         assert!(!request_allowed(document, "http://192.168.0.1/reboot"));
         assert!(!request_allowed(document, "https://evil/"));
-        assert!(!request_allowed(
-            COREWEBVIEW2_WEB_RESOURCE_CONTEXT_OTHER,
-            "https://evil/prefetch"
-        ));
+        assert!(!request_allowed(COREWEBVIEW2_WEB_RESOURCE_CONTEXT_OTHER, "https://evil/prefetch"));
         assert!(!request_allowed(image, "file:///C:/x.png"));
         // Our own render is a data: URI and must never be filtered out.
-        assert!(request_allowed(
-            document,
-            "data:text/html;charset=utf-8;base64,AAA"
-        ));
+        assert!(request_allowed(document, "data:text/html;charset=utf-8;base64,AAA"));
         // Byte-wise prefix check: a multi-byte character at the cut must not panic (a
         // panic here aborts the process). Not a network scheme, so the denylist passes it.
         assert!(request_allowed(image, "ht日"));

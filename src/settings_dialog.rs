@@ -4,13 +4,13 @@ use std::cell::{Cell, RefCell};
 
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, COLOR_WINDOW, CreateSolidBrush, DeleteObject, EndPaint, FrameRect, HBRUSH, HDC,
-    HFONT, HGDIOBJ, PAINTSTRUCT, SetBkColor, SetTextColor,
+    BeginPaint, COLOR_WINDOW, CreateSolidBrush, DeleteObject, EndPaint, FrameRect, HBRUSH, HDC, HFONT, HGDIOBJ,
+    PAINTSTRUCT, SetBkColor, SetTextColor,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Controls::{
-    DRAWITEMSTRUCT, UDM_SETBUDDY, UDM_SETPOS32, UDM_SETRANGE32, UDS_ALIGNRIGHT, UDS_ARROWKEYS,
-    UDS_NOTHOUSANDS, UDS_SETBUDDYINT,
+    DRAWITEMSTRUCT, UDM_SETBUDDY, UDM_SETPOS32, UDM_SETRANGE32, UDS_ALIGNRIGHT, UDS_ARROWKEYS, UDS_NOTHOUSANDS,
+    UDS_SETBUDDYINT,
 };
 use windows::Win32::UI::HiDpi::AdjustWindowRectExForDpi;
 use windows::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, SetActiveWindow, SetFocus};
@@ -57,13 +57,9 @@ impl DialogEdits {
             editor_font_family: self.editor_font,
             // A field that no longer holds a number falls back to that setting's own
             // previous value; out-of-range values are clamped.
-            editor_font_size: self
-                .editor_size
-                .map_or(current.editor_font_size, limits::clamp_font_size),
+            editor_font_size: self.editor_size.map_or(current.editor_font_size, limits::clamp_font_size),
             preview_font_family: self.preview_font,
-            preview_font_size: self
-                .preview_size
-                .map_or(current.preview_font_size, limits::clamp_font_size),
+            preview_font_size: self.preview_size.map_or(current.preview_font_size, limits::clamp_font_size),
             preview_background_color: self.background,
             table_header_gray_background: self.table_header,
             table_row_striping: self.table_striping,
@@ -115,11 +111,7 @@ fn parse_size(text: &str) -> Option<f64> {
 }
 
 fn format_size(v: f64) -> String {
-    if v.fract() == 0.0 {
-        format!("{}", v as i64)
-    } else {
-        format!("{v}")
-    }
+    if v.fract() == 0.0 { format!("{}", v as i64) } else { format!("{v}") }
 }
 
 pub fn show(
@@ -170,12 +162,7 @@ pub fn show(
         };
         RegisterClassW(&wc); // A second registration fails harmlessly.
 
-        let client = RECT {
-            left: 0,
-            top: 0,
-            right: s(420),
-            bottom: s(560),
-        };
+        let client = RECT { left: 0, top: 0, right: s(420), bottom: s(560) };
         let mut outer = client;
         let style = WS_POPUP | WS_CAPTION | WS_SYSMENU;
         let ex = WS_EX_DLGMODALFRAME | WS_EX_CONTROLPARENT;
@@ -205,51 +192,31 @@ pub fn show(
     crate::theme::set_title_bar_dark(hwnd, palette.dark);
 
     // ---- controls ----
-    let make = |class: PCWSTR,
-                text: &str,
-                style: u32,
-                ex: u32,
-                id: i32,
-                x: i32,
-                y: i32,
-                cx: i32,
-                cy: i32,
-                f: HFONT|
-     -> HWND {
-        let text = wide(text);
-        unsafe {
-            let h = CreateWindowExW(
-                WINDOW_EX_STYLE(ex),
-                class,
-                pcwstr(&text),
-                WS_CHILD | WS_VISIBLE | WINDOW_STYLE(style),
-                s(x),
-                s(y),
-                s(cx),
-                s(cy),
-                Some(hwnd),
-                Some(HMENU(id as isize as *mut _)),
-                None,
-                None,
-            )
-            .unwrap_or_default();
-            send(h, WM_SETFONT, f.0 as usize, 1);
-            h
-        }
-    };
+    let make =
+        |class: PCWSTR, text: &str, style: u32, ex: u32, id: i32, x: i32, y: i32, cx: i32, cy: i32, f: HFONT| -> HWND {
+            let text = wide(text);
+            unsafe {
+                let h = CreateWindowExW(
+                    WINDOW_EX_STYLE(ex),
+                    class,
+                    pcwstr(&text),
+                    WS_CHILD | WS_VISIBLE | WINDOW_STYLE(style),
+                    s(x),
+                    s(y),
+                    s(cx),
+                    s(cy),
+                    Some(hwnd),
+                    Some(HMENU(id as isize as *mut _)),
+                    None,
+                    None,
+                )
+                .unwrap_or_default();
+                send(h, WM_SETFONT, f.0 as usize, 1);
+                h
+            }
+        };
     let label = |text: &str, x: i32, y: i32, cx: i32, bold: bool| {
-        make(
-            w!("STATIC"),
-            text,
-            0,
-            0,
-            -1,
-            x,
-            y,
-            cx,
-            20,
-            if bold { bold_font } else { ui_font },
-        )
+        make(w!("STATIC"), text, 0, 0, -1, x, y, cx, 20, if bold { bold_font } else { ui_font })
     };
     let tab = WS_TABSTOP.0;
     let left = 20;
@@ -286,69 +253,63 @@ pub fn show(
     );
     y += 30 + 14;
 
-    let font_section =
-        |title: &str, font_id: i32, size_id: i32, family: &str, size: f64, y: &mut i32| {
-            label(title, left, *y, full, true);
-            *y += 22;
-            let combo = make(
-                w!("COMBOBOX"),
-                "",
-                tab | (CBS_DROPDOWN | CBS_AUTOHSCROLL) as u32 | WS_VSCROLL.0,
-                0,
-                font_id,
-                left,
-                *y,
-                full,
-                300,
-                ui_font,
-            );
-            for f in fonts {
-                let f = wide(f);
-                send(combo, CB_ADDSTRING, 0, f.as_ptr() as isize);
-            }
-            let family_w = wide(family);
-            send(combo, WM_SETTEXT, 0, family_w.as_ptr() as isize);
-            *y += 32;
-            label("サイズ", left, *y + 3, 50, false);
-            let edit = make(
-                w!("EDIT"),
-                &format_size(size),
-                tab | ES_AUTOHSCROLL as u32,
-                WS_EX_CLIENTEDGE.0,
-                size_id,
-                left + 56,
-                *y,
-                80,
-                24,
-                ui_font,
-            );
-            let updown = make(
-                w!("msctls_updown32"),
-                "",
-                UDS_SETBUDDYINT | UDS_ALIGNRIGHT | UDS_ARROWKEYS | UDS_NOTHOUSANDS,
-                0,
-                size_id + 1,
-                0,
-                0,
-                0,
-                0,
-                ui_font,
-            );
-            send(updown, UDM_SETBUDDY, edit.0 as usize, 0);
-            send(
-                updown,
-                UDM_SETRANGE32,
-                limits::MIN_FONT_SIZE as usize,
-                limits::MAX_FONT_SIZE as isize,
-            );
-            send(updown, UDM_SETPOS32, 0, size.round() as isize);
-            // Set after attaching: UDS_SETBUDDYINT rewrites the buddy as an integer on
-            // attach, which would round a fractional size loaded from settings.
-            let text = wide(&format_size(size));
-            send(edit, WM_SETTEXT, 0, text.as_ptr() as isize);
-            *y += 24 + 18;
-            (combo, edit, updown)
-        };
+    let font_section = |title: &str, font_id: i32, size_id: i32, family: &str, size: f64, y: &mut i32| {
+        label(title, left, *y, full, true);
+        *y += 22;
+        let combo = make(
+            w!("COMBOBOX"),
+            "",
+            tab | (CBS_DROPDOWN | CBS_AUTOHSCROLL) as u32 | WS_VSCROLL.0,
+            0,
+            font_id,
+            left,
+            *y,
+            full,
+            300,
+            ui_font,
+        );
+        for f in fonts {
+            let f = wide(f);
+            send(combo, CB_ADDSTRING, 0, f.as_ptr() as isize);
+        }
+        let family_w = wide(family);
+        send(combo, WM_SETTEXT, 0, family_w.as_ptr() as isize);
+        *y += 32;
+        label("サイズ", left, *y + 3, 50, false);
+        let edit = make(
+            w!("EDIT"),
+            &format_size(size),
+            tab | ES_AUTOHSCROLL as u32,
+            WS_EX_CLIENTEDGE.0,
+            size_id,
+            left + 56,
+            *y,
+            80,
+            24,
+            ui_font,
+        );
+        let updown = make(
+            w!("msctls_updown32"),
+            "",
+            UDS_SETBUDDYINT | UDS_ALIGNRIGHT | UDS_ARROWKEYS | UDS_NOTHOUSANDS,
+            0,
+            size_id + 1,
+            0,
+            0,
+            0,
+            0,
+            ui_font,
+        );
+        send(updown, UDM_SETBUDDY, edit.0 as usize, 0);
+        send(updown, UDM_SETRANGE32, limits::MIN_FONT_SIZE as usize, limits::MAX_FONT_SIZE as isize);
+        send(updown, UDM_SETPOS32, 0, size.round() as isize);
+        // Set after attaching: UDS_SETBUDDYINT rewrites the buddy as an integer on
+        // attach, which would round a fractional size loaded from settings.
+        let text = wide(&format_size(size));
+        send(edit, WM_SETTEXT, 0, text.as_ptr() as isize);
+        *y += 24 + 18;
+        (combo, edit, updown)
+    };
     let (efont, esize, eud) = font_section(
         "エディタのフォント",
         IDC_EDITOR_FONT,
@@ -383,33 +344,12 @@ pub fn show(
     let use_bg = current.preview_background_color.is_some();
     send(bg_check, BM_SETCHECK, use_bg as usize, 0);
     y += 26;
-    let bg_button = make(
-        w!("BUTTON"),
-        "色を選択",
-        tab | BS_PUSHBUTTON as u32,
-        0,
-        IDC_BG_BUTTON,
-        left,
-        y,
-        100,
-        28,
-        ui_font,
-    );
+    let bg_button =
+        make(w!("BUTTON"), "色を選択", tab | BS_PUSHBUTTON as u32, 0, IDC_BG_BUTTON, left, y, 100, 28, ui_font);
     unsafe {
         let _ = EnableWindow(bg_button, use_bg);
     }
-    make(
-        w!("STATIC"),
-        "",
-        SS_OWNERDRAW,
-        0,
-        IDC_SWATCH,
-        left + 110,
-        y,
-        28,
-        28,
-        ui_font,
-    );
+    make(w!("STATIC"), "", SS_OWNERDRAW, 0, IDC_SWATCH, left + 110, y, 28, 28, ui_font);
     y += 28 + 18;
 
     label("表(テーブル)", left, y, full, true);
@@ -426,12 +366,7 @@ pub fn show(
         22,
         ui_font,
     );
-    send(
-        header,
-        BM_SETCHECK,
-        current.table_header_gray_background as usize,
-        0,
-    );
+    send(header, BM_SETCHECK, current.table_header_gray_background as usize, 0);
     y += 26;
     let stripe = make(
         w!("BUTTON"),
@@ -448,18 +383,7 @@ pub fn show(
     send(stripe, BM_SETCHECK, current.table_row_striping as usize, 0);
     y += 26 + 22;
 
-    let ok = make(
-        w!("BUTTON"),
-        "保存",
-        tab | BS_DEFPUSHBUTTON as u32,
-        0,
-        IDOK_,
-        left + full - 200,
-        y,
-        96,
-        30,
-        ui_font,
-    );
+    let ok = make(w!("BUTTON"), "保存", tab | BS_DEFPUSHBUTTON as u32, 0, IDOK_, left + full - 200, y, 96, 30, ui_font);
     let cancel = make(
         w!("BUTTON"),
         "キャンセル",
@@ -496,12 +420,7 @@ pub fn show(
 
     // Fit the window to the content.
     unsafe {
-        let mut rc = RECT {
-            left: 0,
-            top: 0,
-            right: s(420),
-            bottom: s(y),
-        };
+        let mut rc = RECT { left: 0, top: 0, right: s(420), bottom: s(y) };
         let _ = AdjustWindowRectExForDpi(
             &mut rc,
             WS_POPUP | WS_CAPTION | WS_SYSMENU,
@@ -509,15 +428,7 @@ pub fn show(
             WS_EX_DLGMODALFRAME | WS_EX_CONTROLPARENT,
             dpi,
         );
-        let _ = SetWindowPos(
-            hwnd,
-            None,
-            0,
-            0,
-            rc.right - rc.left,
-            rc.bottom - rc.top,
-            SWP_NOMOVE | SWP_NOZORDER,
-        );
+        let _ = SetWindowPos(hwnd, None, 0, 0, rc.right - rc.left, rc.bottom - rc.top, SWP_NOMOVE | SWP_NOZORDER);
         let _ = ShowWindow(hwnd, SW_SHOW);
         let _ = SetFocus(Some(theme));
     }
@@ -596,11 +507,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     if let Some(c) = chosen {
                         state.bg_color.set(c);
                         unsafe {
-                            let _ = windows::Win32::Graphics::Gdi::InvalidateRect(
-                                Some(item(hwnd, IDC_SWATCH)),
-                                None,
-                                true,
-                            );
+                            let _ =
+                                windows::Win32::Graphics::Gdi::InvalidateRect(Some(item(hwnd, IDC_SWATCH)), None, true);
                         }
                     }
                 }
@@ -676,10 +584,7 @@ mod tests {
             table_header: true,
             table_striping: false,
         };
-        let s = edits.apply(&AppSettings {
-            recent_folders: vec!["C:\\x".into()],
-            ..current.clone()
-        });
+        let s = edits.apply(&AppSettings { recent_folders: vec!["C:\\x".into()], ..current.clone() });
         assert_eq!(s.editor_font_size, current.editor_font_size);
         assert_eq!(s.preview_font_size, 48.0);
         assert_eq!(s.recent_folders, vec!["C:\\x"]);
