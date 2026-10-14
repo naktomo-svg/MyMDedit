@@ -1339,6 +1339,9 @@ impl App {
         self.busy.set(false);
         if ok {
             self.release_shutdown_block();
+        } else {
+            // The session continues: hand over anything that waited for this prompt.
+            self.deliver_pending_probe();
         }
         ok
     }
@@ -1352,14 +1355,20 @@ impl App {
     fn on_close_request(&self) {
         // A modal dialog of ours is up (its own loop delivered this, e.g. from the taskbar).
         // Closing under it would stack a second prompt; the user can close once it's gone.
-        if self.busy.get() {
+        if self.busy.replace(true) {
             return;
         }
-        if self.close_confirmed.get() || self.confirm_discard(true) {
+        // The prompt below is itself a modal: while it is up, a second WM_CLOSE or a
+        // folder-probe result must wait like they do for any other modal.
+        let close = self.close_confirmed.get() || self.confirm_discard(true);
+        self.busy.set(false);
+        if close {
             self.close_confirmed.set(true);
             unsafe {
                 let _ = DestroyWindow(self.hwnd());
             }
+        } else {
+            self.deliver_pending_probe();
         }
     }
 
