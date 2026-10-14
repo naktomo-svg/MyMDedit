@@ -26,7 +26,8 @@ use webview2_com::Microsoft::Web::WebView2::Win32::{
     COREWEBVIEW2_KEY_EVENT_KIND_SYSTEM_KEY_DOWN, COREWEBVIEW2_WEB_ERROR_STATUS, COREWEBVIEW2_WEB_RESOURCE_CONTEXT,
     COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL, COREWEBVIEW2_WEB_RESOURCE_CONTEXT_IMAGE,
     COREWEBVIEW2_WEB_RESOURCE_REQUEST_SOURCE_KINDS_ALL, CreateCoreWebView2EnvironmentWithOptions, ICoreWebView2,
-    ICoreWebView2Controller, ICoreWebView2Controller2, ICoreWebView2Environment, ICoreWebView2EnvironmentOptions,
+    ICoreWebView2Controller, ICoreWebView2Controller2, ICoreWebView2CreateCoreWebView2ControllerCompletedHandler,
+    ICoreWebView2Environment, ICoreWebView2Environment10, ICoreWebView2EnvironmentOptions,
     ICoreWebView2NavigationStartingEventArgs, ICoreWebView2Settings4, ICoreWebView2WebResourceRequestedEventArgs,
     ICoreWebView2_4, ICoreWebView2_5, ICoreWebView2_18, ICoreWebView2_22, COREWEBVIEW2_PROCESS_FAILED_KIND,
     COREWEBVIEW2_PROCESS_FAILED_KIND_BROWSER_PROCESS_EXITED, COREWEBVIEW2_PROCESS_FAILED_KIND_RENDER_PROCESS_EXITED,
@@ -273,7 +274,7 @@ pub fn start(this: &App, parent: HWND) {
             }
             Ok(())
         }));
-        if let Err(e) = unsafe { env.CreateCoreWebView2Controller(parent, &handler) } {
+        if let Err(e) = create_controller(&env, parent, &handler) {
             app().report_error("CreateCoreWebView2Controller", INIT_FAILED, Some(&e));
         }
         Ok(())
@@ -285,6 +286,26 @@ pub fn start(this: &App, parent: HWND) {
     };
     if let Err(e) = created {
         this.report_error("CreateCoreWebView2EnvironmentWithOptions", INIT_FAILED, Some(&e));
+    }
+}
+
+/// The preview runs InPrivate: its profile keeps history, downloads and cache in memory
+/// only. The page is a `data:` URI holding the whole rendered document, and a normal
+/// profile wrote it to disk — every download the preview cancelled still left a
+/// History row whose `tab_url` was that URI, long after the document itself was gone.
+fn create_controller(
+    env: &ICoreWebView2Environment,
+    parent: HWND,
+    handler: &ICoreWebView2CreateCoreWebView2ControllerCompletedHandler,
+) -> windows::core::Result<()> {
+    unsafe {
+        if let Ok(env10) = env.cast::<ICoreWebView2Environment10>() {
+            let options = env10.CreateCoreWebView2ControllerOptions()?;
+            options.SetIsInPrivateModeEnabled(true)?;
+            return env10.CreateCoreWebView2ControllerWithOptions(parent, &options, handler);
+        }
+        log::error("CreateCoreWebView2Controller", "ICoreWebView2Environment10 unavailable; the preview profile is persistent");
+        env.CreateCoreWebView2Controller(parent, handler)
     }
 }
 

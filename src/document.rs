@@ -9,11 +9,13 @@
 use std::fmt;
 use std::fs;
 use std::io::{self, Write};
+use std::os::windows::io::AsRawHandle;
 use std::path::{Path, PathBuf};
 
+use windows::Win32::Foundation::HANDLE;
 use windows::Win32::Storage::FileSystem::{
-    MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW, REPLACEFILE_IGNORE_MERGE_ERRORS,
-    ReplaceFileW,
+    FILE_TYPE_DISK, GetFileType, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+    REPLACEFILE_IGNORE_MERGE_ERRORS, ReplaceFileW,
 };
 use windows::core::HSTRING;
 
@@ -217,8 +219,17 @@ pub const MAX_DOCUMENT_BYTES: u64 = 64 * 1024 * 1024;
 /// it is read (or be meaningless, as for a device or a pipe).
 pub fn read_at_most(path: &Path, max: u64) -> io::Result<Vec<u8>> {
     use std::io::Read;
+    let file = fs::File::open(path)?;
+    // Checked on the opened handle, not the path: CreateFile happily opens CON, NUL, COM
+    // ports and (remote) named pipes, and reading one can block until its writer goes away.
+    if unsafe { GetFileType(HANDLE(file.as_raw_handle())) } != FILE_TYPE_DISK {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "通常のファイルではないため開けません（デバイスやパイプは開けません）。",
+        ));
+    }
     let mut bytes = Vec::new();
-    fs::File::open(path)?.take(max + 1).read_to_end(&mut bytes)?;
+    file.take(max + 1).read_to_end(&mut bytes)?;
     if bytes.len() as u64 > max {
         return Err(io::Error::new(
             io::ErrorKind::FileTooLarge,
@@ -440,6 +451,15 @@ mod tests {
         assert_eq!(e.kind(), io::ErrorKind::FileTooLarge);
         assert!(e.to_string().contains("大きすぎる"));
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn devices_are_refused() {
+        // A device or pipe can block the read forever (CON waits for the keyboard, a
+        // pipe for its writer) — on the UI thread, before the window even appears.
+        let e = read_at_most(Path::new("NUL"), 10).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::InvalidInput);
+        assert!(e.to_string().contains("通常のファイルではない"));
     }
 
     #[test]
