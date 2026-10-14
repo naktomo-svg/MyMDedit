@@ -4,27 +4,38 @@
 //! renderer passes raw HTML through):
 //! 1. the CSP in `render.rs`,
 //! 2. `IsScriptEnabled = false`,
-//! 3. the navigation guard here, which lets through only navigations this app started.
+//! 3. the handlers here: the request filter (`WebResourceRequested`), which is what
+//!    actually keeps requests from leaving, and the navigation guard, which keeps the
+//!    page from being replaced by anything but this app's own renders.
 //!
-//! The preview is never loaded before all three are in place (`ready`).
+//! Cancelling in NavigationStarting does NOT stop the request: the runtime has already
+//! sent it by then (observed: a `<meta refresh>` to http:// reached the server while the
+//! guard logged it as blocked). Only the request filter stops traffic; the guard stops
+//! the page change. Downloads and frame navigations never reach NavigationStarting at
+//! all and have their own handlers.
+//!
+//! The preview is never loaded before all of these are in place (`ready`).
 
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, RECT, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_APP};
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_CONTROL, VK_SHIFT};
-use windows::core::{BOOL, HSTRING, Interface, PWSTR};
+use windows::core::{BOOL, HSTRING, Interface, PWSTR, w};
 
 use webview2_com::Microsoft::Web::WebView2::Win32::{
     COREWEBVIEW2_COLOR, COREWEBVIEW2_KEY_EVENT_KIND, COREWEBVIEW2_KEY_EVENT_KIND_KEY_DOWN,
-    COREWEBVIEW2_KEY_EVENT_KIND_SYSTEM_KEY_DOWN, COREWEBVIEW2_WEB_ERROR_STATUS, CreateCoreWebView2EnvironmentWithOptions,
-    ICoreWebView2, ICoreWebView2Controller, ICoreWebView2Controller2, ICoreWebView2EnvironmentOptions,
-    ICoreWebView2NavigationStartingEventArgs, ICoreWebView2_18, COREWEBVIEW2_PROCESS_FAILED_KIND,
+    COREWEBVIEW2_KEY_EVENT_KIND_SYSTEM_KEY_DOWN, COREWEBVIEW2_WEB_ERROR_STATUS, COREWEBVIEW2_WEB_RESOURCE_CONTEXT,
+    COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL, COREWEBVIEW2_WEB_RESOURCE_CONTEXT_IMAGE,
+    COREWEBVIEW2_WEB_RESOURCE_REQUEST_SOURCE_KINDS_ALL, CreateCoreWebView2EnvironmentWithOptions, ICoreWebView2,
+    ICoreWebView2Controller, ICoreWebView2Controller2, ICoreWebView2Environment, ICoreWebView2EnvironmentOptions,
+    ICoreWebView2NavigationStartingEventArgs, ICoreWebView2WebResourceRequestedEventArgs, ICoreWebView2_4,
+    ICoreWebView2_18, ICoreWebView2_22, COREWEBVIEW2_PROCESS_FAILED_KIND,
     COREWEBVIEW2_PROCESS_FAILED_KIND_BROWSER_PROCESS_EXITED, COREWEBVIEW2_PROCESS_FAILED_KIND_RENDER_PROCESS_EXITED,
 };
 use webview2_com::{
     AcceleratorKeyPressedEventHandler, CoreWebView2EnvironmentOptions, CreateCoreWebView2ControllerCompletedHandler,
-    CreateCoreWebView2EnvironmentCompletedHandler, ExecuteScriptCompletedHandler, NavigationCompletedEventHandler,
-    LaunchingExternalUriSchemeEventHandler, NavigationStartingEventHandler, NewWindowRequestedEventHandler,
-    ProcessFailedEventHandler, take_pwstr,
+    CreateCoreWebView2EnvironmentCompletedHandler, DownloadStartingEventHandler, ExecuteScriptCompletedHandler,
+    LaunchingExternalUriSchemeEventHandler, NavigationCompletedEventHandler, NavigationStartingEventHandler,
+    NewWindowRequestedEventHandler, ProcessFailedEventHandler, WebResourceRequestedEventHandler, take_pwstr,
 };
 
 use crate::app::{App, app};
@@ -157,6 +168,33 @@ fn navigation_allowed(pending_self: i32, uri: &str) -> bool {
     pending_self > 0 && !uses_blocked_scheme(uri)
 }
 
+/// Whether a request the preview makes may go out. The same denylist as the guard
+/// (our own document is a `data:` URI and never matches), with one exception: https
+/// images, the risk accepted in `render.rs`'s CSP comment. Everything else on a
+/// network scheme — navigations, prefetches, frames, CSP-exempt fetches — is answered
+/// locally and never sent.
+fn request_allowed(context: COREWEBVIEW2_WEB_RESOURCE_CONTEXT, uri: &str) -> bool {
+    const HTTPS: &[u8] = b"https:";
+    let https = uri.as_bytes().get(..HTTPS.len()).is_some_and(|p| p.eq_ignore_ascii_case(HTTPS));
+    !uses_blocked_scheme(uri) || (context == COREWEBVIEW2_WEB_RESOURCE_CONTEXT_IMAGE && https)
+}
+
+/// The request filter's decision for one request; every `Err` becomes a denial.
+fn allow_request(args: &ICoreWebView2WebResourceRequestedEventArgs) -> windows::core::Result<bool> {
+    let mut uri = PWSTR::null();
+    let mut context = COREWEBVIEW2_WEB_RESOURCE_CONTEXT::default();
+    unsafe {
+        args.Request()?.Uri(&mut uri)?;
+        args.ResourceContext(&mut context)?;
+    }
+    let uri = take_pwstr(uri);
+    let allowed = request_allowed(context, &uri);
+    if !allowed {
+        log::error("PreviewRequestBlocked", format!("blocked request to {}", describe_uri(&uri)));
+    }
+    Ok(allowed)
+}
+
 const STOPPED: &str = "プレビューの安全確認に失敗したため、プレビューを停止しました。編集と保存は引き続き行えます。";
 
 /// The guard could not enforce a denial. Fail closed: no further document is ever
@@ -222,10 +260,11 @@ pub fn start(this: &App, parent: HWND) {
                 return Ok(());
             }
         };
+        let env_for_configure = env.clone();
         let handler = CreateCoreWebView2ControllerCompletedHandler::create(Box::new(move |result, controller| {
             match (result, controller) {
                 (Ok(()), Some(controller)) => {
-                    if let Err(e) = configure(controller) {
+                    if let Err(e) = configure(controller, &env_for_configure) {
                         app().report_error("ConfigureWebView2", INIT_FAILED, Some(&e));
                     }
                 }
@@ -249,7 +288,7 @@ pub fn start(this: &App, parent: HWND) {
 }
 
 #[allow(unused_unsafe)]
-fn configure(controller: ICoreWebView2Controller) -> windows::core::Result<()> {
+fn configure(controller: ICoreWebView2Controller, env: &ICoreWebView2Environment) -> windows::core::Result<()> {
     let webview = unsafe { controller.CoreWebView2()? };
     unsafe {
         let settings = webview.Settings()?;
@@ -274,6 +313,76 @@ fn configure(controller: ICoreWebView2Controller) -> windows::core::Result<()> {
                 if !allow && let Err(e) = unsafe { args.SetCancel(true) } {
                     stop_preview("PreviewNavigationGuard", &e);
                 }
+                Ok(())
+            })),
+            &mut token,
+        )?;
+
+        // The only layer that stops traffic (see the module comment). Every request on a
+        // network scheme is filtered, from every source, and anything not allowed gets a
+        // local 403 instead of going out.
+        if let Ok(wv22) = webview.cast::<ICoreWebView2_22>() {
+            wv22.AddWebResourceRequestedFilterWithRequestSourceKinds(
+                w!("*"),
+                COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL,
+                COREWEBVIEW2_WEB_RESOURCE_REQUEST_SOURCE_KINDS_ALL,
+            )?;
+        } else {
+            webview.AddWebResourceRequestedFilter(w!("*"), COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL)?;
+        }
+        let env = env.clone();
+        webview.add_WebResourceRequested(
+            &WebResourceRequestedEventHandler::create(Box::new(move |_, args| {
+                let Some(args) = args else { return Ok(()) };
+                let allow = allow_request(&args).unwrap_or_else(|e| {
+                    log::error("PreviewRequestBlocked", format!("could not inspect request, blocking: {e}"));
+                    false
+                });
+                if !allow {
+                    let blocked = unsafe {
+                        env.CreateWebResourceResponse(None, 403, w!("Blocked"), w!(""))
+                            .and_then(|response| args.SetResponse(&response))
+                    };
+                    if let Err(e) = blocked {
+                        stop_preview("PreviewRequestFilter", &e);
+                    }
+                }
+                Ok(())
+            })),
+            &mut token,
+        )?;
+
+        // Frame navigations never reach NavigationStarting. Nothing this app renders
+        // needs a frame, so none may navigate.
+        webview.add_FrameNavigationStarting(
+            &NavigationStartingEventHandler::create(Box::new(|_, args| {
+                let Some(args) = args else { return Ok(()) };
+                if let Err(e) = unsafe { args.SetCancel(true) } {
+                    stop_preview("PreviewFrameNavigationGuard", &e);
+                }
+                let mut uri = PWSTR::null();
+                let uri = match unsafe { args.Uri(&mut uri) } {
+                    Ok(()) => take_pwstr(uri),
+                    Err(_) => String::new(),
+                };
+                log::error("PreviewFrameNavigationBlocked", format!("blocked frame navigation to {}", describe_uri(&uri)));
+                Ok(())
+            })),
+            &mut token,
+        )?;
+
+        // `<a href="data:…" download>` starts a download without any NavigationStarting
+        // and, for file types the runtime does not warn about, saves it to the user's
+        // Downloads folder unasked. Required, not best-effort: nothing else sees this
+        // path, so a runtime without the event must not show the preview at all.
+        webview.cast::<ICoreWebView2_4>()?.add_DownloadStarting(
+            &DownloadStartingEventHandler::create(Box::new(|_, args| {
+                let Some(args) = args else { return Ok(()) };
+                let cancelled = unsafe { args.SetCancel(true).and_then(|()| args.SetHandled(true)) };
+                if let Err(e) = cancelled {
+                    stop_preview("PreviewDownloadGuard", &e);
+                }
+                log::error("PreviewDownloadBlocked", "blocked a download");
                 Ok(())
             })),
             &mut token,
@@ -619,6 +728,30 @@ mod tests {
         assert_eq!(crash_response(CrashedProcess::Browser, 0, 3), CrashResponse::GiveUp);
         // GPU/utility exits and a hung renderer leave our navigations alive: touch nothing.
         assert_eq!(crash_response(CrashedProcess::Other, 0, 0), CrashResponse::Ignore);
+    }
+
+    #[test]
+    fn requests_leave_only_as_https_images() {
+        use webview2_com::Microsoft::Web::WebView2::Win32::{
+            COREWEBVIEW2_WEB_RESOURCE_CONTEXT_DOCUMENT, COREWEBVIEW2_WEB_RESOURCE_CONTEXT_OTHER,
+        };
+        let image = COREWEBVIEW2_WEB_RESOURCE_CONTEXT_IMAGE;
+        let document = COREWEBVIEW2_WEB_RESOURCE_CONTEXT_DOCUMENT;
+        // The accepted risk (render.rs's CSP comment), and nothing wider.
+        assert!(request_allowed(image, "https://example.com/a.png"));
+        assert!(request_allowed(image, "HTTPS://example.com/a.png"));
+        assert!(!request_allowed(image, "http://192.168.0.1/a.png"));
+        // A <meta refresh> or a clicked link: the guard cancels the page change, but only
+        // this filter keeps the request itself from being sent.
+        assert!(!request_allowed(document, "http://192.168.0.1/reboot"));
+        assert!(!request_allowed(document, "https://evil/"));
+        assert!(!request_allowed(COREWEBVIEW2_WEB_RESOURCE_CONTEXT_OTHER, "https://evil/prefetch"));
+        assert!(!request_allowed(image, "file:///C:/x.png"));
+        // Our own render is a data: URI and must never be filtered out.
+        assert!(request_allowed(document, "data:text/html;charset=utf-8;base64,AAA"));
+        // Byte-wise prefix check: a multi-byte character at the cut must not panic (a
+        // panic here aborts the process). Not a network scheme, so the denylist passes it.
+        assert!(request_allowed(image, "ht日"));
     }
 
     #[test]
