@@ -1,0 +1,47 @@
+[package]
+name = "mymdedit"
+version = "0.1.0"
+edition = "2024"
+description = "MyMDedit - Windows向けのシンプルなMarkdownエディタ(Win32 + WebView2)"
+
+[[bin]]
+name = "MyMDedit"
+path = "src/main.rs"
+
+[dependencies]
+comrak = { version = "0.56.0", default-features = false }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+webview2-com = "0.39.1"
+
+# Must stay on the same minor version webview2-com is built against (0.62), or the
+# COM interface types it hands back will not be the types this crate names.
+[dependencies.windows]
+version = "0.62"
+features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Dwm",
+    "Win32_Graphics_Gdi",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Com",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Registry",
+    "Win32_UI_Accessibility",
+    "Win32_UI_Controls",
+    "Win32_UI_Controls_Dialogs",
+    "Win32_UI_Controls_RichEdit",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Shell",
+    "Win32_UI_Shell_Common",
+    "Win32_UI_WindowsAndMessaging",
+]
+
+[build-dependencies]
+embed-resource = "3.0.12"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
