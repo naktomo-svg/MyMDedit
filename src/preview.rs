@@ -65,10 +65,15 @@ fn uses_blocked_scheme(uri: &str) -> bool {
     BLOCKED_SCHEMES.iter().any(|s| uri.as_bytes().get(..s.len()).is_some_and(|p| p.eq_ignore_ascii_case(s.as_bytes())))
 }
 
-/// The guard, as a pure decision. All three conditions only ever deny; none of them
-/// can admit a navigation the counter would not.
-fn navigation_allowed(pending_self: i32, uri: &str, user_initiated: bool) -> bool {
-    pending_self > 0 && !uses_blocked_scheme(uri) && !user_initiated
+/// The guard, as a pure decision. Both conditions only ever deny; neither can admit a
+/// navigation the counter would not.
+///
+/// Deliberately NOT a condition: IsUserInitiated. WebView2 documents navigations
+/// started through its APIs — NavigateToString included — as user initiated, so gating
+/// on it would cancel every render as soon as a runtime behaves as documented: the
+/// blank-preview failure MyWinApp already had once.
+fn navigation_allowed(pending_self: i32, uri: &str) -> bool {
+    pending_self > 0 && !uses_blocked_scheme(uri)
 }
 
 const STOPPED: &str = "プレビューの安全確認に失敗したため、プレビューを停止しました。編集と保存は引き続き行えます。";
@@ -95,16 +100,14 @@ fn stop_preview(context: &str, e: &windows::core::Error) {
 fn allow_navigation(args: &ICoreWebView2NavigationStartingEventArgs) -> windows::core::Result<bool> {
     let mut uri = PWSTR::null();
     let mut id = 0u64;
-    let mut user = BOOL::default();
     unsafe {
         args.Uri(&mut uri)?;
         args.NavigationId(&mut id)?;
-        args.IsUserInitiated(&mut user)?;
     }
     let uri = take_pwstr(uri);
     let app = app();
     let mut p = app.preview.borrow_mut();
-    if !navigation_allowed(p.pending_self, &uri, user.as_bool()) {
+    if !navigation_allowed(p.pending_self, &uri) {
         log::error("PreviewNavigationBlocked", format!("blocked navigation to {}", describe_uri(&uri)));
         return Ok(false);
     }
@@ -525,11 +528,17 @@ mod tests {
     }
 
     #[test]
-    fn guard_denies_user_initiated_and_unexpected_navigations() {
-        assert!(navigation_allowed(1, "data:text/html;base64,AA", false));
-        assert!(!navigation_allowed(0, "data:text/html;base64,AA", false)); // not ours
-        assert!(!navigation_allowed(1, "https://evil/", false)); // scheme we never produce
-        assert!(!navigation_allowed(1, "data:text/html;base64,AA", true)); // a click, even mid-render
+    fn guard_denies_unexpected_navigations() {
+        assert!(navigation_allowed(1, "data:text/html;base64,AA"));
+        assert!(!navigation_allowed(0, "data:text/html;base64,AA")); // not ours
+        assert!(!navigation_allowed(1, "https://evil/")); // scheme we never produce
+    }
+
+    #[test]
+    fn own_render_is_allowed_even_if_reported_user_initiated() {
+        // WebView2 documents API-initiated navigations as user initiated; gating on that
+        // flag would cancel every NavigateToString the moment a runtime follows its docs.
+        assert!(navigation_allowed(1, "data:text/html;base64,AA"));
     }
 
     #[test]
