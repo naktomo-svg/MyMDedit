@@ -27,13 +27,14 @@ use webview2_com::Microsoft::Web::WebView2::Win32::{
     COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL, COREWEBVIEW2_WEB_RESOURCE_CONTEXT_IMAGE,
     COREWEBVIEW2_WEB_RESOURCE_REQUEST_SOURCE_KINDS_ALL, CreateCoreWebView2EnvironmentWithOptions, ICoreWebView2,
     ICoreWebView2Controller, ICoreWebView2Controller2, ICoreWebView2Environment, ICoreWebView2EnvironmentOptions,
-    ICoreWebView2NavigationStartingEventArgs, ICoreWebView2Settings4, ICoreWebView2WebResourceRequestedEventArgs, ICoreWebView2_4,
-    ICoreWebView2_18, ICoreWebView2_22, COREWEBVIEW2_PROCESS_FAILED_KIND,
+    ICoreWebView2NavigationStartingEventArgs, ICoreWebView2Settings4, ICoreWebView2WebResourceRequestedEventArgs,
+    ICoreWebView2_4, ICoreWebView2_5, ICoreWebView2_18, ICoreWebView2_22, COREWEBVIEW2_PROCESS_FAILED_KIND,
     COREWEBVIEW2_PROCESS_FAILED_KIND_BROWSER_PROCESS_EXITED, COREWEBVIEW2_PROCESS_FAILED_KIND_RENDER_PROCESS_EXITED,
 };
 use webview2_com::{
-    AcceleratorKeyPressedEventHandler, CoreWebView2EnvironmentOptions, CreateCoreWebView2ControllerCompletedHandler,
-    CreateCoreWebView2EnvironmentCompletedHandler, DownloadStartingEventHandler, ExecuteScriptCompletedHandler,
+    AcceleratorKeyPressedEventHandler, ClientCertificateRequestedEventHandler, CoreWebView2EnvironmentOptions,
+    CreateCoreWebView2ControllerCompletedHandler, CreateCoreWebView2EnvironmentCompletedHandler,
+    DownloadStartingEventHandler, ExecuteScriptCompletedHandler,
     LaunchingExternalUriSchemeEventHandler, NavigationCompletedEventHandler, NavigationStartingEventHandler,
     NewWindowRequestedEventHandler, ProcessFailedEventHandler, WebResourceRequestedEventHandler, take_pwstr,
 };
@@ -399,6 +400,22 @@ fn configure(controller: ICoreWebView2Controller, env: &ICoreWebView2Environment
                     stop_preview("PreviewDownloadGuard", &e);
                 }
                 log::error("PreviewDownloadBlocked", "blocked a download");
+                Ok(())
+            })),
+            &mut token,
+        )?;
+
+        // An https image is the one request allowed out, and its server can ask for a
+        // client certificate; unhandled, WebView2 shows the certificate picker, and the
+        // one the user picks (a corporate certificate names its owner) goes to the
+        // document's author. Required for the same reason as DownloadStarting.
+        webview.cast::<ICoreWebView2_5>()?.add_ClientCertificateRequested(
+            &ClientCertificateRequestedEventHandler::create(Box::new(|_, args| {
+                let Some(args) = args else { return Ok(()) };
+                if let Err(e) = unsafe { args.SetCancel(true) } {
+                    stop_preview("PreviewClientCertificateGuard", &e);
+                }
+                log::error("PreviewClientCertificateBlocked", "refused a client certificate request");
                 Ok(())
             })),
             &mut token,
