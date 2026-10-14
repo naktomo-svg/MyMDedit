@@ -184,7 +184,8 @@ pub struct State {
     dirty: bool,
     zoom: i32,
     settings: SettingsStore,
-    error: Option<String>,
+    /// What the error banner shows, oldest first.
+    errors: Vec<String>,
     palette: Palette,
     html: String,
     lines: usize,
@@ -253,7 +254,7 @@ pub fn run(launch_file: Option<PathBuf>) -> windows::core::Result<()> {
             dirty: false,
             zoom: 100,
             settings,
-            error: None,
+            errors: Vec::new(),
             palette: Palette::new(dark),
             html: String::new(),
             lines: 1,
@@ -313,6 +314,20 @@ pub fn run(launch_file: Option<PathBuf>) -> windows::core::Result<()> {
     }
     APP.with(|a| *a.borrow_mut() = None);
     Ok(())
+}
+
+const BANNER_MAX_MESSAGES: usize = 3;
+
+/// Adds a message to the banner without losing the ones before it: two failures in a
+/// row (a removed folder, then the settings write about it) are both worth reading.
+fn push_banner_message(messages: &mut Vec<String>, message: &str) {
+    if messages.last().is_some_and(|m| m == message) {
+        return;
+    }
+    messages.push(message.to_string());
+    if messages.len() > BANNER_MAX_MESSAGES {
+        messages.remove(0);
+    }
 }
 
 fn is_dark(theme: Theme) -> bool {
@@ -599,7 +614,10 @@ impl App {
         let (w, h) = (client.right, client.bottom);
 
         let toolbar = RECT { left: 0, top: 0, right: w, bottom: s(40) };
-        let error_text = self.state.borrow().error.clone();
+        let error_text = {
+            let st = self.state.borrow();
+            (!st.errors.is_empty()).then(|| st.errors.join("\n"))
+        };
         let error_h = match &error_text {
             Some(text) => self.measure_error_height(text, w),
             None => 0,
@@ -670,7 +688,7 @@ impl App {
             (
                 st.layout,
                 st.palette,
-                st.error.clone(),
+                (!st.errors.is_empty()).then(|| st.errors.join("\n")),
                 [
                     format!("行: {}", group_thousands(st.lines)),
                     format!("文字: {}", group_thousands(st.chars)),
@@ -818,7 +836,7 @@ impl App {
             Some(c) => log::error(context, c),
             None => log::error(context, message),
         }
-        self.state.borrow_mut().error = Some(message.to_string());
+        push_banner_message(&mut self.state.borrow_mut().errors, message);
         self.layout();
     }
 
@@ -831,7 +849,7 @@ impl App {
     }
 
     fn dismiss_error(&self) {
-        self.state.borrow_mut().error = None;
+        self.state.borrow_mut().errors.clear();
         self.layout();
     }
 
@@ -1699,4 +1717,20 @@ unsafe extern "system" fn button_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
         }
     }
     unsafe { DefSubclassProc(hwnd, msg, wparam, lparam) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::push_banner_message;
+
+    #[test]
+    fn banner_keeps_recent_messages() {
+        let mut m = Vec::new();
+        push_banner_message(&mut m, "a");
+        push_banner_message(&mut m, "a");
+        push_banner_message(&mut m, "b");
+        push_banner_message(&mut m, "c");
+        push_banner_message(&mut m, "d");
+        assert_eq!(m, vec!["b", "c", "d"]);
+    }
 }
