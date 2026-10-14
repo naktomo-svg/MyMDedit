@@ -1694,6 +1694,10 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
             app.poll_scroll();
             LRESULT(0)
         }
+        preview::WM_APP_PREVIEW_FAILED => {
+            preview::on_process_failed(&app, wparam.0 == 1);
+            LRESULT(0)
+        }
         WM_APP_RENDER => {
             app.render_pending.set(false);
             app.rerender();

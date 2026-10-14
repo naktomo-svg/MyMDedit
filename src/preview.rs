@@ -8,7 +8,8 @@
 //!
 //! The preview is never loaded before all three are in place (`ready`).
 
-use windows::Win32::Foundation::{COLORREF, HWND, RECT};
+use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, RECT, WPARAM};
+use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_APP};
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_CONTROL, VK_SHIFT};
 use windows::core::{BOOL, HSTRING, Interface, PWSTR};
 
@@ -49,6 +50,86 @@ pub struct Preview {
     background: COREWEBVIEW2_COLOR,
     /// Browser-process restarts so far this session; capped so a crash loop ends.
     restarts: u32,
+    /// Renderer crashes since the last successful render; capped so a document that
+    /// kills the renderer is not re-rendered forever.
+    renderer_crashes: u32,
+}
+
+/// Posted to the main window when a WebView2 process dies (wparam: 0 renderer, 1 browser).
+pub const WM_APP_PREVIEW_FAILED: u32 = WM_APP + 3;
+const MAX_CRASH_RETRIES: u32 = 3;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CrashedProcess {
+    Renderer,
+    Browser,
+    Other,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum CrashResponse {
+    Rerender,
+    Restart,
+    GiveUp,
+    Ignore,
+}
+
+/// What to do about a dead WebView2 process, given how many times that has already
+/// happened. Bounded both ways: a document that reliably kills the renderer, or a
+/// runtime that keeps dying, must not turn into an endless respawn loop.
+fn crash_response(process: CrashedProcess, renderer_crashes: u32, browser_restarts: u32) -> CrashResponse {
+    match process {
+        CrashedProcess::Renderer if renderer_crashes < MAX_CRASH_RETRIES => CrashResponse::Rerender,
+        CrashedProcess::Browser if browser_restarts < MAX_CRASH_RETRIES => CrashResponse::Restart,
+        CrashedProcess::Renderer | CrashedProcess::Browser => CrashResponse::GiveUp,
+        CrashedProcess::Other => CrashResponse::Ignore,
+    }
+}
+
+/// Recovers from a dead process, on the main window's own message (never inside the
+/// WebView2 callback that reported it).
+pub fn on_process_failed(app: &App, browser: bool) {
+    let process = if browser { CrashedProcess::Browser } else { CrashedProcess::Renderer };
+    let response = {
+        let mut p = app.preview.borrow_mut();
+        // Whatever was in flight died with the process.
+        p.pending_self = 0;
+        p.script_busy = false;
+        p.script_again = false;
+        let response = crash_response(process, p.renderer_crashes, p.restarts);
+        match process {
+            CrashedProcess::Renderer => p.renderer_crashes += 1,
+            _ => p.restarts += 1,
+        }
+        response
+    };
+    match response {
+        CrashResponse::Rerender => {
+            log::error("PreviewProcessFailed", "render process exited; re-rendering");
+            app.refresh_preview();
+        }
+        CrashResponse::Restart => {
+            log::error("PreviewProcessFailed", "browser process exited; restarting");
+            close(app);
+            start(app, app.main_hwnd());
+        }
+        CrashResponse::GiveUp if browser => {
+            close(app);
+            app.report_error(
+                "PreviewProcessFailed",
+                "プレビューの処理が繰り返し停止したため、再起動をやめました。編集と保存は引き続き行えます。",
+                None,
+            );
+        }
+        // Not re-rendered automatically; the next edit tries again, and a successful
+        // render resets the count.
+        CrashResponse::GiveUp => app.report_error(
+            "PreviewProcessFailed",
+            "この文書を表示するとプレビューの処理が停止するため、自動での再表示をやめました。編集と保存は引き続き行えます。",
+            None,
+        ),
+        CrashResponse::Ignore => {}
+    }
 }
 
 /// Schemes NavigateToString can never produce, so a navigation carrying one can only
@@ -239,33 +320,23 @@ fn configure(controller: ICoreWebView2Controller) -> windows::core::Result<()> {
                 let Some(args) = args else { return Ok(()) };
                 let mut kind = COREWEBVIEW2_PROCESS_FAILED_KIND::default();
                 unsafe { args.ProcessFailedKind(&mut kind)? };
-                let app = app();
-                {
-                    // Whatever was in flight died with the process.
-                    let mut p = app.preview.borrow_mut();
-                    p.pending_self = 0;
-                    p.script_busy = false;
-                    p.script_again = false;
-                }
-                if kind == COREWEBVIEW2_PROCESS_FAILED_KIND_RENDER_PROCESS_EXITED {
-                    log::error("PreviewProcessFailed", "render process exited; re-rendering");
-                    app.refresh_preview();
+                let process = if kind == COREWEBVIEW2_PROCESS_FAILED_KIND_RENDER_PROCESS_EXITED {
+                    CrashedProcess::Renderer
                 } else if kind == COREWEBVIEW2_PROCESS_FAILED_KIND_BROWSER_PROCESS_EXITED {
-                    let attempt = {
-                        let mut p = app.preview.borrow_mut();
-                        p.restarts += 1;
-                        p.restarts
-                    };
-                    close(&app);
-                    if attempt <= 3 {
-                        log::error("PreviewProcessFailed", format!("browser process exited; restarting ({attempt}/3)"));
-                        start(&app, app.main_hwnd());
-                    } else {
-                        app.report_error(
-                            "PreviewProcessFailed",
-                            "プレビューの処理が繰り返し停止したため、再起動をやめました。編集と保存は引き続き行えます。",
-                            None,
-                        );
+                    CrashedProcess::Browser
+                } else {
+                    CrashedProcess::Other
+                };
+                if process == CrashedProcess::Other {
+                    log::error("PreviewProcessFailed", format!("ignored process failure kind {}", kind.0));
+                    return Ok(());
+                }
+                // Handled after this callback returns: recovery closes the controller that
+                // is raising this very event, which must not happen from inside it.
+                let wparam = WPARAM(if process == CrashedProcess::Browser { 1 } else { 0 });
+                unsafe {
+                    if let Err(e) = PostMessageW(Some(app().main_hwnd()), WM_APP_PREVIEW_FAILED, wparam, LPARAM(0)) {
+                        log::error("PreviewProcessFailed PostMessage", &e);
                     }
                 }
                 Ok(())
@@ -311,7 +382,11 @@ fn configure(controller: ICoreWebView2Controller) -> windows::core::Result<()> {
                     }
                     return Ok(());
                 }
-                app.preview.borrow_mut().navigation_failure_reported = false;
+                {
+                    let mut p = app.preview.borrow_mut();
+                    p.navigation_failure_reported = false;
+                    p.renderer_crashes = 0;
+                }
                 sync_view(&app);
                 Ok(())
             })),
@@ -532,6 +607,18 @@ mod tests {
         assert!(navigation_allowed(1, "data:text/html;base64,AA"));
         assert!(!navigation_allowed(0, "data:text/html;base64,AA")); // not ours
         assert!(!navigation_allowed(1, "https://evil/")); // scheme we never produce
+    }
+
+    #[test]
+    fn crashes_are_retried_a_bounded_number_of_times() {
+        assert_eq!(crash_response(CrashedProcess::Renderer, 0, 0), CrashResponse::Rerender);
+        assert_eq!(crash_response(CrashedProcess::Renderer, 2, 0), CrashResponse::Rerender);
+        // A document that kills the renderer must not loop render → crash → render.
+        assert_eq!(crash_response(CrashedProcess::Renderer, 3, 0), CrashResponse::GiveUp);
+        assert_eq!(crash_response(CrashedProcess::Browser, 0, 2), CrashResponse::Restart);
+        assert_eq!(crash_response(CrashedProcess::Browser, 0, 3), CrashResponse::GiveUp);
+        // GPU/utility exits and a hung renderer leave our navigations alive: touch nothing.
+        assert_eq!(crash_response(CrashedProcess::Other, 0, 0), CrashResponse::Ignore);
     }
 
     #[test]
