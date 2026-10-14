@@ -62,15 +62,15 @@ pub fn wrap_selection(text: &[u16], start: usize, len: usize, prefix: &str, suff
 /// Link / image: `[text](url)` with the `url` part selected afterwards, so a URL already
 /// on the clipboard can be pasted straight over it.
 pub fn insert_link(text: &[u16], start: usize, len: usize, opening: &str, text_placeholder: &str, url_placeholder: &str) -> Edit {
-    let opening = w(opening);
+    let (opening, close_label, close_url) = (w(opening), w("]("), w(")"));
     let label = if len > 0 { text[start..start + len].to_vec() } else { w(text_placeholder) };
     let url = w(url_placeholder);
     Edit {
         start,
         end: start + len,
-        text: concat(&[&opening, &label, &w("]("), &url, &w(")")]),
-        sel_start: start + opening.len() + label.len() + 2,
+        sel_start: start + opening.len() + label.len() + close_label.len(),
         sel_len: url.len(),
+        text: concat(&[&opening, &label, &close_label, &url, &close_url]),
     }
 }
 
@@ -182,12 +182,13 @@ pub fn code_block(text: &[u16], start: usize, len: usize) -> Edit {
     let inner = if len > 0 { text[start..end].to_vec() } else { w("コード") };
     let leading = boundary(text, start, true, false);
     let trailing = boundary(text, end, false, false);
+    let (open, close) = (w("```\r"), w("\r```"));
     Edit {
         start,
         end,
-        sel_start: start + leading.len() + 4,
+        sel_start: start + leading.len() + open.len(),
         sel_len: inner.len(),
-        text: concat(&[&leading, &w("```\r"), &inner, &w("\r```"), &trailing]),
+        text: concat(&[&leading, &open, &inner, &close, &trailing]),
     }
 }
 
@@ -257,6 +258,12 @@ mod tests {
     fn link_selects_url() {
         let e = insert_link(&w("x"), 0, 1, "[", "リンクテキスト", "url");
         assert_eq!(apply("x", &e), ("[x](url)".into(), "url".into()));
+    }
+
+    #[test]
+    fn image_link_selects_url() {
+        let e = insert_link(&w("x"), 0, 1, "![", "代替テキスト", "url");
+        assert_eq!(apply("x", &e), ("![x](url)".into(), "url".into()));
     }
 
     #[test]

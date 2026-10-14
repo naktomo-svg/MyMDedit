@@ -27,6 +27,15 @@ use crate::win::{send, wide};
 
 const CP_UTF16: u32 = 1200;
 
+/// A RichEdit selection as (start, length), kept inside the text. RichEdit can report
+/// a position past the last character (its final paragraph mark), and slicing the text
+/// with it would panic inside a window procedure — which aborts the process.
+pub fn clamp_selection(a: i32, b: i32, len: usize) -> (usize, usize) {
+    let a = (a.max(0) as usize).min(len);
+    let b = (b.max(0) as usize).min(len);
+    (a.min(b), a.abs_diff(b))
+}
+
 #[derive(Clone, Copy)]
 pub struct Editor(pub HWND);
 
@@ -100,8 +109,7 @@ impl Editor {
     pub fn selection(&self) -> (usize, usize) {
         let mut cr = CHARRANGE::default();
         send(self.0, EM_EXGETSEL, 0, &mut cr as *mut _ as isize);
-        let (a, b) = (cr.cpMin.max(0) as usize, cr.cpMax.max(0) as usize);
-        (a.min(b), a.abs_diff(b))
+        clamp_selection(cr.cpMin, cr.cpMax, self.len())
     }
 
     pub fn set_selection(&self, start: usize, len: usize) {
@@ -209,5 +217,18 @@ impl Editor {
         send(self.0, EM_GETSCROLLPOS, 0, &mut pos as *mut _ as isize);
         let scrollable = si.nMax - si.nMin + 1 - si.nPage as i32;
         if scrollable <= 0 { 0.0 } else { (pos.y as f64 / scrollable as f64).clamp(0.0, 1.0) }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::clamp_selection;
+
+    #[test]
+    fn selection_never_exceeds_text() {
+        assert_eq!(clamp_selection(2, 5, 10), (2, 3));
+        assert_eq!(clamp_selection(5, 2, 10), (2, 3));
+        assert_eq!(clamp_selection(0, 11, 10), (0, 10)); // RichEdit's final EOP
+        assert_eq!(clamp_selection(-1, 3, 10), (0, 3));
     }
 }

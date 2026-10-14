@@ -24,7 +24,7 @@ use windows::Win32::UI::Controls::Dialogs::{
 };
 use windows::Win32::UI::Controls::{DRAWITEMSTRUCT, ODS_SELECTED, TOOLTIPS_CLASSW, TTF_IDISHWND, TTF_SUBCLASS, TTM_ADDTOOLW, TTM_SETMAXTIPWIDTH, TTTOOLINFOW};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    SetFocus, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent, VK_ADD, VK_RETURN, VK_NUMPAD0, VK_OEM_MINUS, VK_OEM_PLUS, VK_SUBTRACT,
+    SetFocus, TME_LEAVE, TRACKMOUSEEVENT, GetKeyState, TrackMouseEvent, VK_ADD, VK_CONTROL, VK_MENU, VK_RETURN, VK_NUMPAD0, VK_OEM_MINUS, VK_OEM_PLUS, VK_SUBTRACT,
 };
 use windows::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::*;
@@ -220,6 +220,8 @@ pub struct App {
     /// Re-entrancy guard for commands that show a modal dialog.
     busy: Cell<bool>,
     hovered: Cell<HWND>,
+    /// Ctrl+wheel movement not yet worth a whole zoom step.
+    wheel_accum: Cell<i32>,
     find: Cell<*mut FindData>,
     find_message: Cell<u32>,
 }
@@ -273,6 +275,7 @@ pub fn run(launch_file: Option<PathBuf>) -> windows::core::Result<()> {
         swallow_enter_char: Cell::new(false),
         busy: Cell::new(false),
         hovered: Cell::new(HWND::default()),
+        wheel_accum: Cell::new(0),
         find: Cell::new(std::ptr::null_mut()),
         find_message: Cell::new(0),
     });
@@ -1660,6 +1663,16 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
 }
 
 const MK_CONTROL_BIT: usize = 0x0008;
+const WHEEL_DELTA: i32 = 120;
+
+/// Zoom steps for a wheel `delta` on top of the `accum`ulated remainder, and the new
+/// remainder. High-resolution touchpads send many deltas well under 120; each used to
+/// move the zoom a full 10%. A direction change discards the old remainder.
+fn wheel_steps(accum: i32, delta: i32) -> (i32, i32) {
+    let accum = if accum.signum() * delta.signum() < 0 { 0 } else { accum };
+    let total = accum + delta;
+    (total / WHEEL_DELTA, total % WHEEL_DELTA)
+}
 const WM_MOUSELEAVE: u32 = 0x02A3;
 
 unsafe extern "system" fn editor_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM, _id: usize, _data: usize) -> LRESULT {
@@ -1668,19 +1681,23 @@ unsafe extern "system" fn editor_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
             // Ctrl+wheel drives the app-wide zoom (editor + preview together) instead of
             // RichEdit's own editor-only zoom.
             WM_MOUSEWHEEL if wparam.0 & MK_CONTROL_BIT != 0 => {
-                let delta = hiword(wparam.0) as i16;
-                if delta > 0 {
-                    app.zoom_by(ZOOM_STEP);
-                } else if delta < 0 {
-                    app.zoom_by(-ZOOM_STEP);
+                let delta = hiword(wparam.0) as i16 as i32;
+                let (steps, rest) = wheel_steps(app.wheel_accum.get(), delta);
+                app.wheel_accum.set(rest);
+                if steps != 0 {
+                    app.zoom_by(steps * ZOOM_STEP);
                 }
                 return LRESULT(0);
             }
             // RichEdit inserts the line break on the key-down itself, so list continuation
             // has to act there. While an IME is composing, its confirming Enter arrives
             // as VK_PROCESSKEY, never VK_RETURN, so it is left alone.
-            WM_KEYDOWN if wparam.0 == VK_RETURN.0 as usize => {
-                if app.on_editor_enter() {
+            WM_KEYDOWN => {
+                // The flag only ever covers the character of the key-down that set it.
+                app.swallow_enter_char.set(false);
+                // Ctrl/Alt+Enter are not plain line breaks; leave them to RichEdit.
+                let modified = unsafe { GetKeyState(VK_CONTROL.0 as i32) < 0 || GetKeyState(VK_MENU.0 as i32) < 0 };
+                if wparam.0 == VK_RETURN.0 as usize && !modified && app.on_editor_enter() {
                     // TranslateMessage has already queued the matching '\r' character.
                     app.swallow_enter_char.set(true);
                     return LRESULT(0);
@@ -1732,5 +1749,14 @@ mod tests {
         push_banner_message(&mut m, "c");
         push_banner_message(&mut m, "d");
         assert_eq!(m, vec!["b", "c", "d"]);
+    }
+
+    #[test]
+    fn wheel_steps_accumulate_small_deltas() {
+        assert_eq!(super::wheel_steps(0, 40), (0, 40));
+        assert_eq!(super::wheel_steps(80, 40), (1, 0));
+        assert_eq!(super::wheel_steps(0, 240), (2, 0));
+        assert_eq!(super::wheel_steps(40, -60), (0, -60)); // direction change drops the remainder
+        assert_eq!(super::wheel_steps(-90, -40), (-1, -10));
     }
 }
