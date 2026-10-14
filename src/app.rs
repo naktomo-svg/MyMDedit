@@ -16,6 +16,7 @@ use windows::Win32::Graphics::Gdi::{
     EndPaint, GetDC, HFONT, HGDIOBJ, InvalidateRect, PAINTSTRUCT, ReleaseDC, SelectObject, SetBkMode, SetTextColor,
     TRANSPARENT,
 };
+use windows::Win32::System::Diagnostics::Debug::MessageBeep;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Shutdown::{ShutdownBlockReasonCreate, ShutdownBlockReasonDestroy};
 use windows::Win32::UI::Controls::Dialogs::{
@@ -224,6 +225,13 @@ pub struct App {
     wheel_accum: Cell<i32>,
     find: Cell<*mut FindData>,
     find_message: Cell<u32>,
+    /// Results of the background folder probe. The window message is only a doorbell:
+    /// the payload never travels in lparam, so a forged or duplicated message can't hand
+    /// the UI thread a pointer to free.
+    probe_tx: std::sync::mpsc::Sender<std::io::Result<()>>,
+    probe_rx: std::sync::mpsc::Receiver<std::io::Result<()>>,
+    /// A probe result waiting for the current modal dialog to close.
+    pending_probe: RefCell<Option<std::io::Result<()>>>,
 }
 
 thread_local! {
@@ -247,6 +255,7 @@ pub fn run(launch_file: Option<PathBuf>) -> windows::core::Result<()> {
     let dark = is_dark(settings.current().theme);
     theme::set_app_dark_mode(dark);
 
+    let (probe_tx, probe_rx) = std::sync::mpsc::channel();
     let app = Rc::new(App {
         ui: Cell::new(Ui::default()),
         state: RefCell::new(State {
@@ -278,6 +287,9 @@ pub fn run(launch_file: Option<PathBuf>) -> windows::core::Result<()> {
         wheel_accum: Cell::new(0),
         find: Cell::new(std::ptr::null_mut()),
         find_message: Cell::new(0),
+        probe_tx,
+        probe_rx,
+        pending_probe: RefCell::new(None),
     });
     APP.with(|a| *a.borrow_mut() = Some(app.clone()));
 
@@ -1026,25 +1038,51 @@ impl App {
     /// UI thread — an unreachable network drive blocks for the SMB/DNS timeout.
     fn open_from_recent(&self, index: usize) {
         let Some(folder) = self.current_settings().recent_folders.get(index).cloned() else { return };
-        {
-            let mut st = self.state.borrow_mut();
-            if st.probing_folder.is_some() {
-                return;
+        let already_probing = self.state.borrow().probing_folder.is_some();
+        if already_probing {
+            // A doorbell may have been lost; pick up a result that is already there.
+            if let Ok(result) = self.probe_rx.try_recv() {
+                *self.pending_probe.borrow_mut() = Some(result);
+                self.deliver_pending_probe();
+            } else {
+                // Still checking (an unreachable network drive takes a while).
+                unsafe {
+                    let _ = MessageBeep(MB_OK);
+                }
             }
-            st.probing_folder = Some(folder.clone());
+            return;
         }
+        self.state.borrow_mut().probing_folder = Some(folder.clone());
         let hwnd = self.hwnd().0 as isize;
+        let tx = self.probe_tx.clone();
         std::thread::spawn(move || {
             // Listing must actually be attempted: one entry is enough. An empty folder
             // is a perfectly good folder; only the error matters.
             let result = std::fs::read_dir(&folder).and_then(|mut it| it.next().transpose().map(|_| ()));
-            let boxed = Box::into_raw(Box::new(result));
+            if tx.send(result).is_err() {
+                return; // The app is gone.
+            }
             unsafe {
-                if PostMessageW(Some(HWND(hwnd as *mut _)), WM_APP_FOLDER_PROBED, WPARAM(0), LPARAM(boxed as isize)).is_err() {
-                    drop(Box::from_raw(boxed));
+                if let Err(e) = PostMessageW(Some(HWND(hwnd as *mut _)), WM_APP_FOLDER_PROBED, WPARAM(0), LPARAM(0)) {
+                    // The result waits in the channel; the next click on a recent folder collects it.
+                    log::error("open_from_recent PostMessage", &e);
                 }
             }
         });
+    }
+
+    /// Handles a waiting probe result unless a modal dialog is up; then it is retried when
+    /// that dialog's command finishes (see `command`). The result opens a discard prompt
+    /// and a file picker, which must never stack on another modal.
+    fn deliver_pending_probe(&self) {
+        if self.busy.replace(true) {
+            return;
+        }
+        let result = self.pending_probe.borrow_mut().take();
+        if let Some(result) = result {
+            self.on_folder_probed(result);
+        }
+        self.busy.set(false);
     }
 
     /// Step 2: the probe's verdict. Only "not found" drops the entry; access denied or
@@ -1273,6 +1311,11 @@ impl App {
     }
 
     fn on_close_request(&self) {
+        // A modal dialog of ours is up (its own loop delivered this, e.g. from the taskbar).
+        // Closing under it would stack a second prompt; the user can close once it's gone.
+        if self.busy.get() {
+            return;
+        }
         if self.close_confirmed.get() || self.confirm_discard(true) {
             self.close_confirmed.set(true);
             unsafe {
@@ -1525,6 +1568,7 @@ impl App {
         }
         if modal {
             self.busy.set(false);
+            self.deliver_pending_probe();
         }
     }
 
@@ -1622,8 +1666,10 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
             LRESULT(0)
         }
         WM_APP_FOLDER_PROBED => {
-            let result = unsafe { Box::from_raw(lparam.0 as *mut std::io::Result<()>) };
-            app.on_folder_probed(*result);
+            if let Ok(result) = app.probe_rx.try_recv() {
+                *app.pending_probe.borrow_mut() = Some(result);
+                app.deliver_pending_probe();
+            }
             LRESULT(0)
         }
         WM_SETTINGCHANGE => {
