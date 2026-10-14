@@ -76,6 +76,10 @@ pub enum ReadError {
     Io(io::Error),
     /// The bytes are not valid in the detected charset (realistically: a Shift-JIS file).
     InvalidEncoding,
+    /// Decodes fine but contains U+0000 (realistically: BOM-less UTF-16). Every Win32
+    /// text API the editor uses stops at the first NUL, so the rest would be silently
+    /// dropped from view — and then from the file on the next save.
+    ContainsNul,
 }
 
 impl fmt::Display for ReadError {
@@ -83,11 +87,13 @@ impl fmt::Display for ReadError {
         match self {
             ReadError::Io(e) => write!(f, "{e}"),
             ReadError::InvalidEncoding => f.write_str(INVALID_ENCODING_MESSAGE),
+            ReadError::ContainsNul => f.write_str(CONTAINS_NUL_MESSAGE),
         }
     }
 }
 
 pub const INVALID_ENCODING_MESSAGE: &str = "このファイルは UTF-8 として読み取れませんでした。Shift-JIS など、このアプリが対応していない文字コードの可能性があります。ファイルは変更していません。";
+pub const CONTAINS_NUL_MESSAGE: &str = "このファイルには NUL 文字が含まれているため開けません。BOM のない UTF-16 など、このアプリが対応していない形式の可能性があります。ファイルは変更していません。";
 
 /// Strictly decodes `bytes`. Strictness is the point: substituting U+FFFD for
 /// undecodable input is what destroys non-UTF-8 files, because saving then writes the
@@ -133,6 +139,10 @@ pub fn decode(bytes: &[u8]) -> Result<(String, DocumentFormat), ReadError> {
         }
     };
 
+    // Checked after decoding, so it covers every charset — UTF-16/32 decode NUL too.
+    if text.contains('\0') {
+        return Err(ReadError::ContainsNul);
+    }
     format.line_ending = line_endings::detect(&text);
     Ok((text, format))
 }
@@ -175,8 +185,8 @@ pub struct OpenedDocument {
 pub fn read(path: &Path) -> Result<OpenedDocument, ReadError> {
     let bytes = fs::read(path).map_err(ReadError::Io)?;
     let (content, format) = decode(&bytes).inspect_err(|e| {
-        if matches!(e, ReadError::InvalidEncoding) {
-            log::error(&format!("read({})", path.display()), "invalid encoding");
+        if !matches!(e, ReadError::Io(_)) {
+            log::error(&format!("read({})", path.display()), e);
         }
     })?;
     Ok(OpenedDocument { path: path.to_path_buf(), content, format })
@@ -195,52 +205,100 @@ pub fn save_atomic(path: &Path, content: &str, format: &DocumentFormat) -> io::R
     let file_name = full.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     let temp = dir.join(format!("{file_name}.{:016x}.tmp", random_u64()));
 
+    let backup = dir.join(format!("{file_name}.{:016x}.bak", random_u64()));
+
     let bytes = encode(&line_endings::normalize(content, format.line_ending), format);
+    let existed = full.exists();
     let result = (|| {
         {
             let mut file = fs::File::create_new(&temp)?;
             file.write_all(&bytes)?;
             file.sync_all()?;
         }
-        if full.exists() {
-            // Preferred: ReplaceFile keeps the original's attributes and ACLs.
-            let replaced = unsafe {
-                ReplaceFileW(
-                    &HSTRING::from(full.as_os_str()),
-                    &HSTRING::from(temp.as_os_str()),
-                    None,
-                    REPLACEFILE_IGNORE_MERGE_ERRORS,
-                    None,
-                    None,
-                )
-            };
-            if let Err(e) = replaced {
-                // Not every file system supports ReplaceFile (notably some network
-                // shares). MoveFileEx with REPLACE_EXISTING is still an atomic swap; it
-                // just doesn't carry the original's attributes over.
-                log::error(&format!("save_atomic({}) ReplaceFile fallback", full.display()), &e);
-                move_file(&temp, &full, true)?;
-            }
-        } else {
-            move_file(&temp, &full, false)?;
-        }
-        Ok(())
+        if existed { swap_into_place(&full, &temp, &backup, &SYSTEM_FILE_OPS) } else { move_file(&temp, &full, false) }
     })();
 
-    // A successful swap consumed the temp file; anything else must not leave debris
-    // next to the user's document. Never let cleanup replace the real outcome.
-    if temp.exists() {
-        if let Err(e) = fs::remove_file(&temp) {
-            log::error(&format!("remove temp {}", temp.display()), e);
+    match &result {
+        // The target was there before and is gone now: the temp file is the only copy of
+        // the document on disk, so it must survive, and the user must learn where it is.
+        Err(e) if existed && !full.exists() && temp.exists() => {
+            return Err(io::Error::new(
+                e.kind(),
+                format!("{e}（保存しようとした内容は {} に残しています）", temp.display()),
+            ));
         }
+        // Otherwise the target holds either the original or the new content, so a
+        // leftover temp file is debris. Never let cleanup replace the real outcome.
+        _ => remove_if_exists(&temp),
     }
     result
+}
+
+/// The file-system calls `swap_into_place` makes, injectable so its recovery paths can
+/// be exercised by tests without provoking real ReplaceFile failures.
+struct FileOps {
+    replace: fn(target: &Path, replacement: &Path, backup: &Path) -> io::Result<()>,
+    rename: fn(from: &Path, to: &Path, overwrite: bool) -> io::Result<()>,
+}
+
+const SYSTEM_FILE_OPS: FileOps = FileOps { replace: replace_file, rename: move_file };
+
+/// Replaces existing `full` with `temp`, keeping the original recoverable at every step.
+///
+/// ReplaceFile can fail after it has already moved the original aside
+/// (ERROR_UNABLE_TO_MOVE_REPLACEMENT_2). Without a backup name the original then sits
+/// under a name nobody knows — and if the fallback also fails, the target is simply
+/// gone. Passing `backup` makes that location known, so it can be put back.
+fn swap_into_place(full: &Path, temp: &Path, backup: &Path, ops: &FileOps) -> io::Result<()> {
+    // Preferred: ReplaceFile keeps the original's attributes and ACLs.
+    let replaced = (ops.replace)(full, temp, backup);
+    if let Err(e) = replaced {
+        log::error(&format!("save_atomic({}) ReplaceFile failed", full.display()), &e);
+        if !full.exists() && backup.exists() {
+            // Restore the original before trying anything else.
+            (ops.rename)(backup, full, false).map_err(|restore| {
+                io::Error::new(
+                    restore.kind(),
+                    format!("{e}（元のファイルは {} に退避されています）", backup.display()),
+                )
+            })?;
+        }
+        // Not every file system supports ReplaceFile (notably some network shares).
+        // MoveFileEx with REPLACE_EXISTING is still an atomic swap; it just doesn't
+        // carry the original's attributes over.
+        (ops.rename)(temp, full, true)?;
+    }
+    // The original's content has been superseded by a successful swap.
+    remove_if_exists(backup);
+    Ok(())
+}
+
+fn remove_if_exists(path: &Path) {
+    if path.exists()
+        && let Err(e) = fs::remove_file(path)
+    {
+        log::error(&format!("remove {}", path.display()), e);
+    }
+}
+
+fn replace_file(target: &Path, replacement: &Path, backup: &Path) -> io::Result<()> {
+    unsafe {
+        ReplaceFileW(
+            &HSTRING::from(target.as_os_str()),
+            &HSTRING::from(replacement.as_os_str()),
+            &HSTRING::from(backup.as_os_str()),
+            REPLACEFILE_IGNORE_MERGE_ERRORS,
+            None,
+            None,
+        )
+    }
+    .map_err(|e| io::Error::from_raw_os_error(e.code().0 & 0xFFFF))
 }
 
 fn move_file(from: &Path, to: &Path, overwrite: bool) -> io::Result<()> {
     let flags = if overwrite { MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH } else { MOVEFILE_WRITE_THROUGH };
     unsafe { MoveFileExW(&HSTRING::from(from.as_os_str()), &HSTRING::from(to.as_os_str()), flags) }
-        .map_err(|e| io::Error::from_raw_os_error((e.code().0 & 0xFFFF) as i32))
+        .map_err(|e| io::Error::from_raw_os_error(e.code().0 & 0xFFFF))
 }
 
 fn random_u64() -> u64 {
@@ -273,6 +331,64 @@ mod tests {
             assert_eq!(text, "日本語\n😀");
             assert_eq!(back, fmt);
         }
+    }
+
+    fn temp_dir() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("mymdedit-test-{:x}", random_u64()));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// ERROR_UNABLE_TO_MOVE_REPLACEMENT_2: the original was moved aside, the swap did not happen.
+    fn replace_moves_original_then_fails(target: &Path, _: &Path, backup: &Path) -> io::Result<()> {
+        fs::rename(target, backup)?;
+        Err(io::Error::from_raw_os_error(1177))
+    }
+
+    fn replace_unsupported(_: &Path, _: &Path, _: &Path) -> io::Result<()> {
+        Err(io::Error::from_raw_os_error(50))
+    }
+
+    /// A rename that is blocked (sharing violation) whenever it would move the temp file.
+    fn rename_refusing_temp(from: &Path, to: &Path, overwrite: bool) -> io::Result<()> {
+        if from.extension().is_some_and(|e| e == "tmp") {
+            return Err(io::Error::from_raw_os_error(32));
+        }
+        move_file(from, to, overwrite)
+    }
+
+    #[test]
+    fn partial_replace_failure_restores_the_original() {
+        let dir = temp_dir();
+        let (full, temp, backup) = (dir.join("a.md"), dir.join("a.md.1.tmp"), dir.join("a.md.1.bak"));
+        fs::write(&full, "original").unwrap();
+        fs::write(&temp, "new").unwrap();
+        let ops = FileOps { replace: replace_moves_original_then_fails, rename: rename_refusing_temp };
+        assert!(swap_into_place(&full, &temp, &backup, &ops).is_err());
+        assert_eq!(fs::read_to_string(&full).unwrap(), "original");
+        assert!(!backup.exists());
+        assert_eq!(fs::read_to_string(&temp).unwrap(), "new");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn unsupported_replace_falls_back_to_move() {
+        let dir = temp_dir();
+        let (full, temp, backup) = (dir.join("a.md"), dir.join("a.md.1.tmp"), dir.join("a.md.1.bak"));
+        fs::write(&full, "original").unwrap();
+        fs::write(&temp, "new").unwrap();
+        let ops = FileOps { replace: replace_unsupported, rename: move_file };
+        swap_into_place(&full, &temp, &backup, &ops).unwrap();
+        assert_eq!(fs::read_to_string(&full).unwrap(), "new");
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn rejects_text_containing_nul() {
+        // BOM-less UTF-16LE "ab": valid UTF-8 byte-wise, but the editor would cut it at the NUL.
+        assert!(decode(b"a\0b\0").is_err());
+        assert!(decode(b"x\0y").is_err());
     }
 
     #[test]

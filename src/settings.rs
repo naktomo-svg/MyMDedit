@@ -5,7 +5,7 @@
 //! named are carried over rather than reset. Neither loading nor saving panics or
 //! propagates: a failed load degrades to defaults, a failed save returns `false`.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -97,43 +97,129 @@ pub fn add_recent_folder(current: &[String], folder: &str) -> Vec<String> {
         .collect()
 }
 
+fn unix_seconds() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
 pub fn remove_recent_folder(current: &[String], folder: &str) -> Vec<String> {
     current.iter().filter(|f| !f.eq_ignore_ascii_case(folder)).cloned().collect()
+}
+
+/// The settings file's own on-disk form, decided here rather than borrowed from the
+/// document defaults (which are free to change for documents' sake).
+const SETTINGS_FILE_FORMAT: DocumentFormat =
+    DocumentFormat { charset: document::Charset::Utf8, has_bom: false, line_ending: LineEnding::Lf };
+
+/// What [`parse_settings`] made of a settings file.
+#[derive(Debug)]
+enum Parsed {
+    /// Every field read cleanly.
+    Clean(AppSettings),
+    /// Readable as a whole, but these fields were invalid and fell back to defaults.
+    Partial(AppSettings, Vec<String>),
+    /// Not a JSON object at all.
+    Unreadable(String),
+}
+
+/// Reads settings field by field, so one bad value (a misspelt theme, a string where a
+/// number belongs) costs only that field instead of every setting.
+fn parse_settings(text: &str) -> Parsed {
+    // Editors that save "UTF-8" with a BOM are common; JSON parsers reject it.
+    let text = text.strip_prefix('\u{FEFF}').unwrap_or(text);
+    let object = match serde_json::from_str::<serde_json::Value>(text) {
+        Ok(serde_json::Value::Object(o)) => o,
+        Ok(_) => return Parsed::Unreadable("設定ファイルの中身が JSON オブジェクトではありません".into()),
+        Err(e) => return Parsed::Unreadable(e.to_string()),
+    };
+    let mut merged = match serde_json::to_value(AppSettings::default()) {
+        Ok(serde_json::Value::Object(o)) => o,
+        _ => return Parsed::Unreadable("既定の設定を組み立てられませんでした".into()),
+    };
+    let mut rejected = Vec::new();
+    for (key, value) in object {
+        if !merged.contains_key(&key) {
+            continue; // Unknown keys (e.g. from a newer version) are ignored, not errors.
+        }
+        let mut candidate = merged.clone();
+        candidate.insert(key.clone(), value);
+        if serde_json::from_value::<AppSettings>(serde_json::Value::Object(candidate.clone())).is_ok() {
+            merged = candidate;
+        } else {
+            rejected.push(key);
+        }
+    }
+    let settings = serde_json::from_value::<AppSettings>(serde_json::Value::Object(merged)).unwrap_or_default().sanitized();
+    if rejected.is_empty() { Parsed::Clean(settings) } else { Parsed::Partial(settings, rejected) }
 }
 
 pub struct SettingsStore {
     path: Option<PathBuf>,
     current: AppSettings,
+    /// False when the file on disk could not be read: writing would replace settings
+    /// we never saw, so this session leaves the file alone.
+    writable: bool,
+    /// Something the user should be told at startup about how the settings were loaded.
+    load_warning: Option<String>,
 }
 
 impl SettingsStore {
     /// Loads from `%APPDATA%\MyMDedit\settings.json`. Never fails: anything unreadable
-    /// degrades to defaults and is recorded.
+    /// degrades to defaults — but never silently, and never by later overwriting a file
+    /// that held more than what was loaded.
     pub fn load() -> Self {
         let path = std::env::var_os("APPDATA").map(|d| PathBuf::from(d).join("MyMDedit").join("settings.json"));
-        let current = path.as_ref().map(|p| Self::read(p)).unwrap_or_default();
-        Self { path, current }
+        let mut store = Self { path: path.clone(), current: AppSettings::default(), writable: true, load_warning: None };
+        if let Some(path) = path {
+            store.read(&path);
+        }
+        store
     }
 
-    fn read(path: &PathBuf) -> AppSettings {
-        match std::fs::read_to_string(path) {
-            Ok(json) => match serde_json::from_str::<AppSettings>(&json) {
-                Ok(s) => s.sanitized(),
-                Err(e) => {
-                    log::error("SettingsStore.load parse", e);
-                    AppSettings::default()
-                }
-            },
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => AppSettings::default(),
+    fn read(&mut self, path: &Path) {
+        let text = match std::fs::read(path) {
+            Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
             Err(e) => {
-                log::error("SettingsStore.load", e);
-                AppSettings::default()
+                // Probably transient (a lock, a permission glitch). The file may be
+                // perfectly good, so it must not be overwritten with defaults.
+                log::error("SettingsStore.load", &e);
+                self.writable = false;
+                self.load_warning = Some(format!(
+                    "設定ファイルを読み込めなかったため、既定の設定で起動しました。元のファイルを守るため、この起動中は設定を保存しません。({e})"
+                ));
+                return;
             }
+        };
+        let (settings, problem) = match parse_settings(&text) {
+            Parsed::Clean(s) => (s, None),
+            Parsed::Partial(s, fields) => (s, Some(format!("一部の項目（{}）を読み込めなかったため、既定値を使います。", fields.join(", ")))),
+            Parsed::Unreadable(reason) => {
+                log::error("SettingsStore.load parse", &reason);
+                (AppSettings::default(), Some("設定ファイルを読み込めなかったため、既定の設定で起動しました。".to_string()))
+            }
+        };
+        self.current = settings;
+        if let Some(problem) = problem {
+            // The next save will drop whatever could not be read, so keep the original.
+            let backup = path.with_file_name(format!("settings.broken-{}.json", unix_seconds()));
+            self.load_warning = Some(match std::fs::copy(path, &backup) {
+                Ok(_) => format!("{problem}元のファイルは {} に保存してあります。", backup.display()),
+                Err(e) => {
+                    log::error("SettingsStore.load backup", &e);
+                    self.writable = false;
+                    format!("{problem}元のファイルを退避できなかったため、この起動中は設定を保存しません。")
+                }
+            });
         }
     }
 
     pub fn current(&self) -> &AppSettings {
         &self.current
+    }
+
+    /// Takes the startup warning, if any, for the caller to show once a UI exists.
+    pub fn take_load_warning(&mut self) -> Option<String> {
+        self.load_warning.take()
     }
 
     /// Makes `settings` current and writes it. `current` is replaced before the write,
@@ -144,13 +230,16 @@ impl SettingsStore {
             log::error("SettingsStore.save", "APPDATA is not set");
             return false;
         };
+        if !self.writable {
+            log::error("SettingsStore.save", "skipped: the settings file could not be read at startup");
+            return false;
+        }
         let result = (|| -> std::io::Result<()> {
             if let Some(dir) = path.parent() {
                 std::fs::create_dir_all(dir)?;
             }
             let json = serde_json::to_string_pretty(&self.current).map_err(std::io::Error::other)?;
-            let format = DocumentFormat { line_ending: LineEnding::Lf, ..DocumentFormat::default() };
-            document::save_atomic(path, &json, &format)
+            document::save_atomic(path, &json, &SETTINGS_FILE_FORMAT)
         })();
         match result {
             Ok(()) => true,
@@ -181,6 +270,52 @@ mod tests {
         assert_eq!(add_recent_folder(&cur, "c:\\B"), vec!["c:\\B", "C:\\a", "C:\\c"]);
         assert_eq!(add_recent_folder(&cur, "C:\\d"), vec!["C:\\d", "C:\\a", "C:\\b"]);
         assert_eq!(remove_recent_folder(&cur, "C:\\A"), vec!["C:\\b", "C:\\c"]);
+    }
+
+    #[test]
+    fn one_bad_field_keeps_the_others() {
+        match parse_settings(r#"{"theme": "dark", "editor_font_size": 20, "table_row_striping": true}"#) {
+            Parsed::Partial(s, rejected) => {
+                assert_eq!(rejected, vec!["theme"]);
+                assert_eq!(s.theme, Theme::System);
+                assert_eq!(s.editor_font_size, 20.0);
+                assert!(s.table_row_striping);
+            }
+            other => panic!("expected Partial, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bom_is_accepted_and_unknown_keys_ignored() {
+        assert!(matches!(parse_settings("\u{FEFF}{\"theme\": \"Dark\", \"future\": 1}"), Parsed::Clean(s) if s.theme == Theme::Dark));
+    }
+
+    #[test]
+    fn syntax_error_is_unreadable() {
+        assert!(matches!(parse_settings("{\"theme\": \"Dark\",}"), Parsed::Unreadable(_)));
+        assert!(matches!(parse_settings("[]"), Parsed::Unreadable(_)));
+    }
+
+    fn store_at(path: &Path) -> SettingsStore {
+        let mut store = SettingsStore { path: Some(path.to_path_buf()), current: AppSettings::default(), writable: true, load_warning: None };
+        store.read(path);
+        store
+    }
+
+    #[test]
+    fn broken_file_is_backed_up_before_it_can_be_overwritten() {
+        let dir = std::env::temp_dir().join(format!("mymdedit-settings-{}", unix_seconds()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+        std::fs::write(&path, "{\"theme\": \"Dark\",}").unwrap();
+        let mut store = store_at(&path);
+        assert!(store.take_load_warning().is_some_and(|w| w.contains("settings.broken-")));
+        assert!(store.save(AppSettings::default()));
+        let backups: Vec<_> = std::fs::read_dir(&dir).unwrap().filter_map(|e| e.ok()).filter(|e| e.file_name().to_string_lossy().starts_with("settings.broken-")).collect();
+        assert_eq!(backups.len(), 1);
+        assert_eq!(std::fs::read_to_string(backups[0].path()).unwrap(), "{\"theme\": \"Dark\",}");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

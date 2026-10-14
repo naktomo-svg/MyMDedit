@@ -16,11 +16,12 @@ use webview2_com::Microsoft::Web::WebView2::Win32::{
     COREWEBVIEW2_COLOR, COREWEBVIEW2_KEY_EVENT_KIND, COREWEBVIEW2_KEY_EVENT_KIND_KEY_DOWN,
     COREWEBVIEW2_KEY_EVENT_KIND_SYSTEM_KEY_DOWN, COREWEBVIEW2_WEB_ERROR_STATUS, CreateCoreWebView2EnvironmentWithOptions,
     ICoreWebView2, ICoreWebView2Controller, ICoreWebView2Controller2, ICoreWebView2EnvironmentOptions,
+    ICoreWebView2NavigationStartingEventArgs,
 };
 use webview2_com::{
     AcceleratorKeyPressedEventHandler, CoreWebView2EnvironmentOptions, CreateCoreWebView2ControllerCompletedHandler,
     CreateCoreWebView2EnvironmentCompletedHandler, ExecuteScriptCompletedHandler, NavigationCompletedEventHandler,
-    NavigationStartingEventHandler, take_pwstr,
+    NavigationStartingEventHandler, NewWindowRequestedEventHandler, take_pwstr,
 };
 
 use crate::app::{App, app};
@@ -54,7 +55,31 @@ pub struct Preview {
 const BLOCKED_SCHEMES: [&str; 6] = ["http:", "https:", "file:", "ftp:", "ws:", "wss:"];
 
 fn uses_blocked_scheme(uri: &str) -> bool {
-    BLOCKED_SCHEMES.iter().any(|s| uri.len() >= s.len() && uri[..s.len()].eq_ignore_ascii_case(s))
+    // Compared as bytes: slicing the &str at a scheme's length can land inside a
+    // multi-byte character and panic — inside a WebView2 callback, where a panic aborts
+    // the process and takes the unsaved document with it.
+    BLOCKED_SCHEMES.iter().any(|s| uri.as_bytes().get(..s.len()).is_some_and(|p| p.eq_ignore_ascii_case(s.as_bytes())))
+}
+
+/// The guard's decision for one NavigationStarting. Every way of failing to decide is
+/// an `Err`, which the caller turns into a cancel — the guard must fail closed.
+fn allow_navigation(args: &ICoreWebView2NavigationStartingEventArgs) -> windows::core::Result<bool> {
+    let mut uri = PWSTR::null();
+    let mut id = 0u64;
+    unsafe {
+        args.Uri(&mut uri)?;
+        args.NavigationId(&mut id)?;
+    }
+    let uri = take_pwstr(uri);
+    let app = app();
+    let mut p = app.preview.borrow_mut();
+    if p.pending_self == 0 || uses_blocked_scheme(&uri) {
+        log::error("PreviewNavigationBlocked", format!("blocked navigation to {}", describe_uri(&uri)));
+        return Ok(false);
+    }
+    p.pending_self -= 1;
+    p.latest_id = id;
+    Ok(true)
 }
 
 fn describe_uri(uri: &str) -> String {
@@ -125,21 +150,33 @@ fn configure(controller: ICoreWebView2Controller) -> windows::core::Result<()> {
         webview.add_NavigationStarting(
             &NavigationStartingEventHandler::create(Box::new(|_, args| {
                 let Some(args) = args else { return Ok(()) };
-                let mut uri = PWSTR::null();
-                unsafe { args.Uri(&mut uri)? };
-                let uri = take_pwstr(uri);
-                let app = app();
-                let mut p = app.preview.borrow_mut();
-                let cancel = p.pending_self == 0 || uses_blocked_scheme(&uri);
-                if cancel {
+                let allow = allow_navigation(&args).unwrap_or_else(|e| {
+                    // WebView2 ignores a handler's error and lets the navigation proceed,
+                    // so an early `?` here would fail open.
+                    log::error("PreviewNavigationBlocked", format!("could not inspect navigation, cancelling: {e}"));
+                    false
+                });
+                if !allow {
                     unsafe { args.SetCancel(true)? };
-                    log::error("PreviewNavigationBlocked", format!("blocked navigation to {}", describe_uri(&uri)));
-                    return Ok(());
                 }
-                p.pending_self -= 1;
-                let mut id = 0u64;
-                unsafe { args.NavigationId(&mut id)? };
-                p.latest_id = id;
+                Ok(())
+            })),
+            &mut token,
+        )?;
+
+        // Ctrl/Shift/middle-click, target="_blank" and the context menu's "open in new
+        // window" bypass NavigationStarting entirely: WebView2 opens a popup that inherits
+        // neither IsScriptEnabled=false nor the CSP. Never let one be created.
+        webview.add_NewWindowRequested(
+            &NewWindowRequestedEventHandler::create(Box::new(|_, args| {
+                let Some(args) = args else { return Ok(()) };
+                unsafe { args.SetHandled(true)? };
+                let mut uri = PWSTR::null();
+                let uri = match unsafe { args.Uri(&mut uri) } {
+                    Ok(()) => take_pwstr(uri),
+                    Err(_) => String::new(),
+                };
+                log::error("PreviewNewWindowBlocked", format!("blocked new window for {}", describe_uri(&uri)));
                 Ok(())
             })),
             &mut token,
@@ -385,6 +422,12 @@ mod tests {
         assert!(uses_blocked_scheme("file:///C:/x"));
         assert!(!uses_blocked_scheme("data:text/html;charset=utf-8;base64,AAA"));
         assert!(!uses_blocked_scheme("about:blank"));
+    }
+
+    #[test]
+    fn scheme_check_does_not_panic_on_non_ascii() {
+        assert!(!uses_blocked_scheme("日本語"));
+        assert!(!uses_blocked_scheme("ab日"));
     }
 
     #[test]

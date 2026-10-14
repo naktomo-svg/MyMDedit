@@ -17,6 +17,7 @@ use windows::Win32::Graphics::Gdi::{
     TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::Shutdown::{ShutdownBlockReasonCreate, ShutdownBlockReasonDestroy};
 use windows::Win32::UI::Controls::Dialogs::{
     FINDMSGSTRINGW, FINDREPLACE_FLAGS, FINDREPLACEW, FR_DIALOGTERM, FR_DOWN, FR_FINDNEXT, FR_MATCHCASE, FR_REPLACE,
     FR_REPLACEALL, FR_WHOLEWORD, FindTextW, ReplaceTextW,
@@ -278,6 +279,11 @@ pub fn run(launch_file: Option<PathBuf>) -> windows::core::Result<()> {
 
     app.create_window()?;
     let ui = app.ui.get();
+    // Settings load before any UI exists; tell the user now that the banner does.
+    let warning = app.state.borrow_mut().settings.take_load_warning();
+    if let Some(warning) = warning {
+        app.report_error("SettingsStore.load", &warning, None);
+    }
 
     app.load_content(SAMPLE_CONTENT);
     if let Some(path) = launch_file {
@@ -819,7 +825,7 @@ impl App {
     fn report_file_error(&self, context: &str, message: &str, e: &ReadError) {
         match e {
             // Already written for the user.
-            ReadError::InvalidEncoding => self.report_error(context, &e.to_string(), None),
+            ReadError::InvalidEncoding | ReadError::ContainsNul => self.report_error(context, &e.to_string(), None),
             ReadError::Io(io) => self.report_error(context, &format!("{message} ({io})"), Some(io)),
         }
     }
@@ -1200,6 +1206,39 @@ impl App {
         }
     }
 
+    /// Whether the session may end. With unsaved changes, the shutdown screen is given a
+    /// reason (so it explains what is holding it up) and the user gets the same
+    /// 保存する / 保存しない / キャンセル prompt as closing the window.
+    fn on_query_end_session(&self) -> bool {
+        if self.close_confirmed.get() || !self.state.borrow().dirty {
+            return true;
+        }
+        let reason = wide("保存されていない変更があります");
+        unsafe {
+            let _ = ShutdownBlockReasonCreate(self.hwnd(), pcwstr(&reason))
+                .inspect_err(|e| log::error("ShutdownBlockReasonCreate", e));
+        }
+        // Another modal dialog is already up: don't stack a prompt on it. The block
+        // reason stays, so the user sees why and can choose there.
+        if self.busy.replace(true) {
+            return false;
+        }
+        // An undisplayable prompt blocks rather than discards: the shutdown screen still
+        // lets the user end the session deliberately.
+        let ok = self.confirm_discard(false);
+        self.busy.set(false);
+        if ok {
+            self.release_shutdown_block();
+        }
+        ok
+    }
+
+    fn release_shutdown_block(&self) {
+        unsafe {
+            let _ = ShutdownBlockReasonDestroy(self.hwnd());
+        }
+    }
+
     fn on_close_request(&self) {
         if self.close_confirmed.get() || self.confirm_discard(true) {
             self.close_confirmed.set(true);
@@ -1564,6 +1603,18 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
         }
         WM_CLOSE => {
             app.on_close_request();
+            LRESULT(0)
+        }
+        // Sign-out, shutdown and Restart Manager (installers, Windows Update) end the app
+        // through these, never through WM_CLOSE — so the discard prompt must live here too.
+        WM_QUERYENDSESSION => LRESULT(app.on_query_end_session() as isize),
+        WM_ENDSESSION => {
+            if wparam.0 != 0 {
+                // The session really is ending; the process is terminated after this.
+                app.close_confirmed.set(true);
+            } else {
+                app.release_shutdown_block();
+            }
             LRESULT(0)
         }
         WM_DESTROY => {

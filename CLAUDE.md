@@ -45,6 +45,10 @@ Generating the AI tech-debt report (`scripts/Analyze-TechDebt.ps1`) has its own 
 - Keyboard focus inside the WebView never reaches the main accelerator table; `AcceleratorKeyPressed` forwards the app's shortcuts (`app::ACCELERATORS` is the single list both paths use).
 - The menu bar has no dark theme; it is painted through the undocumented `WM_UAHDRAWMENU`/`WM_UAHDRAWMENUITEM` messages (`theme.rs`), and popup menus follow uxtheme ordinal 135 (`SetPreferredAppMode`).
 - Owner-drawn buttons report a fast second click as `BN_DOUBLECLICKED` (code 5), which `WM_COMMAND` handling treats as a click.
+- Sign-out, shutdown and Restart Manager end the app through `WM_QUERYENDSESSION`/`WM_ENDSESSION`, never `WM_CLOSE`; `DefWindowProc` answers "yes" and unsaved work is gone. Any "before the app goes away" logic must be wired to both paths (`on_close_request` and `on_query_end_session`).
+- WebView2 ignores an event handler's `Err` and carries on with the default action. A security handler that bails out with `?` before deciding therefore **fails open** — compute the decision in a function returning `Result` and treat `Err` as "deny" (`preview::allow_navigation`).
+- `NavigationStarting` does not see popups: Ctrl/Shift/middle-click, `target="_blank"` and "open in new window" go through `NewWindowRequested`, and the popup inherits neither `IsScriptEnabled = false` nor the CSP. Any new way content can leave the preview needs its own handler installed before `ready`.
+- `ReplaceFileW` can fail after moving the original aside. Always give it a backup name so the original's location is known, and never delete the temp file while the target is missing (`document::swap_into_place`).
 
 ## Development workflow
 
