@@ -19,7 +19,7 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Shutdown::{ShutdownBlockReasonCreate, ShutdownBlockReasonDestroy};
 use windows::Win32::UI::Controls::Dialogs::{
-    FINDMSGSTRINGW, FINDREPLACE_FLAGS, FINDREPLACEW, FR_DIALOGTERM, FR_DOWN, FR_FINDNEXT, FR_MATCHCASE, FR_REPLACE,
+    CommDlgExtendedError, FINDMSGSTRINGW, FINDREPLACE_FLAGS, FINDREPLACEW, FR_DIALOGTERM, FR_DOWN, FR_FINDNEXT, FR_MATCHCASE, FR_REPLACE,
     FR_REPLACEALL, FR_WHOLEWORD, FindTextW, ReplaceTextW,
 };
 use windows::Win32::UI::Controls::{DRAWITEMSTRUCT, ODS_SELECTED, TOOLTIPS_CLASSW, TTF_IDISHWND, TTF_SUBCLASS, TTM_ADDTOOLW, TTM_SETMAXTIPWIDTH, TTTOOLINFOW};
@@ -1380,6 +1380,11 @@ impl App {
             ..Default::default()
         };
         let dialog = unsafe { if replace { ReplaceTextW(&mut data.fr) } else { FindTextW(&mut data.fr) } };
+        if dialog.is_invalid() {
+            let code = unsafe { CommDlgExtendedError() };
+            log::error("FindTextW", format!("could not create the dialog: CommDlgExtendedError={}", code.0));
+            return;
+        }
         self.state.borrow_mut().find_is_replace = replace;
         let mut ui = self.ui.get();
         ui.find_dialog = dialog;
@@ -1401,18 +1406,20 @@ impl App {
         editor.scroll_caret();
     }
 
-    fn on_find_message(&self, fr: &FINDREPLACEW) {
-        let flags: FINDREPLACE_FLAGS = fr.Flags;
+    fn on_find_message(&self) {
+        // Copy everything out first: no reference into FindData may outlive this block.
+        // The message boxes below run a modal loop in which show_find can take `&mut`.
+        let (flags, query, replacement): (FINDREPLACE_FLAGS, Vec<u16>, Vec<u16>) = unsafe {
+            let data = &*self.find.get();
+            let cut = |b: &[u16]| b[..b.iter().position(|&c| c == 0).unwrap_or(b.len())].to_vec();
+            (data.fr.Flags, cut(&data.find), cut(&data.replace))
+        };
         if flags.contains(FR_DIALOGTERM) {
             let mut ui = self.ui.get();
             ui.find_dialog = HWND::default();
             self.ui.set(ui);
             return;
         }
-        let data = unsafe { &*self.find.get() };
-        let cut = |b: &[u16]| b[..b.iter().position(|&c| c == 0).unwrap_or(b.len())].to_vec();
-        let query = cut(&data.find);
-        let replacement = cut(&data.replace);
         let case = flags.contains(FR_MATCHCASE);
         let whole = flags.contains(FR_WHOLEWORD);
         let editor = self.editor();
@@ -1557,8 +1564,12 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
         return r;
     }
     if msg == app.find_message.get() && msg != 0 {
-        let fr = unsafe { &*(lparam.0 as *const FINDREPLACEW) };
-        app.on_find_message(fr);
+        // Only our own FINDREPLACEW: another process can post this registered message
+        // with any lparam, and it is about to be dereferenced.
+        let ours = unsafe { &raw const (*app.find.get()).fr };
+        if lparam.0 as *const FINDREPLACEW == ours {
+            app.on_find_message();
+        }
         return LRESULT(0);
     }
 
