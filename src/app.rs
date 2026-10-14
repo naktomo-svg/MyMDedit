@@ -85,6 +85,8 @@ const ID_STRIKE: u16 = 174;
 const ID_CODE_BLOCK: u16 = 175;
 const ID_ERROR_CLOSE: u16 = 180;
 const ID_RECENT_BASE: u16 = 200;
+/// One command id per recent-folder slot, derived from the cap so the two can't drift.
+const ID_RECENT_END: u16 = ID_RECENT_BASE + settings::limits::RECENT_FOLDER_COUNT as u16;
 const ID_EDITOR: usize = 300;
 
 const WM_APP_FOLDER_PROBED: u32 = WM_APP + 1;
@@ -124,27 +126,31 @@ pub fn accelerator_command(vk: u16, ctrl: bool, shift: bool) -> Option<u16> {
 struct ToolButton {
     id: u16,
     label: &'static str,
-    kind: ButtonKind,
+    font: ButtonFont,
+    /// Draws a chevron and opens a menu.
+    dropdown: bool,
     width: i32,
     tip: &'static str,
 }
 
 #[derive(Clone, Copy, PartialEq)]
-enum ButtonKind {
+enum ButtonFont {
     Icon,
     Bold,
-    Dropdown,
+    Normal,
 }
 
-const TOOL_BUTTONS: [ToolButton; 8] = [
-    ToolButton { id: ID_BOLD, label: "\u{E8DD}", kind: ButtonKind::Icon, width: 32, tip: "太字 (**太字**)" },
-    ToolButton { id: ID_ITALIC, label: "\u{E8DB}", kind: ButtonKind::Icon, width: 32, tip: "斜体 (*斜体*)" },
-    ToolButton { id: ID_HEADING, label: "H", kind: ButtonKind::Dropdown, width: 44, tip: "見出し" },
-    ToolButton { id: ID_BULLET, label: "\u{E8FD}", kind: ButtonKind::Icon, width: 32, tip: "箇条書きリスト (- 項目)" },
-    ToolButton { id: ID_NUMBERED, label: "1.", kind: ButtonKind::Bold, width: 32, tip: "番号付きリスト (1. 項目)" },
-    ToolButton { id: ID_LINK, label: "\u{E71B}", kind: ButtonKind::Icon, width: 32, tip: "リンク ([テキスト](URL))" },
-    ToolButton { id: ID_CODE, label: "\u{E943}", kind: ButtonKind::Icon, width: 32, tip: "コード (`code`)" },
-    ToolButton { id: ID_MORE, label: "その他", kind: ButtonKind::Dropdown, width: 72, tip: "その他の記法" },
+const TOOL_BUTTON_COUNT: usize = 8;
+
+const TOOL_BUTTONS: [ToolButton; TOOL_BUTTON_COUNT] = [
+    ToolButton { id: ID_BOLD, label: "\u{E8DD}", font: ButtonFont::Icon, dropdown: false, width: 32, tip: "太字 (**太字**)" },
+    ToolButton { id: ID_ITALIC, label: "\u{E8DB}", font: ButtonFont::Icon, dropdown: false, width: 32, tip: "斜体 (*斜体*)" },
+    ToolButton { id: ID_HEADING, label: "H", font: ButtonFont::Bold, dropdown: true, width: 44, tip: "見出し" },
+    ToolButton { id: ID_BULLET, label: "\u{E8FD}", font: ButtonFont::Icon, dropdown: false, width: 32, tip: "箇条書きリスト (- 項目)" },
+    ToolButton { id: ID_NUMBERED, label: "1.", font: ButtonFont::Bold, dropdown: false, width: 32, tip: "番号付きリスト (1. 項目)" },
+    ToolButton { id: ID_LINK, label: "\u{E71B}", font: ButtonFont::Icon, dropdown: false, width: 32, tip: "リンク ([テキスト](URL))" },
+    ToolButton { id: ID_CODE, label: "\u{E943}", font: ButtonFont::Icon, dropdown: false, width: 32, tip: "コード (`code`)" },
+    ToolButton { id: ID_MORE, label: "その他", font: ButtonFont::Normal, dropdown: true, width: 72, tip: "その他の記法" },
 ];
 
 #[derive(Clone, Copy, Default)]
@@ -162,7 +168,7 @@ pub struct Ui {
     editor: HWND,
     tooltip: HWND,
     error_close: HWND,
-    buttons: [HWND; 8],
+    buttons: [HWND; TOOL_BUTTON_COUNT],
     file_menu: HMENU,
     accel: HACCEL,
     find_dialog: HWND,
@@ -391,7 +397,8 @@ impl App {
                 style: CS_HREDRAW | CS_VREDRAW,
                 lpfnWndProc: Some(main_proc),
                 hInstance: instance.into(),
-                hIcon: LoadIconW(Some(instance.into()), PCWSTR(1 as *const u16)).unwrap_or_default(),
+                // MAKEINTRESOURCE(1): an integer resource id smuggled in a pointer, not an address.
+                hIcon: LoadIconW(Some(instance.into()), PCWSTR(std::ptr::without_provenance(1))).unwrap_or_default(),
                 hCursor: LoadCursorW(None, IDC_ARROW)?,
                 lpszClassName: class,
                 ..Default::default()
@@ -424,7 +431,7 @@ impl App {
             let editor = Editor::create(hwnd, ID_EDITOR)?;
             let _ = SetWindowSubclass(editor.hwnd(), Some(editor_proc), 1, 0);
 
-            let mut buttons = [HWND::default(); 8];
+            let mut buttons = [HWND::default(); TOOL_BUTTON_COUNT];
             for (slot, b) in buttons.iter_mut().zip(TOOL_BUTTONS.iter()) {
                 *slot = self.create_owner_draw_button(hwnd, b.id)?;
                 // The window text is never drawn (owner-draw) but is the button's
@@ -788,41 +795,33 @@ impl App {
         } else {
             base
         };
-        fill(dis.hDC, &dis.rcItem, base);
         let s = |v: i32| scale(v, ui.dpi);
-        let inner = RECT { left: dis.rcItem.left, top: dis.rcItem.top, right: dis.rcItem.right, bottom: dis.rcItem.bottom };
-        fill(dis.hDC, &inner, bg);
+        fill(dis.hDC, &dis.rcItem, bg);
 
-        let (label, kind) = if is_error_close {
-            ("\u{E711}", ButtonKind::Icon)
+        let (label, font, dropdown) = if is_error_close {
+            ("\u{E711}", ButtonFont::Icon, false)
         } else {
             match TOOL_BUTTONS.iter().find(|b| b.id as u32 == dis.CtlID) {
-                Some(b) => (b.label, b.kind),
+                Some(b) => (b.label, b.font, b.dropdown),
                 None => return,
             }
         };
         unsafe {
             SetBkMode(dis.hDC, TRANSPARENT);
             SetTextColor(dis.hDC, palette.text);
-            let font = match kind {
-                ButtonKind::Icon => ui.fonts.icon,
-                ButtonKind::Bold => ui.fonts.bold,
-                ButtonKind::Dropdown => {
-                    if label == "H" {
-                        ui.fonts.bold
-                    } else {
-                        ui.fonts.ui
-                    }
-                }
+            let font = match font {
+                ButtonFont::Icon => ui.fonts.icon,
+                ButtonFont::Bold => ui.fonts.bold,
+                ButtonFont::Normal => ui.fonts.ui,
             };
             let old = SelectObject(dis.hDC, HGDIOBJ(font.0));
             let mut rc = dis.rcItem;
-            if kind == ButtonKind::Dropdown {
+            if dropdown {
                 rc.right -= s(12);
             }
             let mut buf: Vec<u16> = label.encode_utf16().collect();
             DrawTextW(dis.hDC, &mut buf, &mut rc, DT_SINGLELINE | DT_VCENTER | DT_CENTER | DT_NOPREFIX);
-            if kind == ButtonKind::Dropdown {
+            if dropdown {
                 SelectObject(dis.hDC, HGDIOBJ(ui.fonts.icon_small.0));
                 let mut chevron: Vec<u16> = "\u{E70D}".encode_utf16().collect();
                 let mut crc = RECT { left: dis.rcItem.right - s(16), right: dis.rcItem.right - s(2), ..dis.rcItem };
@@ -990,7 +989,7 @@ impl App {
             (st.settings.current().clone(), st.installed_fonts.clone(), st.palette)
         };
         let fonts = if fonts.is_empty() { vec!["Segoe UI".into(), "Consolas".into()] } else { fonts };
-        let edits = settings_dialog::show(
+        let edits = match settings_dialog::show(
             self.hwnd(),
             &current,
             &fonts,
@@ -1000,8 +999,15 @@ impl App {
                     app.update_custom_colors(colors);
                 }
             }),
-        );
-        let Some(edits) = edits else { return };
+        ) {
+            Ok(Some(edits)) => edits,
+            Ok(None) => return,
+            Err(e) => {
+                // The user asked for this dialog; its absence needs explaining.
+                self.report_error("SettingsDialog", "設定ダイアログを表示できませんでした。", Some(&e));
+                return;
+            }
+        };
         // Applied onto the settings as of now, not as of when the dialog opened.
         self.persist_settings(|s| *s = edits.apply(s));
         self.apply_theme();
@@ -1542,11 +1548,9 @@ impl App {
         // Commands that open modal UI must not nest (e.g. a shortcut forwarded from the
         // WebView while a dialog is already up).
         let modal = matches!(id, ID_NEW | ID_OPEN | ID_SAVE | ID_SAVE_AS | ID_EXIT | ID_SETTINGS)
-            || (ID_RECENT_BASE..ID_RECENT_BASE + 10).contains(&id);
-        if modal {
-            if self.busy.replace(true) {
-                return;
-            }
+            || (ID_RECENT_BASE..ID_RECENT_END).contains(&id);
+        if modal && self.busy.replace(true) {
+            return;
         }
         let editor = self.editor();
         match id {
@@ -1585,7 +1589,7 @@ impl App {
             ID_TABLE => self.apply_op(|t, s, l| md_ops::insert_block(t, s, l, "| 見出し1 | 見出し2 |\r| --- | --- |\r| セル1 | セル2 |", true)),
             ID_STRIKE => self.apply_op(|t, s, l| md_ops::wrap_selection(t, s, l, "~~", "~~", "取り消し線")),
             ID_CODE_BLOCK => self.apply_op(md_ops::code_block),
-            id if (ID_RECENT_BASE..ID_RECENT_BASE + 10).contains(&id) => self.open_from_recent((id - ID_RECENT_BASE) as usize),
+            id if (ID_RECENT_BASE..ID_RECENT_END).contains(&id) => self.open_from_recent((id - ID_RECENT_BASE) as usize),
             _ => {}
         }
         if matches!(id, ID_UNDO | ID_REDO | ID_CUT | ID_COPY | ID_PASTE | ID_SELECT_ALL | ID_ERROR_CLOSE) {

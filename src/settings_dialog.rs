@@ -68,6 +68,25 @@ impl DialogEdits {
     }
 }
 
+impl Drop for DlgState {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = DeleteObject(HGDIOBJ(self.bg_brush.0));
+            let _ = DeleteObject(HGDIOBJ(self.field_brush.0));
+        }
+    }
+}
+
+/// Deletes the dialog's fonts on every exit path, including the early `?` returns.
+struct Fonts(HFONT, HFONT);
+
+impl Drop for Fonts {
+    fn drop(&mut self) {
+        crate::win::delete_font(self.0);
+        crate::win::delete_font(self.1);
+    }
+}
+
 struct DlgState {
     palette: Palette,
     done: Cell<bool>,
@@ -101,7 +120,7 @@ pub fn show(
     fonts: &[String],
     palette: Palette,
     on_custom_colors: Box<dyn Fn(Vec<String>)>,
-) -> Option<DialogEdits> {
+) -> windows::core::Result<Option<DialogEdits>> {
     let mut custom = [COLORREF(0x00FF_FFFF); 16];
     for (slot, hex) in custom.iter_mut().zip(&current.custom_colors) {
         if let Some(c) = parse_hex_color(hex) {
@@ -125,9 +144,10 @@ pub fn show(
     let s = |v: i32| scale(v, dpi);
     let ui_font = message_font(dpi, false);
     let bold_font = message_font(dpi, true);
+    let _fonts = Fonts(ui_font, bold_font);
 
     let hwnd = unsafe {
-        let instance = GetModuleHandleW(None).ok()?;
+        let instance = GetModuleHandleW(None)?;
         let wc = WNDCLASSW {
             lpfnWndProc: Some(wndproc),
             hInstance: instance.into(),
@@ -149,7 +169,7 @@ pub fn show(
         let x = owner_rect.left + ((owner_rect.right - owner_rect.left) - w) / 2;
         let y = owner_rect.top + ((owner_rect.bottom - owner_rect.top) - h) / 2;
 
-        CreateWindowExW(ex, w!("MyMDeditSettingsDialog"), w!("設定"), style, x, y, w, h, Some(owner), None, Some(instance.into()), None).ok()?
+        CreateWindowExW(ex, w!("MyMDeditSettingsDialog"), w!("設定"), style, x, y, w, h, Some(owner), None, Some(instance.into()), None)?
     };
     unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, &*state as *const DlgState as isize) };
     crate::theme::set_title_bar_dark(hwnd, palette.dark);
@@ -233,7 +253,7 @@ pub fn show(
         let updown = make(
             w!("msctls_updown32"),
             "",
-            (UDS_SETBUDDYINT | UDS_ALIGNRIGHT | UDS_ARROWKEYS | UDS_NOTHOUSANDS) as u32,
+            UDS_SETBUDDYINT | UDS_ALIGNRIGHT | UDS_ARROWKEYS | UDS_NOTHOUSANDS,
             0,
             size_id + 1,
             0,
@@ -345,12 +365,8 @@ pub fn show(
         let _ = EnableWindow(owner, true);
         let _ = SetActiveWindow(owner);
         let _ = DestroyWindow(hwnd);
-        let _ = DeleteObject(HGDIOBJ(state.bg_brush.0));
-        let _ = DeleteObject(HGDIOBJ(state.field_brush.0));
     }
-    crate::win::delete_font(ui_font);
-    crate::win::delete_font(bold_font);
-    state.result.borrow_mut().take()
+    Ok(state.result.borrow_mut().take())
 }
 
 fn collect(dlg: HWND, state: &DlgState) -> DialogEdits {
