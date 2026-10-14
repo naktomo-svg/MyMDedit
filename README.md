@@ -36,6 +36,17 @@ cargo test                               # 単体テスト
 
 `.md`ファイルをダブルクリックで開きたいときは、エクスプローラーで`.md`ファイルを右クリックし、「プログラムから開く」→「別のプログラムを選択」で`MyMDedit.exe`を選んでください（MSIXを使わないため、アプリ側では関連付けを登録しません）。
 
+## 技術負債の検査
+
+AIレビュー（`claude`コマンド）とclippyを組み合わせて技術負債レポートを作ります。`docs/tech-debt/<日付>.md`と`latest.md`に出力されます。
+
+```powershell
+pwsh ./scripts/Analyze-TechDebt.ps1 -DryRun   # 対象ファイルの分け方とclippyの件数だけ確認（API呼び出しなし）
+pwsh ./scripts/Analyze-TechDebt.ps1           # 実行（Opusを使うためAPI費用がかかります。中断しても再実行で続きから再開）
+```
+
+レポートの指摘に対応するときの手順は`.claude/skills/`（verify-then-fix → why5-and-horizontal-check）と`CLAUDE.md`にまとめてあります。
+
 ## 保存場所
 
 - 設定: `%APPDATA%\MyMDedit\settings.json`
@@ -76,4 +87,6 @@ src/
 ├── win.rs              Win32の小さなヘルパー
 └── log.rs              エラーの記録先（OutputDebugString）
 res/                    アイコンとアプリケーションマニフェスト
+scripts/                技術負債レポートの生成スクリプト
+.claude/skills/         技術負債への対応手順（Claude Code用スキル）
 ```

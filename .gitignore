@@ -1,1 +1,6 @@
 /target
+
+# tech-debt analyzer resume cache (deleted automatically on a fully successful run)
+docs/tech-debt/.partial/
+# tech-debt analyzer partial report (written when a run had failures; superseded by a successful run)
+docs/tech-debt/*-partial.md
