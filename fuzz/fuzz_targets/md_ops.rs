@@ -8,8 +8,9 @@ fn check(text: &[u16], e: &Edit) {
     assert!(e.sel_start + e.sel_len <= new_len, "selection past the end");
 }
 
-// Every toolbar action and list continuation, at any in-range selection: no panic, and
-// the edit and the selection after it stay inside the text.
+// Every toolbar action, list continuation and indentation, at any in-range selection: no
+// panic, and the edit and the selection after it stay inside the text. Heading and line
+// lookups only ever point at line starts inside the text.
 fuzz_target!(|data: &[u8]| {
     let Some((head, rest)) = data.split_first_chunk::<5>() else { return };
     let text: Vec<u16> = String::from_utf8_lossy(rest).encode_utf16().collect();
@@ -17,7 +18,30 @@ fuzz_target!(|data: &[u8]| {
     let start = usize::from(u16::from_le_bytes([head[0], head[1]])) % (n + 1);
     let len = usize::from(u16::from_le_bytes([head[2], head[3]])) % (n - start + 1);
     let op = head[4];
-    let e = match op % 8 {
+    let is_line_start = |i: usize| i <= n && md_ops::find_line_start(&text, i) == i;
+    let e = match op % 13 {
+        8 | 9 => match md_ops::indent_lines(&text, start, len, op % 13 == 9) {
+            Some(e) => e,
+            None => return,
+        },
+        10 => md_ops::toggle_task(&text, start, len),
+        11 => {
+            for h in md_ops::headings(&text) {
+                assert!(is_line_start(h.line_start) && (1..=6).contains(&h.level), "heading at {}", h.line_start);
+            }
+            return;
+        }
+        12 => {
+            let line = md_ops::line_index_at(&text, start);
+            let line_start = md_ops::line_start_of(&text, line);
+            assert!(is_line_start(line_start), "line {line} starts at {line_start}");
+            // The editor's text never holds \n (RichEdit stores lone \r); inside a \r\n pair
+            // find_line_start sees the \n as a line of its own, which no count agrees with.
+            if !text.contains(&(b'\n' as u16)) {
+                assert_eq!(line_start, md_ops::find_line_start(&text, start), "line {line} of position {start}");
+            }
+            return;
+        }
         0 => md_ops::wrap_selection(&text, start, len, "**", "**", "太字"),
         1 => md_ops::insert_link(&text, start, len, "[", "テキスト", "https://"),
         2 => md_ops::prefix_lines(&text, start, len, false, |i| format!("{}. ", i + 1)),

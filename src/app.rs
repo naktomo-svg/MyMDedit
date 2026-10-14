@@ -25,15 +25,17 @@ use windows::Win32::UI::Controls::Dialogs::{
 };
 use windows::Win32::UI::Controls::{DRAWITEMSTRUCT, ODS_SELECTED, TOOLTIPS_CLASSW, TTF_IDISHWND, TTF_SUBCLASS, TTM_ADDTOOLW, TTM_SETMAXTIPWIDTH, TTTOOLINFOW};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    SetFocus, TME_LEAVE, TRACKMOUSEEVENT, GetKeyState, TrackMouseEvent, VK_ADD, VK_CONTROL, VK_MENU, VK_RETURN, VK_NUMPAD0, VK_OEM_MINUS, VK_OEM_PLUS, VK_SUBTRACT,
+    SetFocus, TME_LEAVE, TRACKMOUSEEVENT, GetKeyState, TrackMouseEvent, VK_ADD, VK_CONTROL, VK_MENU, VK_RETURN, VK_NUMPAD0, VK_OEM_MINUS, VK_OEM_PLUS, VK_SHIFT, VK_SUBTRACT,
+    VK_TAB,
 };
 use windows::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{PCWSTR, PWSTR, w};
 
 use crate::dialogs::{self, DiscardChoice};
-use crate::document::{self, DocumentFormat, OpenedDocument, ReadError};
+use crate::document::{self, DiskChange, DocumentFormat, FileStamp, OpenedDocument, ReadError};
 use crate::editor::Editor;
+use crate::goto_dialog;
 use crate::line_endings;
 use crate::log;
 use crate::md_ops::{self, Edit};
@@ -62,6 +64,8 @@ const ID_PASTE: u16 = 114;
 const ID_SELECT_ALL: u16 = 115;
 const ID_FIND: u16 = 120;
 const ID_REPLACE: u16 = 121;
+const ID_GOTO_LINE: u16 = 122;
+const ID_OUTLINE: u16 = 123;
 const ID_SETTINGS: u16 = 130;
 const ID_ZOOM_IN: u16 = 140;
 const ID_ZOOM_OUT: u16 = 141;
@@ -83,6 +87,7 @@ const ID_IMAGE: u16 = 172;
 const ID_TABLE: u16 = 173;
 const ID_STRIKE: u16 = 174;
 const ID_CODE_BLOCK: u16 = 175;
+const ID_TASK: u16 = 176;
 const ID_ERROR_CLOSE: u16 = 180;
 const ID_RECENT_BASE: u16 = 200;
 /// One command id per recent-folder slot, derived from the cap so the two can't drift.
@@ -91,6 +96,8 @@ const ID_EDITOR: usize = 300;
 
 const WM_APP_FOLDER_PROBED: u32 = WM_APP + 1;
 const WM_APP_RENDER: u32 = WM_APP + 2;
+// WM_APP + 3 is preview::WM_APP_PREVIEW_FAILED.
+const WM_APP_CHECK_DISK: u32 = WM_APP + 4;
 const TIMER_SCROLL_SYNC: usize = 1;
 /// Position of the separator above 終了 in the File menu; recent folders go before it.
 const EXIT_SEPARATOR_POS: u32 = 5;
@@ -108,6 +115,9 @@ const ACCELERATORS: &[(u16, bool, bool, u16)] = &[
     (b'S' as u16, true, true, ID_SAVE_AS),
     (b'F' as u16, true, false, ID_FIND),
     (b'H' as u16, true, false, ID_REPLACE),
+    (b'G' as u16, true, false, ID_GOTO_LINE),
+    (b'O' as u16, true, true, ID_OUTLINE),
+    (VK_RETURN.0, true, false, ID_TASK),
     (VK_ADD.0, true, false, ID_ZOOM_IN),
     // Main-row "+": on some layouts (Japanese included) it needs Shift, and accelerator
     // modifier matching is exact, so register both.
@@ -206,6 +216,15 @@ pub struct State {
     find_is_replace: bool,
     /// The folder a recent-folder click is waiting on the background probe for.
     probing_folder: Option<String>,
+    /// The open file as last read, saved or acknowledged, to notice another program
+    /// changing it. `None` for an untitled document.
+    disk_stamp: Option<FileStamp>,
+    /// The file's disappearance has been reported; don't repeat it on every activation.
+    missing_reported: bool,
+    /// The on-disk version the user just declined to overwrite. Closing that prompt
+    /// reactivates the window; asking 読み込み直しますか about the very same change right
+    /// after would be a second prompt for one decision.
+    declined_overwrite: Option<FileStamp>,
 }
 
 /// Find/replace dialog data. Leaked once: the modeless common dialog keeps pointers
@@ -223,8 +242,11 @@ pub struct App {
     /// Set while the app itself replaces the text, so the change is not "dirty".
     suppress_dirty: Cell<bool>,
     close_confirmed: Cell<bool>,
-    /// Set when Enter was consumed on key-down, to drop the character that follows.
-    swallow_enter_char: Cell<bool>,
+    /// The character (`\r` or `\t`) whose key was consumed on key-down, to drop the
+    /// WM_CHAR that follows; 0 for none.
+    swallow_char: Cell<u16>,
+    /// A disk check is queued (see `WM_ACTIVATE`).
+    disk_check_pending: Cell<bool>,
     /// Re-entrancy guard for commands that show a modal dialog.
     busy: Cell<bool>,
     hovered: Cell<HWND>,
@@ -286,11 +308,15 @@ pub fn run(launch_file: Option<PathBuf>) -> windows::core::Result<()> {
             recent_items: 0,
             find_is_replace: false,
             probing_folder: None,
+            disk_stamp: None,
+            missing_reported: false,
+            declined_overwrite: None,
         }),
         preview: RefCell::new(Preview::default()),
         suppress_dirty: Cell::new(false),
         close_confirmed: Cell::new(false),
-        swallow_enter_char: Cell::new(false),
+        swallow_char: Cell::new(0),
+        disk_check_pending: Cell::new(false),
         busy: Cell::new(false),
         hovered: Cell::new(HWND::default()),
         wheel_accum: Cell::new(0),
@@ -567,11 +593,16 @@ impl App {
             add(edit, ID_PASTE, "貼り付け\tCtrl+V");
             sep(edit);
             add(edit, ID_SELECT_ALL, "すべて選択\tCtrl+A");
+            sep(edit);
+            add(edit, ID_TASK, "タスクの切り替え\tCtrl+Enter");
             popup("編集", edit);
 
             let find = CreatePopupMenu()?;
             add(find, ID_FIND, "検索...\tCtrl+F");
             add(find, ID_REPLACE, "置換...\tCtrl+H");
+            sep(find);
+            add(find, ID_OUTLINE, "見出しへ移動...\tCtrl+Shift+O");
+            add(find, ID_GOTO_LINE, "行へ移動...\tCtrl+G");
             popup("検索", find);
 
             let settings = CreatePopupMenu()?;
@@ -1198,6 +1229,7 @@ impl App {
             st.file_path = None;
             st.format = DocumentFormat::default();
             st.file_name = UNTITLED.into();
+            st.disk_stamp = None;
         }
         self.load_content(SAMPLE_CONTENT);
     }
@@ -1238,27 +1270,44 @@ impl App {
             st.file_name = doc.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| UNTITLED.into());
             st.file_path = Some(doc.path.clone());
             st.format = doc.format;
+            st.disk_stamp = doc.stamp;
+            st.missing_reported = false;
+            st.declined_overwrite = None;
         }
         self.load_content(&doc.content);
         self.record_recent_folder(&doc.path);
     }
 
     fn save(&self) {
-        let (path, format) = {
+        let (path, format, recorded, name) = {
             let st = self.state.borrow();
-            (st.file_path.clone(), st.format)
+            (st.file_path.clone(), st.format, st.disk_stamp, st.file_name.clone())
         };
         let Some(path) = path else {
             self.save_as();
             return;
         };
+        if let Some(recorded) = recorded
+            && let DiskChange::Modified(now) = document::check_disk(&path, recorded)
+        {
+            // An undisplayable prompt saves anyway: refusing would leave the document
+            // with no way to be saved to its own file.
+            let overwrite = dialogs::confirm_overwrite(self.hwnd(), &name).unwrap_or_else(|e| {
+                log::error("confirm_overwrite", &e);
+                true
+            });
+            if !overwrite {
+                self.state.borrow_mut().declined_overwrite = Some(now);
+                return; // Still dirty, so a discard gate reads this as "not safe".
+            }
+        }
         let (text, replaced) = document::text_from_editor(&self.editor().text());
         if let Err(e) = document::save_atomic(&path, &text, &format) {
             // The dirty flag stays: a failed save can never pass for a successful one.
             self.report_error("Save", &format!("保存できませんでした: {} ({e})", path.display()), Some(&e));
             return;
         }
-        self.state.borrow_mut().dirty = false;
+        self.record_saved(&path);
         self.warn_if_replaced(replaced);
         self.update_title();
         self.record_recent_folder(&path);
@@ -1287,8 +1336,8 @@ impl App {
             let mut st = self.state.borrow_mut();
             st.file_name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
             st.file_path = Some(path.clone());
-            st.dirty = false;
         }
+        self.record_saved(&path);
         self.warn_if_replaced(replaced);
         self.update_title();
         self.record_recent_folder(&path);
@@ -1304,6 +1353,59 @@ impl App {
                 None,
             );
         }
+    }
+
+    /// After a successful write to `path`: clean, and what is on disk is now ours.
+    fn record_saved(&self, path: &Path) {
+        let stamp = document::stamp(path).inspect_err(|e| log::error("record_saved stamp", e)).ok();
+        let mut st = self.state.borrow_mut();
+        st.dirty = false;
+        st.disk_stamp = stamp;
+        st.missing_reported = false;
+        st.declined_overwrite = None;
+    }
+
+    /// The window was activated: has another program changed or removed the open file?
+    /// Runs from a posted message, never inside WM_ACTIVATE, as it may show a dialog.
+    fn check_external_change(&self) {
+        // Our own modal is up (its closing reactivates the window and checks again).
+        if self.busy.replace(true) {
+            return;
+        }
+        let (path, recorded, name, dirty, missing_reported, declined) = {
+            let st = self.state.borrow();
+            (st.file_path.clone(), st.disk_stamp, st.file_name.clone(), st.dirty, st.missing_reported, st.declined_overwrite)
+        };
+        if let (Some(path), Some(recorded)) = (path, recorded) {
+            match document::check_disk(&path, recorded) {
+                DiskChange::Unchanged => {}
+                DiskChange::Missing if !missing_reported => {
+                    self.state.borrow_mut().missing_reported = true;
+                    self.report_error(
+                        "check_external_change",
+                        &format!("開いているファイルが見つかりません（別のアプリで削除または移動されました）: {}  保存すると作り直します。", path.display()),
+                        None,
+                    );
+                }
+                DiskChange::Missing => {}
+                DiskChange::Modified(now) if declined == Some(now) => {}
+                DiskChange::Modified(now) => {
+                    // Acknowledged either way: a reload that fails (say, the file is no
+                    // longer UTF-8) must not ask again on every activation.
+                    self.state.borrow_mut().disk_stamp = Some(now);
+                    // An undisplayable prompt keeps the editor's text: nothing is lost.
+                    let reload = dialogs::confirm_reload(self.hwnd(), &name, dirty).unwrap_or_else(|e| {
+                        log::error("confirm_reload", &e);
+                        false
+                    });
+                    if reload {
+                        self.read_and_apply(&path, "Reload", &format!("ファイルを読み込み直せませんでした: {}", path.display()));
+                    }
+                }
+            }
+        }
+        self.busy.set(false);
+        self.deliver_pending_probe();
     }
 
     fn exit(&self) {
@@ -1398,6 +1500,66 @@ impl App {
         }
     }
 
+    /// Tab / Shift+Tab in the editor: list indentation. Returns true when it consumed the
+    /// key; outside a list the key keeps inserting a tab.
+    fn on_editor_tab(&self, outdent: bool) -> bool {
+        let editor = self.editor();
+        let (start, len) = editor.selection();
+        let text = editor.text();
+        let Some(edit) = md_ops::indent_lines(&text, start, len, outdent) else { return false };
+        // Shift+Tab on an unindented item changes nothing: no empty undo step for it.
+        if edit.text[..] != text[edit.start..edit.end] {
+            editor.apply(&edit);
+        }
+        editor.scroll_caret();
+        true
+    }
+
+    /// 見出しへ移動: the document's headings as a popup menu at the editor's top-left.
+    fn show_outline(&self) {
+        let editor = self.editor();
+        let text = editor.text();
+        let headings = md_ops::headings(&text);
+        let cmd = unsafe {
+            let Ok(menu) = CreatePopupMenu() else { return };
+            if headings.is_empty() {
+                let t = wide("見出しがありません");
+                let _ = AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, pcwstr(&t));
+            }
+            for (i, h) in headings.iter().enumerate() {
+                let title = if h.title.is_empty() { "(空の見出し)" } else { &h.title };
+                // `&` would become a mnemonic and a tab would start the shortcut column.
+                let title = title.replace('&', "&&").replace('\t', " ");
+                let t = wide(&format!("{}{title}", "\u{3000}".repeat(h.level - 1)));
+                let _ = AppendMenuW(menu, MF_STRING, i + 1, pcwstr(&t));
+            }
+            let mut origin = POINT::default();
+            let _ = windows::Win32::Graphics::Gdi::ClientToScreen(editor.hwnd(), &mut origin);
+            let cmd = TrackPopupMenu(menu, TPM_LEFTALIGN | TPM_TOPALIGN | TPM_RETURNCMD | TPM_NONOTIFY, origin.x, origin.y, None, self.hwnd(), None);
+            let _ = DestroyMenu(menu);
+            cmd.0 as usize
+        };
+        if let Some(h) = cmd.checked_sub(1).and_then(|i| headings.get(i)) {
+            self.select_and_reveal(h.line_start, 0);
+        }
+        editor.focus();
+    }
+
+    /// 行へ移動: asks for a line number and puts the caret at that line's start.
+    fn goto_line(&self) {
+        let editor = self.editor();
+        let text = editor.text();
+        let (start, _) = editor.selection();
+        let current = md_ops::line_index_at(&text, start) + 1;
+        let palette = self.state.borrow().palette;
+        match goto_dialog::show(self.hwnd(), current, line_endings::count_lines(&text), palette) {
+            Ok(Some(line)) => self.select_and_reveal(md_ops::line_start_of(&text, line - 1), 0),
+            Ok(None) => {}
+            Err(e) => self.report_error("GotoLine", &format!("行へ移動のダイアログを開けませんでした。 ({})", e.message()), Some(&e)),
+        }
+        editor.focus();
+    }
+
     fn show_dropdown(&self, button_id: u16) {
         let ui = self.ui.get();
         let Some(index) = TOOL_BUTTONS.iter().position(|b| b.id == button_id) else { return };
@@ -1412,6 +1574,7 @@ impl App {
                 (ID_TABLE, "テーブル"),
                 (ID_STRIKE, "取り消し線\t~~取り消し線~~"),
                 (ID_CODE_BLOCK, "コードブロック\t```"),
+                (ID_TASK, "タスクリスト\t- [ ] タスク"),
             ]
         };
         unsafe {
@@ -1564,7 +1727,7 @@ impl App {
     fn command(&self, id: u16) {
         // Commands that open modal UI must not nest (e.g. a shortcut forwarded from the
         // WebView while a dialog is already up).
-        let modal = matches!(id, ID_NEW | ID_OPEN | ID_SAVE | ID_SAVE_AS | ID_EXIT | ID_SETTINGS)
+        let modal = matches!(id, ID_NEW | ID_OPEN | ID_SAVE | ID_SAVE_AS | ID_EXIT | ID_SETTINGS | ID_GOTO_LINE | ID_OUTLINE)
             || (ID_RECENT_BASE..ID_RECENT_END).contains(&id);
         if modal && self.busy.replace(true) {
             return;
@@ -1606,6 +1769,9 @@ impl App {
             ID_TABLE => self.apply_op(|t, s, l| md_ops::insert_block(t, s, l, "| 見出し1 | 見出し2 |\r| --- | --- |\r| セル1 | セル2 |", true)),
             ID_STRIKE => self.apply_op(|t, s, l| md_ops::wrap_selection(t, s, l, "~~", "~~", "取り消し線")),
             ID_CODE_BLOCK => self.apply_op(md_ops::code_block),
+            ID_TASK => self.apply_op(md_ops::toggle_task),
+            ID_GOTO_LINE => self.goto_line(),
+            ID_OUTLINE => self.show_outline(),
             id if (ID_RECENT_BASE..ID_RECENT_END).contains(&id) => self.open_from_recent((id - ID_RECENT_BASE) as usize),
             _ => {}
         }
@@ -1707,6 +1873,25 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
             app.editor().focus();
             LRESULT(0)
         }
+        WM_ACTIVATE => {
+            // Coming back from another program is when its changes to the file show up.
+            // Posted, not handled here: the check may show a dialog, and activation is
+            // the middle of a focus change.
+            if loword(wparam.0) as u32 != WA_INACTIVE && !app.disk_check_pending.replace(true) {
+                unsafe {
+                    if let Err(e) = PostMessageW(Some(hwnd), WM_APP_CHECK_DISK, WPARAM(0), LPARAM(0)) {
+                        log::error("WM_ACTIVATE PostMessage", &e);
+                        app.disk_check_pending.set(false);
+                    }
+                }
+            }
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+        }
+        WM_APP_CHECK_DISK => {
+            app.disk_check_pending.set(false);
+            app.check_external_change();
+            LRESULT(0)
+        }
         WM_TIMER if wparam.0 == TIMER_SCROLL_SYNC => {
             app.poll_scroll();
             LRESULT(0)
@@ -1806,16 +1991,29 @@ unsafe extern "system" fn editor_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
             // as VK_PROCESSKEY, never VK_RETURN, so it is left alone.
             WM_KEYDOWN => {
                 // The flag only ever covers the character of the key-down that set it.
-                app.swallow_enter_char.set(false);
-                // Ctrl/Alt+Enter are not plain line breaks; leave them to RichEdit.
+                app.swallow_char.set(0);
+                // Modified Enter / Tab are not plain line breaks or tabs; leave them to
+                // RichEdit. (Ctrl+Enter never gets here: it is the タスク accelerator.)
                 let modified = unsafe { GetKeyState(VK_CONTROL.0 as i32) < 0 || GetKeyState(VK_MENU.0 as i32) < 0 };
-                if wparam.0 == VK_RETURN.0 as usize && !modified && app.on_editor_enter() {
-                    // TranslateMessage has already queued the matching '\r' character.
-                    app.swallow_enter_char.set(true);
+                let consumed = match wparam.0 {
+                    _ if modified => None,
+                    k if k == VK_RETURN.0 as usize => app.on_editor_enter().then_some(0x0D),
+                    k if k == VK_TAB.0 as usize => {
+                        let shift = unsafe { GetKeyState(VK_SHIFT.0 as i32) < 0 };
+                        app.on_editor_tab(shift).then_some(0x09)
+                    }
+                    _ => None,
+                };
+                if let Some(ch) = consumed {
+                    // TranslateMessage has already queued the matching character.
+                    app.swallow_char.set(ch);
                     return LRESULT(0);
                 }
             }
-            WM_CHAR if wparam.0 == 0x0D && app.swallow_enter_char.replace(false) => return LRESULT(0),
+            WM_CHAR if wparam.0 != 0 && wparam.0 == app.swallow_char.get() as usize => {
+                app.swallow_char.set(0);
+                return LRESULT(0);
+            }
             _ => {}
         }
     }

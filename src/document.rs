@@ -206,6 +206,8 @@ pub struct OpenedDocument {
     pub path: PathBuf,
     pub content: String,
     pub format: DocumentFormat,
+    /// How the file looked just before it was read; `None` if that could not be told.
+    pub stamp: Option<FileStamp>,
 }
 
 /// The largest document `read` accepts. Far past anything the editor handles well (and
@@ -239,14 +241,52 @@ pub fn read_at_most(path: &Path, max: u64) -> io::Result<Vec<u8>> {
     Ok(bytes)
 }
 
+/// What a file looked like on disk at one moment, to notice another program changing it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FileStamp {
+    modified: std::time::SystemTime,
+    len: u64,
+}
+
+pub fn stamp(path: &Path) -> io::Result<FileStamp> {
+    let meta = fs::metadata(path)?;
+    Ok(FileStamp { modified: meta.modified()?, len: meta.len() })
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum DiskChange {
+    Unchanged,
+    /// Differs from the recorded stamp; holds the new one.
+    Modified(FileStamp),
+    Missing,
+}
+
+/// Compares the file with `recorded`. A file that cannot be inspected for any reason but
+/// being gone (a dropped network drive, a sharing violation) counts as unchanged: there
+/// is nothing the user could do about it, and asking again on every activation would nag.
+pub fn check_disk(path: &Path, recorded: FileStamp) -> DiskChange {
+    match stamp(path) {
+        Ok(now) if now == recorded => DiskChange::Unchanged,
+        Ok(now) => DiskChange::Modified(now),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => DiskChange::Missing,
+        Err(e) => {
+            log::error(&format!("check_disk({})", path.display()), &e);
+            DiskChange::Unchanged
+        }
+    }
+}
+
 pub fn read(path: &Path) -> Result<OpenedDocument, ReadError> {
+    // Taken before reading: a change that lands mid-read then still shows up later as a
+    // difference, rather than being folded into the stamp unseen.
+    let stamp = stamp(path).ok();
     let bytes = read_at_most(path, MAX_DOCUMENT_BYTES).map_err(ReadError::Io)?;
     let (content, format) = decode(&bytes).inspect_err(|e| {
         if !matches!(e, ReadError::Io(_)) {
             log::error(&format!("read({})", path.display()), e);
         }
     })?;
-    Ok(OpenedDocument { path: path.to_path_buf(), content, format })
+    Ok(OpenedDocument { path: path.to_path_buf(), content, format, stamp })
 }
 
 /// Writes `content` to `path` in `format` without ever leaving `path` half-written.
@@ -438,6 +478,21 @@ mod tests {
         swap_into_place(&full, &temp, &backup, &ops).unwrap();
         assert_eq!(fs::read_to_string(&full).unwrap(), "new");
         assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn disk_check_sees_unchanged_modified_and_missing() {
+        let dir = temp_dir();
+        let path = dir.join("a.md");
+        fs::write(&path, "one").unwrap();
+        let recorded = stamp(&path).unwrap();
+        assert_eq!(check_disk(&path, recorded), DiskChange::Unchanged);
+        fs::write(&path, "three").unwrap();
+        let DiskChange::Modified(now) = check_disk(&path, recorded) else { panic!("not seen as modified") };
+        assert_eq!(check_disk(&path, now), DiskChange::Unchanged);
+        fs::remove_file(&path).unwrap();
+        assert_eq!(check_disk(&path, now), DiskChange::Missing);
         fs::remove_dir_all(&dir).unwrap();
     }
 

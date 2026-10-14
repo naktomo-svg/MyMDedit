@@ -15,7 +15,7 @@ use windows::Win32::UI::Shell::{
     FOLDERID_Documents, FileOpenDialog, FileSaveDialog, IFileOpenDialog, IFileSaveDialog, IShellItem, KF_FLAG_DEFAULT,
     SHCreateItemFromParsingName, SHGetKnownFolderItem, SIGDN_FILESYSPATH,
 };
-use windows::core::{HRESULT, HSTRING, w};
+use windows::core::{HRESULT, HSTRING, PCWSTR, w};
 
 fn is_cancelled(e: &windows::core::Error) -> bool {
     e.code() == HRESULT::from_win32(ERROR_CANCELLED.0)
@@ -116,6 +116,57 @@ pub fn confirm_discard(owner: HWND) -> windows::core::Result<DiscardChoice> {
         BTN_DISCARD => DiscardChoice::Discard,
         _ => DiscardChoice::Cancel,
     })
+}
+
+const BTN_YES: i32 = 102;
+const BTN_NO: i32 = 103;
+
+/// A two-way question: `yes`, or `no` (キャンセル when `None`). `Ok(true)` only for
+/// `yes`; Esc and the close box count as `no`.
+fn ask(owner: HWND, instruction: &str, content: &str, yes: &str, no: Option<&str>) -> windows::core::Result<bool> {
+    let (instruction, content, yes) = (HSTRING::from(instruction), HSTRING::from(content), HSTRING::from(yes));
+    let no = no.map(HSTRING::from);
+    let mut buttons = vec![TASKDIALOG_BUTTON { nButtonID: BTN_YES, pszButtonText: PCWSTR(yes.as_ptr()) }];
+    if let Some(no) = &no {
+        buttons.push(TASKDIALOG_BUTTON { nButtonID: BTN_NO, pszButtonText: PCWSTR(no.as_ptr()) });
+    }
+    let config = TASKDIALOGCONFIG {
+        cbSize: size_of::<TASKDIALOGCONFIG>() as u32,
+        hwndParent: owner,
+        dwFlags: TDF_ALLOW_DIALOG_CANCELLATION | TDF_POSITION_RELATIVE_TO_WINDOW,
+        dwCommonButtons: if no.is_some() { Default::default() } else { TDCBF_CANCEL_BUTTON },
+        pszWindowTitle: w!("MyMDedit"),
+        pszMainInstruction: PCWSTR(instruction.as_ptr()),
+        pszContent: PCWSTR(content.as_ptr()),
+        cButtons: buttons.len() as u32,
+        pButtons: buttons.as_ptr(),
+        nDefaultButton: BTN_YES,
+        ..Default::default()
+    };
+    let mut pressed = 0;
+    unsafe { TaskDialogIndirect(&config, Some(&mut pressed), None, None)? };
+    Ok(pressed == BTN_YES)
+}
+
+/// The open file was changed by another program: 「読み込み直す / このまま」.
+pub fn confirm_reload(owner: HWND, file_name: &str, dirty: bool) -> windows::core::Result<bool> {
+    let content = if dirty {
+        "読み込み直すと、まだ保存していない編集内容は失われます。"
+    } else {
+        "読み込み直すと、変更後の内容を表示します。"
+    };
+    ask(owner, &format!("{file_name} は別のアプリで変更されました。読み込み直しますか?"), content, "読み込み直す", Some("このまま"))
+}
+
+/// Saving would overwrite changes another program made: 「上書きする / キャンセル」.
+pub fn confirm_overwrite(owner: HWND, file_name: &str) -> windows::core::Result<bool> {
+    ask(
+        owner,
+        &format!("{file_name} は開いたあとに別のアプリで変更されています。上書きしますか?"),
+        "上書きすると、別のアプリで加えられた変更は失われます。",
+        "上書きする",
+        None,
+    )
 }
 
 pub fn parse_hex_color(hex: &str) -> Option<COLORREF> {

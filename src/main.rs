@@ -8,6 +8,7 @@ mod app;
 mod dialogs;
 mod document;
 mod editor;
+mod goto_dialog;
 mod line_endings;
 mod log;
 mod md_ops;
