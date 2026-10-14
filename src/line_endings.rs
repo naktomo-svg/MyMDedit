@@ -103,7 +103,10 @@ mod tests {
     #[test]
     fn normalizes_all_styles() {
         assert_eq!(normalize("a\rb\r\nc\nd", LineEnding::Lf), "a\nb\nc\nd");
-        assert_eq!(normalize("a\rb\r\nc\nd", LineEnding::Crlf), "a\r\nb\r\nc\r\nd");
+        assert_eq!(
+            normalize("a\rb\r\nc\nd", LineEnding::Crlf),
+            "a\r\nb\r\nc\r\nd"
+        );
         assert_eq!(normalize("a\r\n\r\nb", LineEnding::Cr), "a\r\rb");
     }
 

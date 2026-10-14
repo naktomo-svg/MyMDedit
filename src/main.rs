@@ -23,9 +23,12 @@ mod win;
 use std::path::PathBuf;
 
 use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx};
-use windows::Win32::System::LibraryLoader::{LOAD_LIBRARY_SEARCH_SYSTEM32, SetDefaultDllDirectories};
+use windows::Win32::System::LibraryLoader::{
+    LOAD_LIBRARY_SEARCH_SYSTEM32, SetDefaultDllDirectories,
+};
 use windows::Win32::UI::Controls::{
-    ICC_BAR_CLASSES, ICC_STANDARD_CLASSES, ICC_TAB_CLASSES, ICC_UPDOWN_CLASS, INITCOMMONCONTROLSEX, InitCommonControlsEx,
+    ICC_BAR_CLASSES, ICC_STANDARD_CLASSES, ICC_TAB_CLASSES, ICC_UPDOWN_CLASS, INITCOMMONCONTROLSEX,
+    InitCommonControlsEx,
 };
 use windows::Win32::UI::WindowsAndMessaging::{MB_ICONERROR, MB_OK, MessageBoxW};
 use windows::core::{HSTRING, w};
@@ -57,7 +60,12 @@ fn main() {
     if let Err(e) = app::run(launch_file) {
         log::error("startup", &e);
         unsafe {
-            MessageBoxW(None, &HSTRING::from(format!("MyMDedit を起動できませんでした。\n{e}")), w!("MyMDedit"), MB_OK | MB_ICONERROR);
+            MessageBoxW(
+                None,
+                &HSTRING::from(format!("MyMDedit を起動できませんでした。\n{e}")),
+                w!("MyMDedit"),
+                MB_OK | MB_ICONERROR,
+            );
         }
     }
 }
@@ -87,8 +95,14 @@ mod tests {
             (0..sections)
                 .map(|i| section_table + i * 40)
                 .find_map(|s| {
-                    let (size, va, raw) = (u32_at(s + 8).max(u32_at(s + 16)), u32_at(s + 12), u32_at(s + 20));
-                    (va..va + size).contains(&rva).then(|| (rva - va + raw) as usize)
+                    let (size, va, raw) = (
+                        u32_at(s + 8).max(u32_at(s + 16)),
+                        u32_at(s + 12),
+                        u32_at(s + 20),
+                    );
+                    (va..va + size)
+                        .contains(&rva)
+                        .then(|| (rva - va + raw) as usize)
                 })
                 .unwrap()
         };
@@ -109,24 +123,45 @@ mod tests {
         let dll_characteristics = u16_at(opt + 70);
         // Debug directory entries are 28 bytes: Type at +12, PointerToRawData at +24.
         // Type 20 = IMAGE_DEBUG_TYPE_EX_DLLCHARACTERISTICS, where /CETCOMPAT lands.
-        let (debug_rva, debug_size) = (u32_at(data_dirs + 6 * 8), u32_at(data_dirs + 6 * 8 + 4) as usize);
-        let debug = if debug_rva == 0 { 0 } else { file_offset(debug_rva) };
+        let (debug_rva, debug_size) = (
+            u32_at(data_dirs + 6 * 8),
+            u32_at(data_dirs + 6 * 8 + 4) as usize,
+        );
+        let debug = if debug_rva == 0 {
+            0
+        } else {
+            file_offset(debug_rva)
+        };
         let dll_characteristics_ex = (0..debug_size / 28)
             .map(|i| debug + i * 28)
             .find(|&e| u32_at(e + 12) == 20)
             .map_or(0, |e| u32_at(u32_at(e + 24) as usize));
-        Pe { dependent_load_flags, dll_characteristics, dll_characteristics_ex, imports }
+        Pe {
+            dependent_load_flags,
+            dll_characteristics,
+            dll_characteristics_ex,
+            imports,
+        }
     }
 
     #[test]
     fn exploit_mitigations_are_on() {
         let pe = read_pe(&std::fs::read(std::env::current_exe().unwrap()).unwrap());
         // DYNAMIC_BASE, HIGH_ENTROPY_VA, NX_COMPAT, and GUARD_CF from .cargo/config.toml.
-        for (bit, name) in [(0x0040, "ASLR"), (0x0020, "high-entropy ASLR"), (0x0100, "NX"), (0x4000, "CFG")] {
+        for (bit, name) in [
+            (0x0040, "ASLR"),
+            (0x0020, "high-entropy ASLR"),
+            (0x0100, "NX"),
+            (0x4000, "CFG"),
+        ] {
             assert_ne!(pe.dll_characteristics & bit, 0, "{name} is off");
         }
         // IMAGE_DLLCHARACTERISTICS_EX_CET_COMPAT, from build.rs.
-        assert_ne!(pe.dll_characteristics_ex & 0x01, 0, "CET shadow stack compatibility is off");
+        assert_ne!(
+            pe.dll_characteristics_ex & 0x01,
+            0,
+            "CET shadow stack compatibility is off"
+        );
     }
 
     #[test]
@@ -141,7 +176,9 @@ mod tests {
             .iter()
             .filter(|n| {
                 let n = n.to_ascii_lowercase();
-                n.starts_with("vcruntime") || n.starts_with("msvcp") || n.starts_with("api-ms-win-crt")
+                n.starts_with("vcruntime")
+                    || n.starts_with("msvcp")
+                    || n.starts_with("api-ms-win-crt")
             })
             .collect();
         assert!(crt.is_empty(), "dynamic C runtime imports: {crt:?}");

@@ -11,15 +11,18 @@ use std::ffi::c_void;
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::{DWMWA_USE_IMMERSIVE_DARK_MODE, DwmSetWindowAttribute};
 use windows::Win32::Graphics::Gdi::{
-    CreateSolidBrush, DT_CENTER, DT_HIDEPREFIX, DT_SINGLELINE, DT_VCENTER, DeleteObject, DrawTextW, FillRect, GetWindowDC,
-    HDC, HFONT, HGDIOBJ, MapWindowPoints, ReleaseDC, SelectObject, SetBkMode, SetTextColor, TRANSPARENT,
+    CreateSolidBrush, DT_CENTER, DT_HIDEPREFIX, DT_SINGLELINE, DT_VCENTER, DeleteObject, DrawTextW,
+    FillRect, GetWindowDC, HDC, HFONT, HGDIOBJ, MapWindowPoints, ReleaseDC, SelectObject,
+    SetBkMode, SetTextColor, TRANSPARENT,
 };
-use windows::Win32::System::LibraryLoader::{GetProcAddress, LOAD_LIBRARY_SEARCH_SYSTEM32, LoadLibraryExW};
+use windows::Win32::System::LibraryLoader::{
+    GetProcAddress, LOAD_LIBRARY_SEARCH_SYSTEM32, LoadLibraryExW,
+};
 use windows::Win32::System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RegGetValueW};
 use windows::Win32::UI::Controls::{DRAWITEMSTRUCT, SetWindowTheme};
 use windows::Win32::UI::WindowsAndMessaging::{
-    DefWindowProcW, GetClientRect, GetMenuBarInfo, GetMenuItemInfoW, GetWindowRect, HMENU, MENUBARINFO, MENUITEMINFOW,
-    MIIM_STRING, OBJID_MENU,
+    DefWindowProcW, GetClientRect, GetMenuBarInfo, GetMenuItemInfoW, GetWindowRect, HMENU,
+    MENUBARINFO, MENUITEMINFOW, MIIM_STRING, OBJID_MENU,
 };
 use windows::core::{BOOL, PCSTR, PWSTR, w};
 
@@ -194,7 +197,10 @@ struct UahDrawMenuItem {
 
 fn menu_bar_rect_in_window(hwnd: HWND) -> Option<RECT> {
     unsafe {
-        let mut mbi = MENUBARINFO { cbSize: size_of::<MENUBARINFO>() as u32, ..Default::default() };
+        let mut mbi = MENUBARINFO {
+            cbSize: size_of::<MENUBARINFO>() as u32,
+            ..Default::default()
+        };
         GetMenuBarInfo(hwnd, OBJID_MENU, 0, &mut mbi).ok()?;
         let mut win = RECT::default();
         GetWindowRect(hwnd, &mut win).ok()?;
@@ -209,7 +215,14 @@ fn menu_bar_rect_in_window(hwnd: HWND) -> Option<RECT> {
 
 /// Paints the menu bar in `palette` when it is dark. Returns `Some` when the message
 /// was fully handled.
-pub fn handle_menu_bar_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM, palette: &Palette, font: HFONT) -> Option<LRESULT> {
+pub fn handle_menu_bar_message(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+    palette: &Palette,
+    font: HFONT,
+) -> Option<LRESULT> {
     if !palette.dark {
         return None;
     }

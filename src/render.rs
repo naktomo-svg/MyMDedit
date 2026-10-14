@@ -34,7 +34,14 @@ pub fn to_html_document(markdown: &str, settings: &AppSettings) -> String {
     let body = filter_fetching_tags(&markdown_to_html(markdown, &options()));
     // Assembled in one pass: substituting into a template would re-scan what was
     // already substituted, so a setting containing a marker could duplicate the body.
-    [HTML_HEAD, &build_css(settings), HTML_MIDDLE, &body, HTML_TAIL].concat()
+    [
+        HTML_HEAD,
+        &build_css(settings),
+        HTML_MIDDLE,
+        &body,
+        HTML_TAIL,
+    ]
+    .concat()
 }
 
 /// Elements whose only effect in the preview is to fetch or connect. Security: the
@@ -42,8 +49,18 @@ pub fn to_html_document(markdown: &str, settings: &AppSettings) -> String {
 /// rel=dns-prefetch/preconnect>` resolves and connects to any host, `<iframe src>`
 /// opens a connection before FrameNavigationStarting can cancel it (both observed in
 /// the 2026-10-14 audit, F8). The content is the only place they can be stopped.
-const FETCHING_TAGS: [&str; 10] =
-    ["base", "embed", "fencedframe", "frame", "frameset", "iframe", "link", "meta", "object", "portal"];
+const FETCHING_TAGS: [&str; 10] = [
+    "base",
+    "embed",
+    "fencedframe",
+    "frame",
+    "frameset",
+    "iframe",
+    "link",
+    "meta",
+    "object",
+    "portal",
+];
 
 /// GFM's tagfilter, over `FETCHING_TAGS`: the `<` of such a tag becomes `&lt;`, so it
 /// shows as text instead of becoming an element. Safe to run over the whole rendered
@@ -77,7 +94,9 @@ fn build_css(settings: &AppSettings) -> String {
     match settings.theme {
         Theme::Light => {}
         Theme::Dark => css.push_str(DARK_PALETTE_CSS),
-        Theme::System => css.push_str(&format!("\n@media (prefers-color-scheme: dark) {{{DARK_PALETTE_CSS}}}\n")),
+        Theme::System => css.push_str(&format!(
+            "\n@media (prefers-color-scheme: dark) {{{DARK_PALETTE_CSS}}}\n"
+        )),
     }
     css.push_str(&format!(
         "\nbody {{ font-family: {}; font-size: {}px; }}",
@@ -88,7 +107,11 @@ fn build_css(settings: &AppSettings) -> String {
     // Security: the value comes from a settings file writable from outside the app and
     // is interpolated straight into a CSS rule; "#fff; } body {display:none} x {" would
     // escape it. Emit only a validated hex color.
-    if let Some(color) = settings.preview_background_color.as_deref().filter(|c| is_hex_color(c)) {
+    if let Some(color) = settings
+        .preview_background_color
+        .as_deref()
+        .filter(|c| is_hex_color(c))
+    {
         css.push_str(&format!("\nbody {{ background: {color} !important; }}"));
     }
     if settings.table_header_gray_background {
@@ -96,14 +119,26 @@ fn build_css(settings: &AppSettings) -> String {
     }
     if settings.table_row_striping {
         // With a gray header too, start striping on even rows so the two never touch.
-        let selector =
-            if settings.table_header_gray_background { "table tbody tr:nth-child(even)" } else { "table tbody tr:nth-child(odd)" };
-        css.push_str(&format!("\n{selector} {{ background: rgba(128,128,128,0.15); }}"));
+        let selector = if settings.table_header_gray_background {
+            "table tbody tr:nth-child(even)"
+        } else {
+            "table tbody tr:nth-child(odd)"
+        };
+        css.push_str(&format!(
+            "\n{selector} {{ background: rgba(128,128,128,0.15); }}"
+        ));
     }
     css
 }
 
-const GENERIC_FAMILIES: [&str; 6] = ["serif", "sans-serif", "monospace", "cursive", "fantasy", "system-ui"];
+const GENERIC_FAMILIES: [&str; 6] = [
+    "serif",
+    "sans-serif",
+    "monospace",
+    "cursive",
+    "fantasy",
+    "system-ui",
+];
 
 /// Formats a comma-separated family list for CSS.
 ///
@@ -195,7 +230,10 @@ mod tests {
 
     #[test]
     fn font_family_cannot_break_out_of_style() {
-        assert_eq!(format_css_font_family("a</style><img src=x>, Segoe UI, serif"), "\"Segoe UI\", serif");
+        assert_eq!(
+            format_css_font_family("a</style><img src=x>, Segoe UI, serif"),
+            "\"Segoe UI\", serif"
+        );
         assert_eq!(format_css_font_family("A\"B"), "\"A\\\"B\"");
     }
 
@@ -218,7 +256,12 @@ mod tests {
     fn harmless_html_is_untouched() {
         let md = "<details><summary>s</summary>x</details>\n\n<img src=\"https://example.com/a.png\"> <linkx> <a href=\"#m\">metadata</a>";
         let html = to_html_document(md, &AppSettings::default());
-        for kept in ["<details>", "<img src=\"https://example.com/a.png\">", "<linkx>", "<a href=\"#m\">metadata</a>"] {
+        for kept in [
+            "<details>",
+            "<img src=\"https://example.com/a.png\">",
+            "<linkx>",
+            "<a href=\"#m\">metadata</a>",
+        ] {
             assert!(html.contains(kept), "{kept} lost: {html}");
         }
         // Markdown text is already escaped by comrak and must not be double-escaped.
@@ -239,13 +282,19 @@ mod tests {
 
     #[test]
     fn invalid_background_is_not_emitted() {
-        let s = AppSettings { preview_background_color: Some("red;}".into()), ..AppSettings::default() };
+        let s = AppSettings {
+            preview_background_color: Some("red;}".into()),
+            ..AppSettings::default()
+        };
         assert!(!to_html_document("", &s).contains("red;}"));
     }
 
     #[test]
     fn css_cannot_inject_template_markers() {
-        let s = AppSettings { preview_font_family: "__BODY__".into(), ..AppSettings::default() };
+        let s = AppSettings {
+            preview_font_family: "__BODY__".into(),
+            ..AppSettings::default()
+        };
         let html = to_html_document("unique-body-text", &s);
         assert_eq!(html.matches("unique-body-text").count(), 1);
     }
@@ -259,7 +308,11 @@ mod tests {
 
     #[test]
     fn striping_starts_on_even_rows_with_gray_header() {
-        let s = AppSettings { table_header_gray_background: true, table_row_striping: true, ..AppSettings::default() };
+        let s = AppSettings {
+            table_header_gray_background: true,
+            table_row_striping: true,
+            ..AppSettings::default()
+        };
         assert!(to_html_document("", &s).contains("nth-child(even)"));
     }
 }

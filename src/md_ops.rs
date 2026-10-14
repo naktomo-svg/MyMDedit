@@ -31,11 +31,17 @@ pub fn find_line_start(text: &[u16], index: usize) -> usize {
     if index == 0 {
         return 0;
     }
-    text[..index].iter().rposition(|&c| is_break(c)).map_or(0, |i| i + 1)
+    text[..index]
+        .iter()
+        .rposition(|&c| is_break(c))
+        .map_or(0, |i| i + 1)
 }
 
 pub fn find_line_end(text: &[u16], from: usize) -> usize {
-    text[from..].iter().position(|&c| is_break(c)).map_or(text.len(), |i| from + i)
+    text[from..]
+        .iter()
+        .position(|&c| is_break(c))
+        .map_or(text.len(), |i| from + i)
 }
 
 /// Zero-based number of the line `index` is on, counted the way the footer counts lines
@@ -61,14 +67,29 @@ fn skip_line_break(text: &[u16], at: usize) -> usize {
     if at >= text.len() {
         return at;
     }
-    if text[at] == b'\r' as u16 && text.get(at + 1) == Some(&(b'\n' as u16)) { at + 2 } else { at + 1 }
+    if text[at] == b'\r' as u16 && text.get(at + 1) == Some(&(b'\n' as u16)) {
+        at + 2
+    } else {
+        at + 1
+    }
 }
 
 /// Bold / italic / strikethrough / inline code: wrap the selection (keeping the original
 /// text selected), or insert a placeholder and select it so typing replaces it.
-pub fn wrap_selection(text: &[u16], start: usize, len: usize, prefix: &str, suffix: &str, placeholder: &str) -> Edit {
+pub fn wrap_selection(
+    text: &[u16],
+    start: usize,
+    len: usize,
+    prefix: &str,
+    suffix: &str,
+    placeholder: &str,
+) -> Edit {
     let (prefix, suffix) = (w(prefix), w(suffix));
-    let inner = if len > 0 { text[start..start + len].to_vec() } else { w(placeholder) };
+    let inner = if len > 0 {
+        text[start..start + len].to_vec()
+    } else {
+        w(placeholder)
+    };
     Edit {
         start,
         end: start + len,
@@ -80,9 +101,20 @@ pub fn wrap_selection(text: &[u16], start: usize, len: usize, prefix: &str, suff
 
 /// Link / image: `[text](url)` with the `url` part selected afterwards, so a URL already
 /// on the clipboard can be pasted straight over it.
-pub fn insert_link(text: &[u16], start: usize, len: usize, opening: &str, text_placeholder: &str, url_placeholder: &str) -> Edit {
+pub fn insert_link(
+    text: &[u16],
+    start: usize,
+    len: usize,
+    opening: &str,
+    text_placeholder: &str,
+    url_placeholder: &str,
+) -> Edit {
     let (opening, close_label, close_url) = (w(opening), w("]("), w(")"));
-    let label = if len > 0 { text[start..start + len].to_vec() } else { w(text_placeholder) };
+    let label = if len > 0 {
+        text[start..start + len].to_vec()
+    } else {
+        w(text_placeholder)
+    };
     let url = w(url_placeholder);
     Edit {
         start,
@@ -95,7 +127,13 @@ pub fn insert_link(text: &[u16], start: usize, len: usize, opening: &str, text_p
 
 /// Heading / bulleted list / numbered list / quote: prefix the start of each line the
 /// selection touches (only the caret's line when `single_line_only`).
-pub fn prefix_lines(text: &[u16], start: usize, len: usize, single_line_only: bool, prefix_for: impl Fn(usize) -> String) -> Edit {
+pub fn prefix_lines(
+    text: &[u16],
+    start: usize,
+    len: usize,
+    single_line_only: bool,
+    prefix_for: impl Fn(usize) -> String,
+) -> Edit {
     let (block_start, block_end) = line_block(text, start, len, single_line_only);
 
     let mut prefixed = Vec::new();
@@ -107,8 +145,18 @@ pub fn prefix_lines(text: &[u16], start: usize, len: usize, single_line_only: bo
         prefixed.extend_from_slice(&text[i..line_end]);
     }
 
-    let caret = if len == 0 { start + w(&prefix_for(0)).len() } else { block_start + prefixed.len() };
-    Edit { start: block_start, end: block_end, text: prefixed, sel_start: caret, sel_len: 0 }
+    let caret = if len == 0 {
+        start + w(&prefix_for(0)).len()
+    } else {
+        block_start + prefixed.len()
+    };
+    Edit {
+        start: block_start,
+        end: block_end,
+        text: prefixed,
+        sel_start: caret,
+        sel_len: 0,
+    }
 }
 
 /// The whole lines the selection touches, as (start of the first, end of the last —
@@ -148,7 +196,11 @@ fn line_block(text: &[u16], start: usize, len: usize, single_line_only: bool) ->
 }
 
 /// (start, end) of each line in a block from [`line_block`]; ends exclude the break.
-fn lines_in(text: &[u16], block_start: usize, block_end: usize) -> impl Iterator<Item = (usize, usize)> + '_ {
+fn lines_in(
+    text: &[u16],
+    block_start: usize,
+    block_end: usize,
+) -> impl Iterator<Item = (usize, usize)> + '_ {
     let mut next = Some(block_start);
     std::iter::from_fn(move || {
         let i = next?;
@@ -190,8 +242,18 @@ pub fn indent_lines(text: &[u16], start: usize, len: usize, outdent: bool) -> Op
             }
         }
     }
-    let (sel_start, sel_len) = if len == 0 { (caret, 0) } else { (block_start, out.len()) };
-    Some(Edit { start: block_start, end: block_end, text: out, sel_start, sel_len })
+    let (sel_start, sel_len) = if len == 0 {
+        (caret, 0)
+    } else {
+        (block_start, out.len())
+    };
+    Some(Edit {
+        start: block_start,
+        end: block_end,
+        text: out,
+        sel_start,
+        sel_len,
+    })
 }
 
 /// Replaces an existing heading marker (`#`..`######` + space) on the caret's line with
@@ -201,11 +263,25 @@ pub fn set_heading(text: &[u16], start: usize, level: usize) -> Edit {
     let line_end = find_line_end(text, line_start);
     let line = &text[line_start..line_end];
 
-    let hashes = line.iter().take(6).take_while(|&&c| c == b'#' as u16).count();
-    let existing = if hashes > 0 && line.get(hashes) == Some(&(b' ' as u16)) { hashes + 1 } else { 0 };
+    let hashes = line
+        .iter()
+        .take(6)
+        .take_while(|&&c| c == b'#' as u16)
+        .count();
+    let existing = if hashes > 0 && line.get(hashes) == Some(&(b' ' as u16)) {
+        hashes + 1
+    } else {
+        0
+    };
     let marker = w(&format!("{} ", "#".repeat(level)));
     let caret = line_start + marker.len();
-    Edit { start: line_start, end: line_start + existing, text: marker, sel_start: caret, sel_len: 0 }
+    Edit {
+        start: line_start,
+        end: line_start + existing,
+        text: marker,
+        sel_start: caret,
+        sel_len: 0,
+    }
 }
 
 /// The line breaks to put before/after an inserted block so it stands on its own line
@@ -215,7 +291,11 @@ fn boundary(text: &[u16], index: usize, before: bool, blank_line: bool) -> Vec<u
     if (before && index == 0) || (!before && index == text.len()) {
         return Vec::new();
     }
-    let adjacent_is_break = if before { is_break(text[index - 1]) } else { is_break(text[index]) };
+    let adjacent_is_break = if before {
+        is_break(text[index - 1])
+    } else {
+        is_break(text[index])
+    };
     let s = match (blank_line, adjacent_is_break) {
         (false, true) => "",
         (false, false) => "\r",
@@ -244,7 +324,11 @@ pub fn insert_block(text: &[u16], start: usize, len: usize, block: &str, blank_l
 /// Fenced code block around the selection (or a placeholder), with the inside selected.
 pub fn code_block(text: &[u16], start: usize, len: usize) -> Edit {
     let end = start + len;
-    let inner = if len > 0 { text[start..end].to_vec() } else { w("コード") };
+    let inner = if len > 0 {
+        text[start..end].to_vec()
+    } else {
+        w("コード")
+    };
     let leading = boundary(text, start, true, false);
     let trailing = boundary(text, end, false, false);
     let (open, close) = (w("```\r"), w("\r```"));
@@ -278,7 +362,11 @@ fn list_marker(line: &[u16]) -> Option<ListMarker> {
         let (number, marker_len) = parse_numbered(rest)?;
         (marker_len, format!("{}. ", number + 1))
     };
-    Some(ListMarker { indent, len: indent + marker_len, next })
+    Some(ListMarker {
+        indent,
+        len: indent + marker_len,
+        next,
+    })
 }
 
 /// Length of `- [ ] `.
@@ -325,11 +413,25 @@ pub fn toggle_task(text: &[u16], start: usize, len: usize) -> Edit {
         if len == 0 {
             let content = indent + old_marker;
             let offset = start - i;
-            caret = i + if offset < content { indent + TASK_MARKER_LEN } else { offset - old_marker + TASK_MARKER_LEN };
+            caret = i + if offset < content {
+                indent + TASK_MARKER_LEN
+            } else {
+                offset - old_marker + TASK_MARKER_LEN
+            };
         }
     }
-    let (sel_start, sel_len) = if len == 0 { (caret, 0) } else { (block_start, out.len()) };
-    Edit { start: block_start, end: block_end, text: out, sel_start, sel_len }
+    let (sel_start, sel_len) = if len == 0 {
+        (caret, 0)
+    } else {
+        (block_start, out.len())
+    };
+    Edit {
+        start: block_start,
+        end: block_end,
+        text: out,
+        sel_start,
+        sel_len,
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -350,7 +452,11 @@ pub fn headings(text: &[u16]) -> Vec<Heading> {
     while i <= text.len() {
         let line_end = find_line_end(text, i);
         let line = &text[i..line_end];
-        let indent = line.iter().take(4).take_while(|&&c| c == b' ' as u16).count();
+        let indent = line
+            .iter()
+            .take(4)
+            .take_while(|&&c| c == b' ' as u16)
+            .count();
         let rest = if indent < 4 { &line[indent..] } else { &[][..] };
         let run = |c: u16| rest.iter().take_while(|&&x| x == c).count();
 
@@ -358,7 +464,10 @@ pub fn headings(text: &[u16]) -> Vec<Heading> {
             if run(c) >= n {
                 fence = None;
             }
-        } else if let Some(c) = [b'`' as u16, b'~' as u16].into_iter().find(|&c| run(c) >= 3) {
+        } else if let Some(c) = [b'`' as u16, b'~' as u16]
+            .into_iter()
+            .find(|&c| run(c) >= 3)
+        {
             fence = Some((c, run(c)));
         } else {
             let level = run(b'#' as u16);
@@ -367,8 +476,16 @@ pub fn headings(text: &[u16]) -> Vec<Heading> {
                 let title = title.trim();
                 // A closing run of #s is decoration, but only after a space: `# C#` is "C#".
                 let stripped = title.trim_end_matches('#');
-                let title = if stripped.is_empty() || stripped.ends_with(' ') { stripped.trim_end() } else { title };
-                out.push(Heading { level, line_start: i, title: title.to_string() });
+                let title = if stripped.is_empty() || stripped.ends_with(' ') {
+                    stripped.trim_end()
+                } else {
+                    title
+                };
+                out.push(Heading {
+                    level,
+                    line_start: i,
+                    title: title.to_string(),
+                });
             }
         }
         if line_end >= text.len() {
@@ -398,18 +515,36 @@ pub fn on_enter(text: &[u16], caret: usize, sel_len: usize) -> Option<Edit> {
 
     if line_start + marker.len == line_end {
         // Leave the list: the marker-only line becomes an empty line.
-        return Some(Edit { start: line_start, end: line_end, text: w("\r"), sel_start: line_start + 1, sel_len: 0 });
+        return Some(Edit {
+            start: line_start,
+            end: line_end,
+            text: w("\r"),
+            sel_start: line_start + 1,
+            sel_len: 0,
+        });
     }
 
     let insert = concat(&[&w("\r"), &w(&" ".repeat(marker.indent)), &w(&marker.next)]);
     let caret_after = caret + insert.len();
-    Some(Edit { start: caret, end: caret, text: insert, sel_start: caret_after, sel_len: 0 })
+    Some(Edit {
+        start: caret,
+        end: caret,
+        text: insert,
+        sel_start: caret_after,
+        sel_len: 0,
+    })
 }
 
 /// `N. ` at the start of `line` → (N, marker length).
 fn parse_numbered(line: &[u16]) -> Option<(i32, usize)> {
-    let digits = line.iter().take_while(|&&c| (b'0' as u16..=b'9' as u16).contains(&c)).count();
-    if digits == 0 || line.get(digits) != Some(&(b'.' as u16)) || line.get(digits + 1) != Some(&(b' ' as u16)) {
+    let digits = line
+        .iter()
+        .take_while(|&&c| (b'0' as u16..=b'9' as u16).contains(&c))
+        .count();
+    if digits == 0
+        || line.get(digits) != Some(&(b'.' as u16))
+        || line.get(digits + 1) != Some(&(b' ' as u16))
+    {
         return None;
     }
     let number: i32 = String::from_utf16_lossy(&line[..digits]).parse().ok()?;
@@ -535,7 +670,13 @@ mod tests {
     fn tab_indents_every_selected_line_and_selects_them() {
         let t = "- a\r1. b\r- [ ] c\rz";
         let e = indent_lines(&w(t), 1, 12, false).unwrap();
-        assert_eq!(apply(t, &e), ("    - a\r    1. b\r    - [ ] c\rz".into(), "    - a\r    1. b\r    - [ ] c".into()));
+        assert_eq!(
+            apply(t, &e),
+            (
+                "    - a\r    1. b\r    - [ ] c\rz".into(),
+                "    - a\r    1. b\r    - [ ] c".into()
+            )
+        );
     }
 
     #[test]
@@ -594,22 +735,37 @@ mod tests {
     fn task_toggle_over_selection_skips_blank_lines() {
         let t = "- [ ] a\r\r- [x] b\rc";
         let e = toggle_task(&w(t), 0, t.encode_utf16().count());
-        assert_eq!(apply(t, &e), ("- [x] a\r\r- [ ] b\r- [ ] c".into(), "- [x] a\r\r- [ ] b\r- [ ] c".into()));
+        assert_eq!(
+            apply(t, &e),
+            (
+                "- [x] a\r\r- [ ] b\r- [ ] c".into(),
+                "- [x] a\r\r- [ ] b\r- [ ] c".into()
+            )
+        );
     }
 
     fn heading_list(t: &str) -> Vec<(usize, usize, String)> {
-        headings(&w(t)).into_iter().map(|h| (h.level, h.line_start, h.title)).collect()
+        headings(&w(t))
+            .into_iter()
+            .map(|h| (h.level, h.line_start, h.title))
+            .collect()
     }
 
     #[test]
     fn headings_lists_atx_headings_with_positions() {
         let t = "# 一\rtext\r  ### 三 ##\r####### seven\r#nospace\r##";
-        assert_eq!(heading_list(t), vec![(1, 0, "一".into()), (3, 9, "三".into()), (2, 43, "".into())]);
+        assert_eq!(
+            heading_list(t),
+            vec![(1, 0, "一".into()), (3, 9, "三".into()), (2, 43, "".into())]
+        );
     }
 
     #[test]
     fn heading_keeps_hash_that_is_part_of_the_title() {
-        assert_eq!(heading_list("# C#\r## #"), vec![(1, 0, "C#".into()), (2, 5, "".into())]);
+        assert_eq!(
+            heading_list("# C#\r## #"),
+            vec![(1, 0, "C#".into()), (2, 5, "".into())]
+        );
     }
 
     #[test]
@@ -621,7 +777,10 @@ mod tests {
     #[test]
     fn line_index_and_line_start_agree() {
         let t = w("ab\rc\r\rd");
-        assert_eq!([0, 2, 3, 4, 5, 6, 7].map(|p| line_index_at(&t, p)), [0, 0, 1, 1, 2, 3, 3]);
+        assert_eq!(
+            [0, 2, 3, 4, 5, 6, 7].map(|p| line_index_at(&t, p)),
+            [0, 0, 1, 1, 2, 3, 3]
+        );
         assert_eq!([0, 1, 2, 3].map(|n| line_start_of(&t, n)), [0, 3, 5, 6]);
         // Past the last line: the last line's start.
         assert_eq!(line_start_of(&t, 9), 6);

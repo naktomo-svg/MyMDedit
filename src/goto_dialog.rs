@@ -4,8 +4,8 @@ use std::cell::{Cell, RefCell};
 
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, COLOR_WINDOW, CreateSolidBrush, DeleteObject, EndPaint, HBRUSH, HDC, HFONT, HGDIOBJ, PAINTSTRUCT,
-    SetBkColor, SetTextColor,
+    BeginPaint, COLOR_WINDOW, CreateSolidBrush, DeleteObject, EndPaint, HBRUSH, HDC, HFONT,
+    HGDIOBJ, PAINTSTRUCT, SetBkColor, SetTextColor,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Controls::EM_SETSEL;
@@ -73,7 +73,12 @@ fn item(dlg: HWND, id: i32) -> HWND {
 }
 
 /// Asks for a line number; `Some` holds the chosen 1-based line, already clamped.
-pub fn show(owner: HWND, current_line: usize, line_count: usize, palette: Palette) -> windows::core::Result<Option<usize>> {
+pub fn show(
+    owner: HWND,
+    current_line: usize,
+    line_count: usize,
+    palette: Palette,
+) -> windows::core::Result<Option<usize>> {
     let state = Box::new(DlgState {
         palette,
         line_count,
@@ -102,7 +107,12 @@ pub fn show(owner: HWND, current_line: usize, line_count: usize, palette: Palett
         };
         RegisterClassW(&wc); // A second registration fails harmlessly.
 
-        let mut outer = RECT { left: 0, top: 0, right: s(client_w), bottom: s(client_h) };
+        let mut outer = RECT {
+            left: 0,
+            top: 0,
+            right: s(client_w),
+            bottom: s(client_h),
+        };
         let _ = AdjustWindowRectExForDpi(&mut outer, style, false, ex, dpi);
         let (w, h) = (outer.right - outer.left, outer.bottom - outer.top);
         let mut owner_rect = RECT::default();
@@ -110,12 +120,34 @@ pub fn show(owner: HWND, current_line: usize, line_count: usize, palette: Palett
         let x = owner_rect.left + ((owner_rect.right - owner_rect.left) - w) / 2;
         let y = owner_rect.top + ((owner_rect.bottom - owner_rect.top) - h) / 2;
 
-        CreateWindowExW(ex, w!("MyMDeditGotoDialog"), w!("行へ移動"), style, x, y, w, h, Some(owner), None, Some(instance.into()), None)?
+        CreateWindowExW(
+            ex,
+            w!("MyMDeditGotoDialog"),
+            w!("行へ移動"),
+            style,
+            x,
+            y,
+            w,
+            h,
+            Some(owner),
+            None,
+            Some(instance.into()),
+            None,
+        )?
     };
     unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, &*state as *const DlgState as isize) };
     crate::theme::set_title_bar_dark(hwnd, palette.dark);
 
-    let make = |class: PCWSTR, text: &str, style: u32, ex: u32, id: i32, x: i32, y: i32, cx: i32, cy: i32| -> HWND {
+    let make = |class: PCWSTR,
+                text: &str,
+                style: u32,
+                ex: u32,
+                id: i32,
+                x: i32,
+                y: i32,
+                cx: i32,
+                cy: i32|
+     -> HWND {
         let text = wide(text);
         unsafe {
             let h = CreateWindowExW(
@@ -138,10 +170,50 @@ pub fn show(owner: HWND, current_line: usize, line_count: usize, palette: Palett
         }
     };
     let tab = WS_TABSTOP.0;
-    make(w!("STATIC"), &format!("行番号 (1 - {line_count})"), 0, 0, -1, 16, 14, 268, 20);
-    let edit = make(w!("EDIT"), &current_line.to_string(), tab | ES_AUTOHSCROLL as u32, WS_EX_CLIENTEDGE.0, IDC_LINE, 16, 38, 268, 24);
-    let ok = make(w!("BUTTON"), "移動", tab | BS_DEFPUSHBUTTON as u32, 0, IDOK_, 84, 76, 96, 30);
-    let cancel = make(w!("BUTTON"), "キャンセル", tab | BS_PUSHBUTTON as u32, 0, IDCANCEL_, 188, 76, 96, 30);
+    make(
+        w!("STATIC"),
+        &format!("行番号 (1 - {line_count})"),
+        0,
+        0,
+        -1,
+        16,
+        14,
+        268,
+        20,
+    );
+    let edit = make(
+        w!("EDIT"),
+        &current_line.to_string(),
+        tab | ES_AUTOHSCROLL as u32,
+        WS_EX_CLIENTEDGE.0,
+        IDC_LINE,
+        16,
+        38,
+        268,
+        24,
+    );
+    let ok = make(
+        w!("BUTTON"),
+        "移動",
+        tab | BS_DEFPUSHBUTTON as u32,
+        0,
+        IDOK_,
+        84,
+        76,
+        96,
+        30,
+    );
+    let cancel = make(
+        w!("BUTTON"),
+        "キャンセル",
+        tab | BS_PUSHBUTTON as u32,
+        0,
+        IDCANCEL_,
+        188,
+        76,
+        96,
+        30,
+    );
     set_control_theme(edit, palette.dark, "DarkMode_CFD");
     for h in [ok, cancel] {
         set_control_theme(h, palette.dark, "DarkMode_Explorer");

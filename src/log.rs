@@ -28,7 +28,10 @@ pub fn append_line(path: &Path, line: &str) -> std::io::Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    let mut f = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
     writeln!(f, "{line}")
 }
 
@@ -37,7 +40,10 @@ pub fn append_line(path: &Path, line: &str) -> std::io::Result<()> {
 /// so this is the only trace the user (and the next developer) gets.
 pub fn install_panic_hook() {
     std::panic::set_hook(Box::new(|info| {
-        let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        let secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
         let line = format!("[{secs}] panic: {info}");
         error("panic", &line);
         if let Some(path) = crash_log_path() {
