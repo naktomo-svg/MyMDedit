@@ -88,6 +88,7 @@ const ID_RECENT_BASE: u16 = 200;
 const ID_EDITOR: usize = 300;
 
 const WM_APP_FOLDER_PROBED: u32 = WM_APP + 1;
+const WM_APP_RENDER: u32 = WM_APP + 2;
 const TIMER_SCROLL_SYNC: usize = 1;
 /// Position of the separator above 終了 in the File menu; recent folders go before it.
 const EXIT_SEPARATOR_POS: u32 = 5;
@@ -221,6 +222,8 @@ pub struct App {
     /// Re-entrancy guard for commands that show a modal dialog.
     busy: Cell<bool>,
     hovered: Cell<HWND>,
+    /// A render request is queued (see `request_render`).
+    render_pending: Cell<bool>,
     /// Ctrl+wheel movement not yet worth a whole zoom step.
     wheel_accum: Cell<i32>,
     find: Cell<*mut FindData>,
@@ -285,6 +288,7 @@ pub fn run(launch_file: Option<PathBuf>) -> windows::core::Result<()> {
         busy: Cell::new(false),
         hovered: Cell::new(HWND::default()),
         wheel_accum: Cell::new(0),
+        render_pending: Cell::new(false),
         find: Cell::new(std::ptr::null_mut()),
         find_message: Cell::new(0),
         probe_tx,
@@ -875,11 +879,26 @@ impl App {
     // ---- text & preview ------------------------------------------------------------
 
     fn on_text_changed(&self) {
-        self.rerender();
+        self.request_render();
         if !self.suppress_dirty.get() {
             let was_dirty = std::mem::replace(&mut self.state.borrow_mut().dirty, true);
             if !was_dirty {
                 self.update_title();
+            }
+        }
+    }
+
+    /// Renders once the queue is drained of the edits that are already waiting, instead of
+    /// once per edit. Nothing is delayed when typing is slower than rendering, which keeps
+    /// the spec's "no debounce" behaviour; only bursts (a paste, key repeat) coalesce.
+    fn request_render(&self) {
+        if self.render_pending.replace(true) {
+            return;
+        }
+        unsafe {
+            if PostMessageW(Some(self.hwnd()), WM_APP_RENDER, WPARAM(0), LPARAM(0)).is_err() {
+                self.render_pending.set(false);
+                self.rerender();
             }
         }
     }
@@ -913,7 +932,9 @@ impl App {
     fn load_content(&self, content: &str) {
         self.suppress_dirty.set(true);
         self.editor().set_text(content);
-        self.on_text_changed();
+        // EN_CHANGE from set_text has already asked for this; it coalesces, so asking again
+        // only covers the case where no notification came.
+        self.request_render();
         self.suppress_dirty.set(false);
         self.state.borrow_mut().dirty = false;
         self.update_title();
@@ -1667,6 +1688,11 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
         }
         WM_TIMER if wparam.0 == TIMER_SCROLL_SYNC => {
             app.poll_scroll();
+            LRESULT(0)
+        }
+        WM_APP_RENDER => {
+            app.render_pending.set(false);
+            app.rerender();
             LRESULT(0)
         }
         WM_APP_FOLDER_PROBED => {

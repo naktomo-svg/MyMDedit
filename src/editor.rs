@@ -8,7 +8,7 @@
 use windows::Win32::Foundation::{COLORREF, HWND, RECT};
 use windows::Win32::System::LibraryLoader::LoadLibraryW;
 use windows::Win32::UI::Controls::RichEdit::{
-    CFM_COLOR, CFM_FACE, CFM_SIZE, CHARFORMAT2W, CHARRANGE, EM_EXGETSEL, EM_EXLIMITTEXT, EM_EXSETSEL, EM_GETSCROLLPOS,
+    CFM_COLOR, CFM_FACE, CFM_SIZE, CHARFORMAT2W, CHARRANGE, EM_EXGETSEL, EM_EXLIMITTEXT, EM_EXSETSEL,
     EM_GETTEXTEX, EM_GETTEXTLENGTHEX, EM_REDO, EM_SETBKGNDCOLOR, EM_SETCHARFORMAT, EM_SETEVENTMASK, EM_SETTEXTEX,
     EM_SETTEXTMODE, EM_SETZOOM, ENM_CHANGE, GETTEXTEX, GETTEXTLENGTHEX, GT_DEFAULT, GTL_NUMCHARS, GTL_PRECISE, SCF_ALL,
     SCF_DEFAULT, SETTEXTEX, ST_DEFAULT, TM_MULTILEVELUNDO, TM_PLAINTEXT,
@@ -208,15 +208,15 @@ impl Editor {
     /// Vertical scroll position as 0 (top) ..= 1 (bottom).
     pub fn scroll_ratio(&self) -> f64 {
         let mut si = SCROLLINFO { cbSize: size_of::<SCROLLINFO>() as u32, fMask: SIF_ALL, ..Default::default() };
-        let mut pos = windows::Win32::Foundation::POINT::default();
         unsafe {
             if GetScrollInfo(self.0, SB_VERT, &mut si).is_err() {
                 return 0.0;
             }
         }
-        send(self.0, EM_GETSCROLLPOS, 0, &mut pos as *mut _ as isize);
+        // nPos rather than EM_GETSCROLLPOS: the latter is limited to 16 bits, so on a long
+        // document the preview stopped following past ~65535 pixels.
         let scrollable = si.nMax - si.nMin + 1 - si.nPage as i32;
-        if scrollable <= 0 { 0.0 } else { (pos.y as f64 / scrollable as f64).clamp(0.0, 1.0) }
+        if scrollable <= 0 { 0.0 } else { ((si.nPos - si.nMin) as f64 / scrollable as f64).clamp(0.0, 1.0) }
     }
 }
 
