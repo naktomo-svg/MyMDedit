@@ -74,25 +74,52 @@ pub fn detect_bom(bytes: &[u8]) -> Option<Charset> {
 #[derive(Debug)]
 pub enum ReadError {
     Io(io::Error),
-    /// The bytes are not valid in the detected charset (realistically: a Shift-JIS file).
-    InvalidEncoding,
+    /// The bytes are not valid in the detected charset (for BOM-less input, realistically
+    /// a Shift-JIS file; for a BOM'd UTF-16/32 file, a damaged one).
+    InvalidEncoding(Charset),
     /// Decodes fine but contains U+0000 (realistically: BOM-less UTF-16). Every Win32
     /// text API the editor uses stops at the first NUL, so the rest would be silently
     /// dropped from view — and then from the file on the next save.
     ContainsNul,
 }
 
+impl Charset {
+    fn label(self) -> &'static str {
+        match self {
+            Charset::Utf8 => "UTF-8",
+            Charset::Utf16Le | Charset::Utf16Be => "UTF-16",
+            Charset::Utf32Le | Charset::Utf32Be => "UTF-32",
+        }
+    }
+}
+
 impl fmt::Display for ReadError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             ReadError::Io(e) => write!(f, "{e}"),
-            ReadError::InvalidEncoding => f.write_str(INVALID_ENCODING_MESSAGE),
+            ReadError::InvalidEncoding(Charset::Utf8) => f.write_str(
+                "このファイルは UTF-8 として読み取れませんでした。Shift-JIS など、このアプリが対応していない文字コードの可能性があります。ファイルは変更していません。",
+            ),
+            ReadError::InvalidEncoding(c) => write!(
+                f,
+                "このファイルは {} として読み取れませんでした。ファイルが壊れている可能性があります。ファイルは変更していません。",
+                c.label()
+            ),
             ReadError::ContainsNul => f.write_str(CONTAINS_NUL_MESSAGE),
         }
     }
 }
 
-pub const INVALID_ENCODING_MESSAGE: &str = "このファイルは UTF-8 として読み取れませんでした。Shift-JIS など、このアプリが対応していない文字コードの可能性があります。ファイルは変更していません。";
+/// The editor's UTF-16 as a String. A lone surrogate (pasteable, already corrupt) cannot
+/// be represented in any charset this app writes, so it becomes U+FFFD — but the caller
+/// is told, so the substitution is never silent.
+pub fn text_from_editor(units: &[u16]) -> (String, bool) {
+    match String::from_utf16(units) {
+        Ok(s) => (s, false),
+        Err(_) => (String::from_utf16_lossy(units), true),
+    }
+}
+
 pub const CONTAINS_NUL_MESSAGE: &str = "このファイルには NUL 文字が含まれているため開けません。BOM のない UTF-16 など、このアプリが対応していない形式の可能性があります。ファイルは変更していません。";
 
 /// Strictly decodes `bytes`. Strictness is the point: substituting U+FFFD for
@@ -107,33 +134,30 @@ pub fn decode(bytes: &[u8]) -> Result<(String, DocumentFormat), ReadError> {
     let mut format = DocumentFormat { charset, has_bom, line_ending: LineEnding::Crlf };
     let body = &bytes[format.bom_len()..];
 
+    let invalid = || ReadError::InvalidEncoding(charset);
     let text = match charset {
-        Charset::Utf8 => String::from_utf8(body.to_vec()).map_err(|_| ReadError::InvalidEncoding)?,
+        Charset::Utf8 => String::from_utf8(body.to_vec()).map_err(|_| invalid())?,
         Charset::Utf16Le | Charset::Utf16Be => {
-            if body.len() % 2 != 0 {
-                return Err(ReadError::InvalidEncoding);
+            let (chunks, rest) = body.as_chunks::<2>();
+            if !rest.is_empty() {
+                return Err(invalid());
             }
-            let units: Vec<u16> = body
-                .chunks_exact(2)
-                .map(|c| match charset {
-                    Charset::Utf16Le => u16::from_le_bytes([c[0], c[1]]),
-                    _ => u16::from_be_bytes([c[0], c[1]]),
-                })
+            let units: Vec<u16> = chunks
+                .iter()
+                .map(|&c| if charset == Charset::Utf16Le { u16::from_le_bytes(c) } else { u16::from_be_bytes(c) })
                 .collect();
-            String::from_utf16(&units).map_err(|_| ReadError::InvalidEncoding)?
+            String::from_utf16(&units).map_err(|_| invalid())?
         }
         Charset::Utf32Le | Charset::Utf32Be => {
-            if body.len() % 4 != 0 {
-                return Err(ReadError::InvalidEncoding);
+            let (chunks, rest) = body.as_chunks::<4>();
+            if !rest.is_empty() {
+                return Err(invalid());
             }
-            body.chunks_exact(4)
-                .map(|c| {
-                    let b = [c[0], c[1], c[2], c[3]];
-                    let v = match charset {
-                        Charset::Utf32Le => u32::from_le_bytes(b),
-                        _ => u32::from_be_bytes(b),
-                    };
-                    char::from_u32(v).ok_or(ReadError::InvalidEncoding)
+            chunks
+                .iter()
+                .map(|&c| {
+                    let v = if charset == Charset::Utf32Le { u32::from_le_bytes(c) } else { u32::from_be_bytes(c) };
+                    char::from_u32(v).ok_or_else(invalid)
                 })
                 .collect::<Result<String, _>>()?
         }
@@ -394,7 +418,24 @@ mod tests {
     #[test]
     fn rejects_shift_jis() {
         // "日本" in Shift-JIS
-        assert!(matches!(decode(&[0x93, 0xFA, 0x96, 0x7B]), Err(ReadError::InvalidEncoding)));
+        assert!(matches!(decode(&[0x93, 0xFA, 0x96, 0x7B]), Err(ReadError::InvalidEncoding(_))));
+    }
+
+    #[test]
+    fn encoding_errors_name_the_charset() {
+        let bad_utf16 = [0xFF, 0xFE, 0x00, 0xD8]; // BOM + lone high surrogate
+        let e = decode(&bad_utf16).unwrap_err();
+        assert!(matches!(e, ReadError::InvalidEncoding(Charset::Utf16Le)));
+        assert!(e.to_string().contains("UTF-16"));
+        assert!(decode(&[0x93, 0xFA]).unwrap_err().to_string().contains("UTF-8"));
+    }
+
+    #[test]
+    fn editor_text_with_lone_surrogate_is_flagged() {
+        assert_eq!(text_from_editor(&[0x61, 0x62]), ("ab".to_string(), false));
+        let (s, replaced) = text_from_editor(&[0x61, 0xD800]);
+        assert_eq!(s, "a\u{FFFD}");
+        assert!(replaced);
     }
 
     #[test]

@@ -825,7 +825,7 @@ impl App {
     fn report_file_error(&self, context: &str, message: &str, e: &ReadError) {
         match e {
             // Already written for the user.
-            ReadError::InvalidEncoding | ReadError::ContainsNul => self.report_error(context, &e.to_string(), None),
+            ReadError::InvalidEncoding(_) | ReadError::ContainsNul => self.report_error(context, &e.to_string(), None),
             ReadError::Io(io) => self.report_error(context, &format!("{message} ({io})"), Some(io)),
         }
     }
@@ -1156,13 +1156,14 @@ impl App {
             self.save_as();
             return;
         };
-        let text = String::from_utf16_lossy(&self.editor().text());
+        let (text, replaced) = document::text_from_editor(&self.editor().text());
         if let Err(e) = document::save_atomic(&path, &text, &format) {
             // The dirty flag stays: a failed save can never pass for a successful one.
             self.report_error("Save", &format!("保存できませんでした: {} ({e})", path.display()), Some(&e));
             return;
         }
         self.state.borrow_mut().dirty = false;
+        self.warn_if_replaced(replaced);
         self.update_title();
         self.record_recent_folder(&path);
     }
@@ -1180,7 +1181,7 @@ impl App {
                 return;
             }
         };
-        let text = String::from_utf16_lossy(&self.editor().text());
+        let (text, replaced) = document::text_from_editor(&self.editor().text());
         if let Err(e) = document::save_atomic(&path, &text, &format) {
             // The document was never written there, so it must not claim that path.
             self.report_error("SaveAs", &format!("保存できませんでした: {} ({e})", path.display()), Some(&e));
@@ -1192,8 +1193,21 @@ impl App {
             st.file_path = Some(path.clone());
             st.dirty = false;
         }
+        self.warn_if_replaced(replaced);
         self.update_title();
         self.record_recent_folder(&path);
+    }
+
+    /// A save that had to substitute U+FFFD succeeded, but the user must not learn of the
+    /// substitution only by noticing it in the file later.
+    fn warn_if_replaced(&self, replaced: bool) {
+        if replaced {
+            self.report_error(
+                "Save",
+                "保存しましたが、ファイルに書けない文字（壊れたサロゲート）が含まれていたため U+FFFD（�）に置き換えました。",
+                None,
+            );
+        }
     }
 
     fn exit(&self) {
