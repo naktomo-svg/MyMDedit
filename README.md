@@ -51,6 +51,7 @@ pwsh ./scripts/Analyze-TechDebt.ps1           # 実行（Opusを使うためAPI�
 
 - 設定: `%APPDATA%\MyMDedit\settings.json`
 - WebView2のデータ: `%LOCALAPPDATA%\MyMDedit\WebView2`
+- クラッシュ時の記録: `%LOCALAPPDATA%\MyMDedit\crash.log`
 
 ## MyWinApp（WinUI 3版）との違い
 

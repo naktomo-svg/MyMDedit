@@ -29,6 +29,7 @@ use windows::Win32::UI::WindowsAndMessaging::{MB_ICONERROR, MB_OK, MessageBoxW};
 use windows::core::{HSTRING, w};
 
 fn main() {
+    log::install_panic_hook();
     unsafe {
         // WebView2 and the shell dialogs both require an STA thread.
         let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok();
