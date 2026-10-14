@@ -309,6 +309,10 @@ fn configure(controller: ICoreWebView2Controller, env: &ICoreWebView2Environment
             // A hostile document can contain a form; nothing of the user's may land in it.
             s4.SetIsGeneralAutofillEnabled(false)?;
             s4.SetIsPasswordAutosaveEnabled(false)?;
+        } else {
+            // Every protection that is skipped on an older runtime says so: a silent
+            // skip looks the same as one that is in place.
+            log::error("ConfigureWebView2", "ICoreWebView2Settings4 unavailable; autofill stays at the runtime default");
         }
 
         let mut token = 0i64;
@@ -339,6 +343,7 @@ fn configure(controller: ICoreWebView2Controller, env: &ICoreWebView2Environment
                 COREWEBVIEW2_WEB_RESOURCE_REQUEST_SOURCE_KINDS_ALL,
             )?;
         } else {
+            log::error("ConfigureWebView2", "ICoreWebView2_22 unavailable; request filter covers document requests only");
             webview.AddWebResourceRequestedFilter(w!("*"), COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL)?;
         }
         let env = env.clone();
@@ -433,6 +438,11 @@ fn configure(controller: ICoreWebView2Controller, env: &ICoreWebView2Environment
                 })),
                 &mut token,
             )?;
+        } else {
+            log::error(
+                "ConfigureWebView2",
+                "ICoreWebView2_18 unavailable; external URI schemes are stopped by the navigation guard alone",
+            );
         }
 
         webview.add_ProcessFailed(
