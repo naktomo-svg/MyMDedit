@@ -1,0 +1,65 @@
+[package]
+name = "mymdedit-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+# The app is a binary crate; `src/lib.rs` here compiles its pure-logic modules straight
+# from `../src`, so the targets fuzz the shipped code, not a copy.
+[dependencies]
+libfuzzer-sys = "0.4"
+comrak = { version = "0.56.0", default-features = false }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+
+[dependencies.windows]
+version = "0.62"
+features = [
+    "Win32_Foundation",
+    "Win32_Globalization",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_Threading",
+]
+
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "render_markdown"
+path = "fuzz_targets/render_markdown.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "render_settings"
+path = "fuzz_targets/render_settings.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "document_decode"
+path = "fuzz_targets/document_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "md_ops"
+path = "fuzz_targets/md_ops.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "search"
+path = "fuzz_targets/search.rs"
+test = false
+doc = false
+bench = false

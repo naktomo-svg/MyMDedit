@@ -1,0 +1,30 @@
+# cargo deny check — dependency policy (security audit round 2, item 14).
+
+[advisories]
+# Vulnerabilities, unmaintained and yanked crates all fail the check.
+yanked = "deny"
+
+[licenses]
+# Everything in the dependency tree today; a new license is a decision, not an accident.
+allow = [
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "MIT",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "Unlicense",
+    "Zlib",
+]
+# The app itself has no license field and is never published.
+private = { ignore = true }
+
+[bans]
+# Two versions of one crate are worth knowing about but not a reason to fail.
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+# crates.io only: a git or alternative-registry dependency bypasses the advisory database
+# and Cargo.lock's checksums.
+unknown-registry = "deny"
+unknown-git = "deny"

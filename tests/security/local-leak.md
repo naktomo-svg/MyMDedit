@@ -10,6 +10,6 @@
 <iframe src="http://127.0.0.1:18445/iframe-http"></iframe>
 <meta http-equiv="refresh" content="2;url=http://127.0.0.1:18446/refresh-http">
 
-<a href="http://127.0.0.1:18447/click-http">CLICKHTTP</a>
+<a href="http://127.0.0.1:18447/click-http">CLICKPLAIN</a>
 
 <a href="https://127.0.0.1:18448/click-https">CLICKHTTPS</a>
