@@ -24,7 +24,7 @@ A symptom-level patch leaves the root cause, and every sibling occurrence of the
 
 ## Done means
 
-Run every command CLAUDE.md's Commands section lists for verification — build, tests and clippy — and confirm 0 errors, all tests passing, and no new clippy warnings. Do not invent commands it does not list. When the fix touches UI behaviour, also do a manual QA pass with the app.
+Run every command CLAUDE.md's Commands section lists for verification and confirm each meets the bar stated there. Do not invent commands it does not list. When the fix touches UI behaviour, also do a manual QA pass with the app.
 
 ## Red flags — you're skipping a step
 

@@ -26,7 +26,7 @@ Fuzzing needs the nightly toolchain, `cargo install cargo-fuzz`, and the MSVC AS
 
 **This section is the only place this repo's tooling state is asserted.** Skills under `.claude/skills/` refer to "the commands CLAUDE.md lists" rather than naming them, so adding a tool means editing here and nowhere else.
 
-Verification for every change is: `cargo build` with 0 errors, `cargo test` all passing, and `cargo clippy --all-targets` with no new warnings. Tests cover the pure-logic modules only (`md_ops`, `search`, `document`, `line_endings`, `settings`, `render`, `dialogs`' parsers, `settings_dialog::DialogEdits`). Anything behind a Win32 or WebView2 call needs manual QA in the running app (`winapp ui` can drive it; toolbar buttons carry accessible names, the editor's control id is 300).
+Verification for every change is: `cargo build` with 0 errors, `cargo test` all passing, `cargo clippy --all-targets` with no new warnings, and `cargo fmt --check` with no diff (in `fuzz/` too when it changed). Tests cover the pure-logic modules only (`md_ops`, `search`, `document`, `line_endings`, `settings`, `render`, `dialogs`' parsers, `settings_dialog::DialogEdits`). Anything behind a Win32 or WebView2 call needs manual QA in the running app (`winapp ui` can drive it; toolbar buttons carry accessible names, the editor's control id is 300).
 
 Generating the AI tech-debt report (`scripts/Analyze-TechDebt.ps1`) has its own flags, caching/resume behaviour and cost caveats — see the `tech-debt-report` skill.
 
