@@ -13,11 +13,14 @@ cargo build                      # debug build → target\debug\MyMDedit.exe
 cargo build --release            # release build → target\release\MyMDedit.exe (no console window)
 cargo test                       # unit tests
 cargo clippy --all-targets       # lint
+cargo fmt                        # format (rustfmt.toml); run it in fuzz/ too — separate crate
 cargo deny check                 # dependency advisories, licenses, sources (deny.toml)
 .\target\debug\MyMDedit.exe [file.md]
 .\tests\security\tools\run-all.ps1   # preview security regression: every payload, PASS/FAIL (debug build, ~5 min)
 cargo +nightly fuzz run <target> -- -max_total_time=<s>   # fuzz/ ; targets: render_markdown render_settings document_decode md_ops search
 ```
+
+Formatting is `rustfmt.toml` at the root: `max_width = 120` and `use_small_heuristics = "Max"` (calls, struct literals and the like stay on one line up to the full width, as the code was written before rustfmt was adopted). `fuzz/` has no config of its own and picks up the root one.
 
 Fuzzing needs the nightly toolchain, `cargo install cargo-fuzz`, and the MSVC ASan runtime directory (`…\VC\Tools\MSVC\<ver>\bin\Hostx64\x64`, holding `clang_rt.asan_dynamic-x86_64.dll`) on `PATH`; `-s none` does not link on MSVC. `cd fuzz; cargo +nightly test --lib` checks that the fuzz checkers catch what they guard against.
 
