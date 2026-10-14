@@ -972,10 +972,20 @@ impl App {
     }
 
     /// The single place a settings write's failure becomes visible to the user.
+    ///
+    /// The write re-reads the file, so it can bring in another instance's changes (a
+    /// theme switched over there). Whatever now differs on screen is re-applied here, so
+    /// the window, the editor and the preview never show a mix of old and new settings.
     fn persist_settings(&self, change: impl FnOnce(&mut AppSettings)) {
+        let before = self.current_settings();
         let ok = self.state.borrow_mut().settings.update(change);
         if !ok {
             self.report_error("SettingsStore.save", "設定を保存できませんでした。この変更は次回の起動時には元に戻ります。", None);
+        }
+        if settings::display_differs(&before, &self.current_settings()) {
+            self.apply_theme();
+            self.apply_editor_font();
+            self.rerender();
         }
     }
 
@@ -1009,10 +1019,8 @@ impl App {
             }
         };
         // Applied onto the settings as of now, not as of when the dialog opened.
+        // Re-applies the theme, fonts and preview itself when they changed.
         self.persist_settings(|s| *s = edits.apply(s));
-        self.apply_theme();
-        self.apply_editor_font();
-        self.rerender();
     }
 
     // ---- recent folders ------------------------------------------------------------

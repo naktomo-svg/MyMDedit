@@ -93,6 +93,13 @@ impl AppSettings {
     }
 }
 
+/// Whether two settings would look different on screen. Recent folders and the custom
+/// color palette are bookkeeping: nothing has to be redrawn when only they change.
+pub fn display_differs(a: &AppSettings, b: &AppSettings) -> bool {
+    let strip = |s: &AppSettings| AppSettings { recent_folders: Vec::new(), custom_colors: Vec::new(), ..s.clone() };
+    strip(a) != strip(b)
+}
+
 /// Puts `folder` first, dropping a case-insensitive duplicate and anything past the cap.
 pub fn add_recent_folder(current: &[String], folder: &str) -> Vec<String> {
     std::iter::once(folder.to_string())
@@ -448,6 +455,15 @@ mod tests {
         assert_eq!(reloaded.current().theme, Theme::Dark);
         assert_eq!(reloaded.current().recent_folders, vec!["C:\\x"]);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn display_change_detection_ignores_bookkeeping_fields() {
+        let a = AppSettings::default();
+        let bookkeeping = AppSettings { recent_folders: vec!["C:\\x".into()], custom_colors: vec!["#fff".into()], ..a.clone() };
+        assert!(!display_differs(&a, &bookkeeping));
+        assert!(display_differs(&a, &AppSettings { theme: Theme::Dark, ..a.clone() }));
+        assert!(display_differs(&a, &AppSettings { editor_font_size: 20.0, ..a.clone() }));
     }
 
     #[test]
