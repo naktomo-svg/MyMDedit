@@ -6,7 +6,7 @@
 //! code units into that text, which is what `md_ops` and `search` operate on.
 
 use windows::Win32::Foundation::{COLORREF, HWND, RECT};
-use windows::Win32::System::LibraryLoader::LoadLibraryW;
+use windows::Win32::System::LibraryLoader::{LOAD_LIBRARY_SEARCH_SYSTEM32, LoadLibraryExW};
 use windows::Win32::UI::Controls::RichEdit::{
     CFM_COLOR, CFM_FACE, CFM_SIZE, CHARFORMAT2W, CHARRANGE, EM_EXGETSEL, EM_EXLIMITTEXT, EM_EXSETSEL,
     EM_GETTEXTEX, EM_GETTEXTLENGTHEX, EM_REDO, EM_SETBKGNDCOLOR, EM_SETCHARFORMAT, EM_SETEVENTMASK, EM_SETTEXTEX,
@@ -42,7 +42,7 @@ pub struct Editor(pub HWND);
 impl Editor {
     pub fn create(parent: HWND, id: usize) -> windows::core::Result<Self> {
         unsafe {
-            LoadLibraryW(w!("Msftedit.dll"))?;
+            LoadLibraryExW(w!("Msftedit.dll"), None, LOAD_LIBRARY_SEARCH_SYSTEM32)?;
             let style = WS_CHILD
                 | WS_VISIBLE
                 | WS_VSCROLL

@@ -2,7 +2,7 @@
 
 Windows向けのシンプルなMarkdownエディタです（MyWinAppのRust移植版）。左側でMarkdownを編集すると、右側にHTMLプレビューがリアルタイムに表示されます。
 
-Win32 API（`windows`クレート）とWebView2で作った、単一の`.exe`だけで動くネイティブアプリです。.NETランタイムやMSIXのインストールは要りません。
+Win32 API（`windows`クレート）とWebView2で作った、単一の`.exe`だけで動くネイティブアプリです。.NETランタイムやVC++ランタイム、MSIXのインストールは要りません（必要なのはWebView2ランタイムだけです）。
 
 ## 主な機能
 

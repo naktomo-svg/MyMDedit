@@ -14,7 +14,7 @@ use windows::Win32::Graphics::Gdi::{
     CreateSolidBrush, DT_CENTER, DT_HIDEPREFIX, DT_SINGLELINE, DT_VCENTER, DeleteObject, DrawTextW, FillRect, GetWindowDC,
     HDC, HFONT, HGDIOBJ, MapWindowPoints, ReleaseDC, SelectObject, SetBkMode, SetTextColor, TRANSPARENT,
 };
-use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
+use windows::Win32::System::LibraryLoader::{GetProcAddress, LOAD_LIBRARY_SEARCH_SYSTEM32, LoadLibraryExW};
 use windows::Win32::System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RegGetValueW};
 use windows::Win32::UI::Controls::{DRAWITEMSTRUCT, SetWindowTheme};
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -100,7 +100,7 @@ pub fn system_prefers_dark() -> bool {
 
 fn uxtheme_ordinal(ordinal: u16) -> Option<unsafe extern "system" fn() -> isize> {
     unsafe {
-        let module = LoadLibraryW(w!("uxtheme.dll")).ok()?;
+        let module = LoadLibraryExW(w!("uxtheme.dll"), None, LOAD_LIBRARY_SEARCH_SYSTEM32).ok()?;
         GetProcAddress(module, PCSTR(ordinal as usize as *const u8))
     }
 }

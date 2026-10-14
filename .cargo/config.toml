@@ -1,0 +1,6 @@
+# Link the C runtime statically. The exe is meant to run on its own (README), and a
+# dynamically linked VCRUNTIME140.dll is both a missing dependency on machines without
+# the VC++ redistributable and a DLL the loader would otherwise go looking for next to
+# the exe (audit F9, F11). `main.rs`'s tests check the result.
+[target.'cfg(target_env = "msvc")']
+rustflags = ["-C", "target-feature=+crt-static"]
