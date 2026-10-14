@@ -27,7 +27,7 @@ use webview2_com::Microsoft::Web::WebView2::Win32::{
     COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL, COREWEBVIEW2_WEB_RESOURCE_CONTEXT_IMAGE,
     COREWEBVIEW2_WEB_RESOURCE_REQUEST_SOURCE_KINDS_ALL, CreateCoreWebView2EnvironmentWithOptions, ICoreWebView2,
     ICoreWebView2Controller, ICoreWebView2Controller2, ICoreWebView2Environment, ICoreWebView2EnvironmentOptions,
-    ICoreWebView2NavigationStartingEventArgs, ICoreWebView2WebResourceRequestedEventArgs, ICoreWebView2_4,
+    ICoreWebView2NavigationStartingEventArgs, ICoreWebView2Settings4, ICoreWebView2WebResourceRequestedEventArgs, ICoreWebView2_4,
     ICoreWebView2_18, ICoreWebView2_22, COREWEBVIEW2_PROCESS_FAILED_KIND,
     COREWEBVIEW2_PROCESS_FAILED_KIND_BROWSER_PROCESS_EXITED, COREWEBVIEW2_PROCESS_FAILED_KIND_RENDER_PROCESS_EXITED,
 };
@@ -299,6 +299,17 @@ fn configure(controller: ICoreWebView2Controller, env: &ICoreWebView2Environment
         // documented to be unaffected by this.
         settings.SetIsScriptEnabled(false)?;
         settings.SetIsStatusBarEnabled(false)?;
+        // Everything the preview does not use is off rather than left at the runtime's
+        // default. DevTools above all: F12 or "Inspect" opened a console on the
+        // document, undoing the no-script premise with one keystroke.
+        settings.SetAreDevToolsEnabled(false)?;
+        settings.SetIsWebMessageEnabled(false)?;
+        settings.SetAreHostObjectsAllowed(false)?;
+        if let Ok(s4) = settings.cast::<ICoreWebView2Settings4>() {
+            // A hostile document can contain a form; nothing of the user's may land in it.
+            s4.SetIsGeneralAutofillEnabled(false)?;
+            s4.SetIsPasswordAutosaveEnabled(false)?;
+        }
 
         let mut token = 0i64;
         webview.add_NavigationStarting(

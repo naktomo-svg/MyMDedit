@@ -109,12 +109,14 @@ const GENERIC_FAMILIES: [&str; 6] = ["serif", "sans-serif", "monospace", "cursiv
 ///
 /// Security: escaping for the CSS string grammar is not enough here — the result lands
 /// in a `<style>` element, which the HTML tokenizer ends at a literal `</style`
-/// regardless of CSS quoting. Parts containing `<` or `>` are dropped outright.
+/// regardless of CSS quoting. Parts containing `<` or `>` are dropped outright. So are
+/// parts with control characters: a CSS string also ends at a newline (LF, CR or FF),
+/// as a bad string, and a `}` after it would close the rule. No font name has one.
 pub fn format_css_font_family(value: &str) -> String {
     value
         .split(',')
         .map(str::trim)
-        .filter(|p| !p.is_empty() && !p.contains('<') && !p.contains('>'))
+        .filter(|p| !p.is_empty() && !p.contains(['<', '>']) && !p.contains(char::is_control))
         .map(|p| {
             if GENERIC_FAMILIES.iter().any(|g| g.eq_ignore_ascii_case(p)) {
                 p.to_string()
@@ -223,6 +225,16 @@ mod tests {
         assert!(to_html_document("a < link", &AppSettings::default()).contains("a &lt; link"));
         assert_eq!(filter_fetching_tags("日本語<link>"), "日本語&lt;link>");
         assert_eq!(filter_fetching_tags("<"), "<");
+    }
+
+    #[test]
+    fn font_family_cannot_break_out_of_its_rule() {
+        // A newline ends a CSS string as a <bad-string-token>; the `}` after it then
+        // closes the body rule and everything behind it becomes a rule of its own.
+        for nl in ["\n", "\r", "\x0c"] {
+            let css = format_css_font_family(&format!("a{nl}}} body{{display:none}} x{{, serif"));
+            assert_eq!(css, "serif", "{nl:?}");
+        }
     }
 
     #[test]
