@@ -67,6 +67,9 @@ mod tests {
     /// back from this test binary — built with the same flags as the app.
     struct Pe {
         dependent_load_flags: u16,
+        dll_characteristics: u16,
+        /// IMAGE_DLLCHARACTERISTICS_EX_* from the debug directory (0 when absent).
+        dll_characteristics_ex: u32,
         imports: Vec<String>,
     }
 
@@ -102,7 +105,27 @@ mod tests {
         // IMAGE_LOAD_CONFIG_DIRECTORY64.DependentLoadFlags sits at offset 0x4E,
         // after ProcessHeapFlags (0x48) and CSDVersion (0x4C).
         let dependent_load_flags = u16_at(file_offset(u32_at(data_dirs + 10 * 8)) + 0x4E);
-        Pe { dependent_load_flags, imports }
+        let dll_characteristics = u16_at(opt + 70);
+        // Debug directory entries are 28 bytes: Type at +12, PointerToRawData at +24.
+        // Type 20 = IMAGE_DEBUG_TYPE_EX_DLLCHARACTERISTICS, where /CETCOMPAT lands.
+        let (debug_rva, debug_size) = (u32_at(data_dirs + 6 * 8), u32_at(data_dirs + 6 * 8 + 4) as usize);
+        let debug = if debug_rva == 0 { 0 } else { file_offset(debug_rva) };
+        let dll_characteristics_ex = (0..debug_size / 28)
+            .map(|i| debug + i * 28)
+            .find(|&e| u32_at(e + 12) == 20)
+            .map_or(0, |e| u32_at(u32_at(e + 24) as usize));
+        Pe { dependent_load_flags, dll_characteristics, dll_characteristics_ex, imports }
+    }
+
+    #[test]
+    fn exploit_mitigations_are_on() {
+        let pe = read_pe(&std::fs::read(std::env::current_exe().unwrap()).unwrap());
+        // DYNAMIC_BASE, HIGH_ENTROPY_VA, NX_COMPAT, and GUARD_CF from .cargo/config.toml.
+        for (bit, name) in [(0x0040, "ASLR"), (0x0020, "high-entropy ASLR"), (0x0100, "NX"), (0x4000, "CFG")] {
+            assert_ne!(pe.dll_characteristics & bit, 0, "{name} is off");
+        }
+        // IMAGE_DLLCHARACTERISTICS_EX_CET_COMPAT, from build.rs.
+        assert_ne!(pe.dll_characteristics_ex & 0x01, 0, "CET shadow stack compatibility is off");
     }
 
     #[test]

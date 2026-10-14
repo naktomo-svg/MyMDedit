@@ -206,8 +206,30 @@ pub struct OpenedDocument {
     pub format: DocumentFormat,
 }
 
+/// The largest document `read` accepts. Far past anything the editor handles well (and
+/// the preview stops at ~2MB anyway), but small enough that reading, decoding and the
+/// editor's UTF-16 copy cannot exhaust memory — an allocation failure aborts the
+/// process, with no panic and no crash log.
+pub const MAX_DOCUMENT_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Reads the whole file, or fails with `FileTooLarge` past `max` bytes. Counts what is
+/// actually read rather than trusting the file's reported length, which can grow while
+/// it is read (or be meaningless, as for a device or a pipe).
+pub fn read_at_most(path: &Path, max: u64) -> io::Result<Vec<u8>> {
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    fs::File::open(path)?.take(max + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > max {
+        return Err(io::Error::new(
+            io::ErrorKind::FileTooLarge,
+            format!("ファイルが大きすぎるため開けません（上限は {} MB です）。ファイルは変更していません。", max / (1024 * 1024)),
+        ));
+    }
+    Ok(bytes)
+}
+
 pub fn read(path: &Path) -> Result<OpenedDocument, ReadError> {
-    let bytes = fs::read(path).map_err(ReadError::Io)?;
+    let bytes = read_at_most(path, MAX_DOCUMENT_BYTES).map_err(ReadError::Io)?;
     let (content, format) = decode(&bytes).inspect_err(|e| {
         if !matches!(e, ReadError::Io(_)) {
             log::error(&format!("read({})", path.display()), e);
@@ -405,6 +427,18 @@ mod tests {
         swap_into_place(&full, &temp, &backup, &ops).unwrap();
         assert_eq!(fs::read_to_string(&full).unwrap(), "new");
         assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn reads_are_capped() {
+        let dir = temp_dir();
+        let path = dir.join("big.md");
+        fs::write(&path, vec![b'a'; 11]).unwrap();
+        assert_eq!(read_at_most(&path, 11).unwrap().len(), 11);
+        let e = read_at_most(&path, 10).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::FileTooLarge);
+        assert!(e.to_string().contains("大きすぎる"));
         fs::remove_dir_all(&dir).unwrap();
     }
 

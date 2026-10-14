@@ -23,6 +23,9 @@ pub mod limits {
     pub const MAX_FONT_SIZE: f64 = 48.0;
     pub const CUSTOM_COLOR_COUNT: usize = 16;
     pub const RECENT_FOLDER_COUNT: usize = 3;
+    /// A real settings file is well under 4KB. The file is writable from outside the
+    /// app, and one too big to read would abort every launch, not just this one.
+    pub const MAX_FILE_BYTES: u64 = 1024 * 1024;
 
     pub fn clamp_font_size(v: f64) -> f64 {
         if v.is_nan() { MIN_FONT_SIZE } else { v.clamp(MIN_FONT_SIZE, MAX_FONT_SIZE) }
@@ -289,13 +292,15 @@ impl SettingsStore {
 
 /// What is on disk right now. `Ok(None)` = no file yet.
 fn read_disk(path: &Path) -> std::io::Result<Option<Parsed>> {
-    match std::fs::read(path) {
+    match document::read_at_most(path, limits::MAX_FILE_BYTES) {
         Ok(bytes) => Ok(Some(match String::from_utf8(bytes) {
             Ok(text) => parse_settings(&text),
             // Lossy decoding would parse fine and write U+FFFD back on the next save.
             Err(_) => Parsed::Unreadable("設定ファイルが UTF-8 ではありません".into()),
         })),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        // Handled like any other unreadable file: set aside, defaults used.
+        Err(e) if e.kind() == std::io::ErrorKind::FileTooLarge => Ok(Some(Parsed::Unreadable("設定ファイルが大きすぎます".into()))),
         Err(e) => Err(e),
     }
 }
@@ -404,6 +409,17 @@ mod tests {
         let backups: Vec<_> = std::fs::read_dir(&dir).unwrap().filter_map(|e| e.ok()).filter(|e| e.file_name().to_string_lossy().starts_with("settings.broken-")).collect();
         assert_eq!(backups.len(), 1);
         assert_eq!(std::fs::read_to_string(backups[0].path()).unwrap(), "{\"theme\": \"Dark\",}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn oversized_file_is_set_aside_not_read() {
+        let dir = test_dir("oversized");
+        let path = dir.join("settings.json");
+        std::fs::write(&path, vec![b' '; limits::MAX_FILE_BYTES as usize + 1]).unwrap();
+        let mut store = SettingsStore::open(Some(path.clone()));
+        assert!(store.take_load_warning().is_some_and(|w| w.contains("settings.broken-")));
+        assert_eq!(store.current(), &AppSettings::default());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

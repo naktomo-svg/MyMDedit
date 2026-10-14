@@ -8,4 +8,7 @@ fn main() {
     // look for them in System32 only, never in the exe's folder (audit F9). Passed to
     // every target, tests included, so a unit test can check the flag landed.
     println!("cargo:rustc-link-arg=/DEPENDENTLOADFLAG:0x800");
+    // Hardware-enforced shadow stack where the CPU supports it (audit F10): a return
+    // address overwritten on the stack ends the process instead of redirecting it.
+    println!("cargo:rustc-link-arg=/CETCOMPAT");
 }

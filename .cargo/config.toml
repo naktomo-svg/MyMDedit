@@ -1,6 +1,11 @@
 # Link the C runtime statically. The exe is meant to run on its own (README), and a
 # dynamically linked VCRUNTIME140.dll is both a missing dependency on machines without
 # the VC++ redistributable and a DLL the loader would otherwise go looking for next to
-# the exe (audit F9, F11). `main.rs`'s tests check the result.
+# the exe (audit F9, F11).
+#
+# Control Flow Guard (audit F10): the code is heavy on `unsafe`, COM vtables and
+# callbacks, so an indirect call through a corrupted pointer is the likely shape of an
+# exploit. The standard library itself is not CFG-instrumented; this covers our code
+# and the crates'. `main.rs`'s tests check both settings in the built binary.
 [target.'cfg(target_env = "msvc")']
-rustflags = ["-C", "target-feature=+crt-static"]
+rustflags = ["-C", "target-feature=+crt-static", "-C", "control-flow-guard"]
