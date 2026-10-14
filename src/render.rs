@@ -1,9 +1,9 @@
 //! Markdown → a complete HTML document for the preview.
 //!
-//! Raw HTML in the Markdown is passed through (not sanitized). Execution and outbound
-//! traffic are shut off in three layers instead, because opening a third party's `.md`
-//! is a real path: the CSP below, `IsScriptEnabled = false`, and the navigation guard
-//! in `preview.rs`.
+//! Raw HTML in the Markdown is passed through, minus the elements in `FETCHING_TAGS`.
+//! Execution and outbound traffic are shut off in three layers instead, because opening
+//! a third party's `.md` is a real path: the CSP below, `IsScriptEnabled = false`, and
+//! the handlers in `preview.rs`.
 
 use comrak::{Options, markdown_to_html};
 
@@ -31,10 +31,45 @@ fn options() -> Options<'static> {
 }
 
 pub fn to_html_document(markdown: &str, settings: &AppSettings) -> String {
-    let body = markdown_to_html(markdown, &options());
+    let body = filter_fetching_tags(&markdown_to_html(markdown, &options()));
     // Assembled in one pass: substituting into a template would re-scan what was
     // already substituted, so a setting containing a marker could duplicate the body.
     [HTML_HEAD, &build_css(settings), HTML_MIDDLE, &body, HTML_TAIL].concat()
+}
+
+/// Elements whose only effect in the preview is to fetch or connect. Security: the
+/// runtime layers only see *requests*, and these also act without one — `<link
+/// rel=dns-prefetch/preconnect>` resolves and connects to any host, `<iframe src>`
+/// opens a connection before FrameNavigationStarting can cancel it (both observed in
+/// the 2026-10-14 audit, F8). The content is the only place they can be stopped.
+const FETCHING_TAGS: [&str; 10] =
+    ["base", "embed", "fencedframe", "frame", "frameset", "iframe", "link", "meta", "object", "portal"];
+
+/// GFM's tagfilter, over `FETCHING_TAGS`: the `<` of such a tag becomes `&lt;`, so it
+/// shows as text instead of becoming an element. Safe to run over the whole rendered
+/// body: comrak escapes every `<` of Markdown text, so a literal `<tag` can only come
+/// from raw HTML.
+fn filter_fetching_tags(html: &str) -> String {
+    let bytes = html.as_bytes();
+    let mut out = String::with_capacity(html.len());
+    let mut copied = 0;
+    for (i, _) in html.match_indices('<') {
+        let name_start = i + 1 + usize::from(bytes.get(i + 1) == Some(&b'/'));
+        let fetching = FETCHING_TAGS.iter().any(|tag| {
+            let end = name_start + tag.len();
+            bytes.get(name_start..end).is_some_and(|name| name.eq_ignore_ascii_case(tag.as_bytes()))
+                // Where the HTML tokenizer ends a tag name; anything else is a different
+                // (unknown, harmless) element such as <linkx>.
+                && bytes.get(end).is_none_or(|b| matches!(b, b'\t' | b'\n' | b'\x0c' | b'\r' | b' ' | b'/' | b'>'))
+        });
+        if fetching {
+            out.push_str(&html[copied..i]);
+            out.push_str("&lt;");
+            copied = i + 1;
+        }
+    }
+    out.push_str(&html[copied..]);
+    out
 }
 
 fn build_css(settings: &AppSettings) -> String {
@@ -160,6 +195,34 @@ mod tests {
     fn font_family_cannot_break_out_of_style() {
         assert_eq!(format_css_font_family("a</style><img src=x>, Segoe UI, serif"), "\"Segoe UI\", serif");
         assert_eq!(format_css_font_family("A\"B"), "\"A\\\"B\"");
+    }
+
+    #[test]
+    fn fetching_tags_render_as_text() {
+        let md = "<link rel=\"preconnect\" href=\"https://evil/\">\n\n\
+                  <IFRAME\tsrc=\"https://evil/\"></iframe>\n\n\
+                  text <meta http-equiv=\"refresh\" content=\"0;url=http://evil/\"> <base/href=\"https://evil/\">";
+        let html = to_html_document(md, &AppSettings::default());
+        let body = &html[html.find("<body>").unwrap()..];
+        for tag in ["<link", "<iframe", "<IFRAME", "</iframe", "<meta", "<base"] {
+            assert!(!body.contains(tag), "{tag} survived: {body}");
+        }
+        assert!(body.contains("&lt;link rel"), "{body}");
+        // The app's own CSP <meta> sits in the head, outside the filter.
+        assert!(html.contains("<meta http-equiv=\"Content-Security-Policy\""));
+    }
+
+    #[test]
+    fn harmless_html_is_untouched() {
+        let md = "<details><summary>s</summary>x</details>\n\n<img src=\"https://example.com/a.png\"> <linkx> <a href=\"#m\">metadata</a>";
+        let html = to_html_document(md, &AppSettings::default());
+        for kept in ["<details>", "<img src=\"https://example.com/a.png\">", "<linkx>", "<a href=\"#m\">metadata</a>"] {
+            assert!(html.contains(kept), "{kept} lost: {html}");
+        }
+        // Markdown text is already escaped by comrak and must not be double-escaped.
+        assert!(to_html_document("a < link", &AppSettings::default()).contains("a &lt; link"));
+        assert_eq!(filter_fetching_tags("日本語<link>"), "日本語&lt;link>");
+        assert_eq!(filter_fetching_tags("<"), "<");
     }
 
     #[test]
