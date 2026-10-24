@@ -5,7 +5,8 @@
 //! a third party's `.md` is a real path: the CSP below, `IsScriptEnabled = false`, and
 //! the handlers in `preview.rs`.
 
-use comrak::{Options, markdown_to_html};
+use comrak::nodes::{AstNode, NodeHtmlBlock, NodeValue};
+use comrak::{Arena, Options, format_html, parse_document};
 
 use crate::settings::{AppSettings, Theme, is_hex_color};
 
@@ -30,11 +31,78 @@ fn options() -> Options<'static> {
     o
 }
 
-pub fn to_html_document(markdown: &str, settings: &AppSettings) -> String {
-    let body = filter_fetching_tags(&markdown_to_html(markdown, &options()));
+/// A rendered preview page and the text its copy buttons hand out, by index.
+pub struct Rendered {
+    pub html: String,
+    pub code_blocks: Vec<String>,
+}
+
+/// `copy_token` goes into every copy button's link (`copy_link`) and must be unguessable
+/// for the document: it is what keeps raw HTML in the Markdown from forging a button.
+pub fn to_html_document(markdown: &str, settings: &AppSettings, copy_token: u64) -> Rendered {
+    let options = options();
+    let arena = Arena::new();
+    let root = parse_document(&arena, markdown, &options);
+    let code_blocks = add_copy_buttons(&arena, root, copy_token);
+    let mut html = String::new();
+    // Writing into a String cannot fail.
+    let _ = format_html(root, &options, &mut html);
+    let body = filter_fetching_tags(&html);
     // Assembled in one pass: substituting into a template would re-scan what was
     // already substituted, so a setting containing a marker could duplicate the body.
-    [HTML_HEAD, &build_css(settings), HTML_MIDDLE, &body, HTML_TAIL].concat()
+    Rendered { html: [HTML_HEAD, &build_css(settings), HTML_MIDDLE, &body, HTML_TAIL].concat(), code_blocks }
+}
+
+/// The scheme of a copy button's link. Not a network scheme, so the request filter has
+/// nothing to stop; the NavigationStarting handler always cancels it (`preview.rs`).
+const COPY_SCHEME: &str = "mymdedit-copy:";
+
+fn copy_link(token: u64, index: usize) -> String {
+    format!("{COPY_SCHEME}{token:016x}/{index}")
+}
+
+/// The code block a copy link names, if `uri` is one carrying `token`. A link with any
+/// other token was not written by this render — forged by the document, or left over
+/// from a page that has since been replaced — and names nothing.
+pub fn parse_copy_link(uri: &str, token: u64) -> Option<usize> {
+    let rest = uri.get(COPY_SCHEME.len()..).filter(|_| is_copy_link(uri))?;
+    let (t, index) = rest.split_once('/')?;
+    (u64::from_str_radix(t, 16).ok()? == token).then_some(())?;
+    index.parse().ok()
+}
+
+/// Whether `uri` uses the copy scheme at all, whatever it names.
+pub fn is_copy_link(uri: &str) -> bool {
+    // Compared as bytes for the reason `preview::uses_blocked_scheme` gives.
+    uri.as_bytes().get(..COPY_SCHEME.len()).is_some_and(|p| p.eq_ignore_ascii_case(COPY_SCHEME.as_bytes()))
+}
+
+/// Wraps every code block in a box with a copy button and returns the blocks' text, in
+/// the order of the buttons' indexes. Done on the AST, not the HTML: raw HTML can hold
+/// `<pre>` too, and counting those would shift every index after it.
+fn add_copy_buttons<'a>(arena: &'a Arena<'a>, root: &'a AstNode<'a>, token: u64) -> Vec<String> {
+    let blocks: Vec<_> =
+        root.descendants().filter(|n| matches!(n.data.borrow().value, NodeValue::CodeBlock(_))).collect();
+    let html_block =
+        |literal: String| arena.alloc(NodeValue::HtmlBlock(NodeHtmlBlock { block_type: 6, literal }).into());
+    let mut texts = Vec::with_capacity(blocks.len());
+    for (index, node) in blocks.into_iter().enumerate() {
+        let NodeValue::CodeBlock(ref code) = node.data.borrow().value else { unreachable!() };
+        texts.push(clipboard_text(&code.literal));
+        node.insert_before(html_block(format!(
+            "<div class=\"code-block\"><a class=\"copy\" href=\"{}\"><span>コピー</span></a>\n",
+            copy_link(token, index)
+        )));
+        node.insert_after(html_block("</div>\n".to_string()));
+    }
+    texts
+}
+
+/// A code block's text as it goes on the clipboard: CRLF line breaks, which every
+/// Windows program pastes correctly, and without the line break that ends the block.
+fn clipboard_text(literal: &str) -> String {
+    let body = literal.strip_suffix("\r\n").or_else(|| literal.strip_suffix(['\n', '\r'])).unwrap_or(literal);
+    body.replace("\r\n", "\n").replace('\r', "\n").replace('\n', "\r\n")
 }
 
 /// Elements whose only effect in the preview is to fetch or connect. Security: the
@@ -163,6 +231,18 @@ h2 { font-size: 1.5em; border-bottom: 1px solid rgba(128,128,128,0.2); padding-b
 code { font-family: Consolas, 'Cascadia Mono', monospace; background: rgba(128,128,128,0.15); padding: 0.15em 0.35em; border-radius: 4px; }
 pre { background: rgba(128,128,128,0.15); padding: 12px; border-radius: 6px; overflow-x: auto; }
 pre code { background: none; padding: 0; }
+.code-block { position: relative; }
+.code-block .copy {
+    position: absolute; top: 6px; right: 6px; opacity: 0;
+    font: 12px 'Segoe UI', sans-serif; color: inherit; text-decoration: none; user-select: none;
+    background: rgba(128,128,128,0.25); border: 1px solid rgba(128,128,128,0.4); border-radius: 4px; padding: 2px 8px;
+}
+.code-block:hover .copy, .code-block .copy:focus { opacity: 1; }
+.code-block .copy:hover { background: rgba(128,128,128,0.4); }
+/* Scripts are off, so this is the only feedback: a click focuses the link without
+   :focus-visible, which Tab does not. */
+.code-block .copy:focus:not(:focus-visible) span { display: none; }
+.code-block .copy:focus:not(:focus-visible)::after { content: "コピーしました"; }
 blockquote { border-left: 4px solid rgba(128,128,128,0.4); margin: 0.5em 0; padding: 0.2em 1em; color: rgba(128,128,128,1); }
 table { border-collapse: collapse; margin: 0.5em 0; }
 table th, table td { border: 1px solid rgba(128,128,128,0.3); padding: 6px 12px; }
@@ -185,13 +265,13 @@ mod tests {
 
     #[test]
     fn cjk_emphasis_renders_bold() {
-        let html = to_html_document("**注意：**内容", &AppSettings::default());
+        let html = to_html_document("**注意：**内容", &AppSettings::default(), 0).html;
         assert!(html.contains("<strong>注意：</strong>内容"), "{html}");
     }
 
     #[test]
     fn gfm_extensions() {
-        let html = to_html_document("|a|b|\n|-|-|\n|1|2|\n\n~~x~~", &AppSettings::default());
+        let html = to_html_document("|a|b|\n|-|-|\n|1|2|\n\n~~x~~", &AppSettings::default(), 0).html;
         assert!(html.contains("<table>"));
         assert!(html.contains("<del>x</del>"));
     }
@@ -207,7 +287,7 @@ mod tests {
         let md = "<link rel=\"preconnect\" href=\"https://evil/\">\n\n\
                   <IFRAME\tsrc=\"https://evil/\"></iframe>\n\n\
                   text <meta http-equiv=\"refresh\" content=\"0;url=http://evil/\"> <base/href=\"https://evil/\">";
-        let html = to_html_document(md, &AppSettings::default());
+        let html = to_html_document(md, &AppSettings::default(), 0).html;
         let body = &html[html.find("<body>").unwrap()..];
         for tag in ["<link", "<iframe", "<IFRAME", "</iframe", "<meta", "<base"] {
             assert!(!body.contains(tag), "{tag} survived: {body}");
@@ -220,12 +300,12 @@ mod tests {
     #[test]
     fn harmless_html_is_untouched() {
         let md = "<details><summary>s</summary>x</details>\n\n<img src=\"https://example.com/a.png\"> <linkx> <a href=\"#m\">metadata</a>";
-        let html = to_html_document(md, &AppSettings::default());
+        let html = to_html_document(md, &AppSettings::default(), 0).html;
         for kept in ["<details>", "<img src=\"https://example.com/a.png\">", "<linkx>", "<a href=\"#m\">metadata</a>"] {
             assert!(html.contains(kept), "{kept} lost: {html}");
         }
         // Markdown text is already escaped by comrak and must not be double-escaped.
-        assert!(to_html_document("a < link", &AppSettings::default()).contains("a &lt; link"));
+        assert!(to_html_document("a < link", &AppSettings::default(), 0).html.contains("a &lt; link"));
         assert_eq!(filter_fetching_tags("日本語<link>"), "日本語&lt;link>");
         assert_eq!(filter_fetching_tags("<"), "<");
     }
@@ -243,26 +323,58 @@ mod tests {
     #[test]
     fn invalid_background_is_not_emitted() {
         let s = AppSettings { preview_background_color: Some("red;}".into()), ..AppSettings::default() };
-        assert!(!to_html_document("", &s).contains("red;}"));
+        assert!(!to_html_document("", &s, 0).html.contains("red;}"));
     }
 
     #[test]
     fn css_cannot_inject_template_markers() {
         let s = AppSettings { preview_font_family: "__BODY__".into(), ..AppSettings::default() };
-        let html = to_html_document("unique-body-text", &s);
+        let html = to_html_document("unique-body-text", &s, 0).html;
         assert_eq!(html.matches("unique-body-text").count(), 1);
     }
 
     #[test]
     fn system_theme_wraps_the_same_dark_palette_in_a_media_query() {
-        let html = to_html_document("", &AppSettings::default());
+        let html = to_html_document("", &AppSettings::default(), 0).html;
         assert!(html.contains("@media (prefers-color-scheme: dark)"));
         assert!(html.contains("background: #1e1e1e"));
     }
 
     #[test]
+    fn code_blocks_get_copy_buttons_in_order() {
+        let md = "<pre>raw</pre>\n\n```rust\nfn a() {}\r\nb\n```\n\n- item\n\n      indented\n";
+        let r = to_html_document(md, &AppSettings::default(), 0xab);
+        assert_eq!(r.code_blocks, ["fn a() {}\r\nb", "indented"]);
+        for i in 0..2 {
+            assert!(r.html.contains(&format!("href=\"mymdedit-copy:00000000000000ab/{i}\"")), "{}", r.html);
+        }
+        assert_eq!(r.html.matches("<div class=\"code-block\">").count(), 2);
+        assert_eq!(r.html.matches("<div").count(), r.html.matches("</div>").count());
+    }
+
+    #[test]
+    fn copy_links_only_name_blocks_of_this_render() {
+        assert_eq!(parse_copy_link(&copy_link(7, 3), 7), Some(3));
+        assert_eq!(parse_copy_link("MYMDEDIT-COPY:0000000000000007/3", 7), Some(3));
+        assert_eq!(parse_copy_link(&copy_link(8, 3), 7), None);
+        for bad in ["mymdedit-copy:", "mymdedit-copy:7", "mymdedit-copy:7/x", "mymdedit-copy:日本/1", "mymdedit-cop"]
+        {
+            assert_eq!(parse_copy_link(bad, 7), None, "{bad}");
+        }
+        assert!(is_copy_link("mymdedit-copy:x") && !is_copy_link("https://x") && !is_copy_link("日本語"));
+    }
+
+    #[test]
+    fn clipboard_text_uses_crlf_without_the_final_break() {
+        assert_eq!(clipboard_text("a\nb\n"), "a\r\nb");
+        assert_eq!(clipboard_text("a\rb\r"), "a\r\nb");
+        assert_eq!(clipboard_text("a\r\n\r\n"), "a\r\n");
+        assert_eq!(clipboard_text(""), "");
+    }
+
+    #[test]
     fn striping_starts_on_even_rows_with_gray_header() {
         let s = AppSettings { table_header_gray_background: true, table_row_striping: true, ..AppSettings::default() };
-        assert!(to_html_document("", &s).contains("nth-child(even)"));
+        assert!(to_html_document("", &s, 0).html.contains("nth-child(even)"));
     }
 }

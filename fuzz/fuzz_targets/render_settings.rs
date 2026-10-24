@@ -15,11 +15,11 @@ fuzz_target!(|data: &[u8]| {
         preview_background_color: Some(color.to_string()),
         ..AppSettings::default()
     };
-    let html = render::to_html_document("x", &settings);
+    let html = render::to_html_document("x", &settings, 0).html;
     let style = &html[html.find("<style>").unwrap() + 1..html.find("</style>").unwrap()];
     assert!(!style.contains('<'), "markup inside <style>: {s:?}");
     assert_eq!(html.matches("</style").count(), 1, "<style> closed early: {s:?}");
     // A valid color adds exactly one rule; nothing else may add any.
-    let base = render::to_html_document("x", &AppSettings::default());
+    let base = render::to_html_document("x", &AppSettings::default(), 0).html;
     assert!(css_blocks(&html) <= css_blocks(&base) + 1, "extra CSS rule: {s:?}");
 });

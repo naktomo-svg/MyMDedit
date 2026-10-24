@@ -257,6 +257,10 @@ pub struct State {
     errors: Vec<String>,
     palette: Palette,
     html: String,
+    /// What the preview's copy buttons copy, by index, and the token their links carry
+    /// (`render::parse_copy_link`).
+    code_blocks: Vec<String>,
+    copy_token: u64,
     lines: usize,
     chars: usize,
     scroll_ratio: f64,
@@ -354,6 +358,8 @@ pub fn run(launch_file: Option<PathBuf>) -> windows::core::Result<()> {
             errors: Vec::new(),
             palette: Palette::new(dark),
             html: String::new(),
+            code_blocks: Vec::new(),
+            copy_token: 0,
             lines: 1,
             chars: 0,
             scroll_ratio: 0.0,
@@ -1012,12 +1018,17 @@ impl App {
     fn rerender(&self) {
         let text = self.editor().text();
         let markdown = String::from_utf16_lossy(&text);
-        let html = render::to_html_document(&markdown, self.state.borrow().settings.current());
+        // A fresh token per render: the document cannot learn it, so it cannot forge a
+        // copy button, and a click on a page already replaced names nothing.
+        let copy_token = document::random_u64();
+        let rendered = render::to_html_document(&markdown, self.state.borrow().settings.current(), copy_token);
         {
             let mut st = self.state.borrow_mut();
             st.lines = line_endings::count_lines(&text);
             st.chars = text.len();
-            st.html = html;
+            st.html = rendered.html;
+            st.code_blocks = rendered.code_blocks;
+            st.copy_token = copy_token;
         }
         self.invalidate_footer();
         self.refresh_preview();
@@ -1026,6 +1037,21 @@ impl App {
     pub fn refresh_preview(&self) {
         let html = self.state.borrow().html.clone();
         preview::navigate(self, &html);
+    }
+
+    /// A copy button in the preview was clicked: `uri` is its link.
+    pub fn copy_code_block(&self, uri: &str) {
+        let text = {
+            let st = self.state.borrow();
+            render::parse_copy_link(uri, st.copy_token).and_then(|i| st.code_blocks.get(i).cloned())
+        };
+        let Some(text) = text else {
+            log::error("PreviewCopyIgnored", "copy link does not name a code block of the current render");
+            return;
+        };
+        if let Err(e) = win::set_clipboard_text(self.hwnd(), &text) {
+            self.report_error("CopyCodeBlock", "コードをクリップボードにコピーできませんでした。", Some(&e));
+        }
     }
 
     pub fn view_state(&self) -> (i32, f64) {

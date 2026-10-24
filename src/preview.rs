@@ -15,6 +15,9 @@
 //! all and have their own handlers.
 //!
 //! The preview is never loaded before all of these are in place (`ready`).
+//!
+//! Code blocks' copy buttons are links on `render`'s own scheme; NavigationStarting
+//! copies on the app's side and always cancels them (`allow_navigation`).
 
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, RECT, WPARAM};
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_CONTROL, VK_SHIFT};
@@ -43,6 +46,7 @@ use webview2_com::{
 
 use crate::app::{App, app};
 use crate::log;
+use crate::render;
 
 #[derive(Default)]
 pub struct Preview {
@@ -228,6 +232,13 @@ fn allow_navigation(args: &ICoreWebView2NavigationStartingEventArgs) -> windows:
     }
     let uri = take_pwstr(uri);
     let app = app();
+    // A code block's copy button. Never a navigation, and decided before the counter so
+    // a click cannot consume the permission of a render in flight. No borrow is held:
+    // copying can put up the error banner.
+    if render::is_copy_link(&uri) {
+        app.copy_code_block(&uri);
+        return Ok(false);
+    }
     let mut p = app.preview.borrow_mut();
     if !navigation_allowed(p.pending_self, &uri) {
         log::error("PreviewNavigationBlocked", format!("blocked navigation to {}", describe_uri(&uri)));

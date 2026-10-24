@@ -106,7 +106,8 @@ mod tests {
         assert!(is_contained_font_family("\"Segoe UI\", sans-serif, \"a\\\"{\""));
         assert_eq!(css_blocks("a { x: \"{\" } b{}"), 2);
         // The real pipeline: a fetching tag in raw HTML is neutralised.
-        let html = render::to_html_document("<link rel=preconnect href=https://x>", &settings::AppSettings::default());
+        let html =
+            render::to_html_document("<link rel=preconnect href=https://x>", &settings::AppSettings::default(), 0).html;
         assert!(!tag_names(&html).iter().any(|n| n == "link"));
     }
 }

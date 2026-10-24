@@ -398,7 +398,7 @@ fn move_file(from: &Path, to: &Path, overwrite: bool) -> io::Result<()> {
         .map_err(|e| io::Error::from_raw_os_error(e.code().0 & 0xFFFF))
 }
 
-fn random_u64() -> u64 {
+pub fn random_u64() -> u64 {
     use std::hash::{BuildHasher, Hasher};
     let mut h = std::collections::hash_map::RandomState::new().build_hasher();
     h.write_u128(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0));

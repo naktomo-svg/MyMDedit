@@ -1,10 +1,13 @@
 //! Small Win32 helpers shared by the windows of this app.
 
-use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, RECT, WPARAM};
+use windows::Win32::Foundation::{COLORREF, GlobalFree, HANDLE, HWND, LPARAM, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     CLEARTYPE_QUALITY, CreateFontIndirectW, CreateFontW, DEFAULT_CHARSET, DeleteObject, FW_BOLD, FW_NORMAL, HFONT,
     HGDIOBJ, LOGFONTW, OUT_DEFAULT_PRECIS,
 };
+use windows::Win32::System::DataExchange::{CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData};
+use windows::Win32::System::Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock};
+use windows::Win32::System::Ole::CF_UNICODETEXT;
 use windows::Win32::UI::HiDpi::{GetDpiForWindow, SystemParametersInfoForDpi};
 use windows::Win32::UI::WindowsAndMessaging::{
     GetWindowTextLengthW, GetWindowTextW, NONCLIENTMETRICSW, SPI_GETNONCLIENTMETRICS,
@@ -127,6 +130,34 @@ pub fn group_thousands(n: usize) -> String {
         out.push(c);
     }
     out
+}
+
+/// Puts `text` on the clipboard as CF_UNICODETEXT, owned by `hwnd`.
+pub fn set_clipboard_text(hwnd: HWND, text: &str) -> windows::core::Result<()> {
+    let units = wide(text);
+    unsafe {
+        OpenClipboard(Some(hwnd))?;
+        let result = (|| {
+            EmptyClipboard()?;
+            let memory = GlobalAlloc(GMEM_MOVEABLE, units.len() * size_of::<u16>())?;
+            let target = GlobalLock(memory).cast::<u16>();
+            if target.is_null() {
+                let e = windows::core::Error::from_thread();
+                let _ = GlobalFree(Some(memory));
+                return Err(e);
+            }
+            std::ptr::copy_nonoverlapping(units.as_ptr(), target, units.len());
+            let _ = GlobalUnlock(memory);
+            // On success the clipboard owns the memory; on failure it is still ours.
+            if let Err(e) = SetClipboardData(CF_UNICODETEXT.0.into(), Some(HANDLE(memory.0))) {
+                let _ = GlobalFree(Some(memory));
+                return Err(e);
+            }
+            Ok(())
+        })();
+        let _ = CloseClipboard();
+        result
+    }
 }
 
 pub fn loword(v: usize) -> u16 {

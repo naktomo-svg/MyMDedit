@@ -30,6 +30,7 @@ $cases = [ordered]@{
                              stderr = @('PreviewNavigationBlocked') }
     'local-leak'        = @{ clicks = @('CLICKPLAIN', 'CLICKHTTPS'); listener = $true }
     'unc-leak'          = @{ clicks = @('UNCFILE31', 'UNCBS32', 'MDLINK33', 'SEARCHMS34', 'MSWORD35'); tcpRequire = '192.0.2.25' }
+    'copy-link'         = @{ clicks = @('COPYFORGED', 'COPYHOST', 'COPYBLANK'); stderr = @('PreviewCopyIgnored', 'PreviewNewWindowBlocked') }
 }
 # Apps a blocked link would have started.
 $launchWatch = 'SystemSettings', 'olk', 'OUTLOOK', 'HxOutlook', 'WINWORD', 'SearchApp', 'notepad', 'CalculatorApp'
