@@ -4,7 +4,7 @@ Windows向けのシンプルなMarkdownエディタです。左側でMarkdownを
 
 Win32 API（`windows`クレート）とWebView2で作った、単一の`.exe`だけで動くネイティブアプリです。.NETランタイムやVC++ランタイム、MSIXのインストールは要りません（必要なのはWebView2ランタイムだけです）。
 
-移植元は、同じ作者によるWinUI 3製のMarkdownエディタ「MyWinApp」です（非公開・開発終了）。動作の基準にしているMyWinAppの仕様書を[`docs/spec.md`](docs/spec.md)に収録しています。
+移植元は、同じ作者によるWinUI 3製のMarkdownエディタ「MyWinApp」です（非公開・開発終了）。機能の詳しい仕様は[`docs/spec.md`](docs/spec.md)にまとめてあります。
 
 ## 主な機能
 
@@ -109,7 +109,7 @@ src/
 ├── win.rs              Win32の小さなヘルパー
 └── log.rs              エラーの記録先（OutputDebugString）
 res/                    アイコンとアプリケーションマニフェスト
-docs/spec.md            移植元（MyWinApp）の仕様書
+docs/spec.md            仕様書
 fuzz/                   純粋ロジックのファズテスト（cargo-fuzz）
 tests/security/         プレビューのセキュリティ回帰テスト（攻撃用ペイロードと検査ツール。Pythonが必要）
 scripts/                技術負債レポートの生成スクリプト

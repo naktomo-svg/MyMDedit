@@ -2,7 +2,7 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-MyMDedit is a Rust port of the WinUI 3 Markdown editor MyWinApp (not public, no longer maintained): a single-window Win32 app with a RichEdit editor on the left and a WebView2 HTML preview on the right. MyWinApp's spec, copied as `docs/spec.md`, is the behavioural spec this port follows; `README.md` lists where the two deliberately differ.
+MyMDedit is a Rust port of the WinUI 3 Markdown editor MyWinApp (not public, no longer maintained): a single-window Win32 app with a RichEdit editor on the left and a WebView2 HTML preview on the right. `docs/spec.md` is this app's behavioural spec (rewritten from MyWinApp's for the current implementation) — update it with any user-visible change; `README.md` lists where MyMDedit deliberately differs from MyWinApp.
 
 ## Commands
 
