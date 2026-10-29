@@ -26,8 +26,13 @@ jobs:
         working-directory: fuzz
 
   deny:
-    # cargo-deny-action runs in a Linux container; the policy itself is target-independent.
+    # Dependency policy and notices. cargo-deny-action runs in a Linux container; the policy itself is target-independent.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
       - uses: EmbarkStudios/cargo-deny-action@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-about
+      # THIRD-PARTY-NOTICES.txt ships in the release zip; it must match Cargo.lock.
+      - run: cargo about generate about.hbs -o THIRD-PARTY-NOTICES.txt && git diff --exit-code THIRD-PARTY-NOTICES.txt

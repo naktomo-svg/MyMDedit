@@ -34,6 +34,16 @@ Win32 API（`windows`クレート）とWebView2で作った、単一の`.exe`だ
 - Windows 10 バージョン1809以降 / Windows 11（x64）
 - [WebView2 ランタイム](https://developer.microsoft.com/microsoft-edge/webview2/)（多くの環境には最初から入っています）
 
+## ダウンロード
+
+[Releases](https://github.com/naktomo-svg/MyMDedit/releases)から`MyMDedit-vX.Y.Z-x64.zip`をダウンロードし、展開した`MyMDedit.exe`を実行してください。インストールは不要です（設定などの保存場所は後述）。
+
+exeにはコード署名をしていないため、初回の起動時にMicrosoft Defender SmartScreenの警告（「WindowsによってPCが保護されました」）が出ることがあります。その場合は「詳細情報」→「実行」で起動できます。気になる場合は、zipと一緒に置いてある`.sha256`でファイルが改変されていないことを確かめるか、下記の手順でソースからビルドしてください。
+
+```powershell
+(Get-FileHash .\MyMDedit-vX.Y.Z-x64.zip -Algorithm SHA256).Hash   # .sha256 の値と比べる
+```
+
 ## ビルド・実行
 
 ```powershell

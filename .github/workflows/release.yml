@@ -1,0 +1,36 @@
+# Push a tag vX.Y.Z (matching Cargo.toml's version) to build and publish a release.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Tag matches Cargo.toml
+        shell: pwsh
+        run: |
+          $version = (cargo metadata --no-deps --format-version 1 | ConvertFrom-Json).packages[0].version
+          if ("v$version" -ne $env:GITHUB_REF_NAME) { throw "tag $env:GITHUB_REF_NAME does not match Cargo.toml version $version" }
+      - run: cargo test
+      - run: cargo build --release
+      - name: Package
+        shell: pwsh
+        run: |
+          $name = "MyMDedit-$env:GITHUB_REF_NAME-x64"
+          New-Item -ItemType Directory $name | Out-Null
+          Copy-Item target\release\MyMDedit.exe, LICENSE, THIRD-PARTY-NOTICES.txt, README.md $name
+          Compress-Archive -Path "$name\*" -DestinationPath "$name.zip"
+          $hash = (Get-FileHash "$name.zip" -Algorithm SHA256).Hash.ToLower()
+          "$hash  $name.zip" | Set-Content -NoNewline "$name.zip.sha256"
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create $env:GITHUB_REF_NAME MyMDedit-$env:GITHUB_REF_NAME-x64.zip MyMDedit-$env:GITHUB_REF_NAME-x64.zip.sha256 --title "MyMDedit $env:GITHUB_REF_NAME" --generate-notes
