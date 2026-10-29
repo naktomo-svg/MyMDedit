@@ -1,0 +1,8 @@
+# cargo about generate about.hbs -o THIRD-PARTY-NOTICES.txt
+# Only what ends up in the exe: build-time crates (embed-resource) are not shipped.
+accepted = ["Apache-2.0", "BSD-2-Clause", "MIT", "Unicode-3.0", "Unicode-DFS-2016", "Unlicense", "Zlib"]
+targets = ["x86_64-pc-windows-msvc"]
+ignore-build-dependencies = true
+ignore-dev-dependencies = true
+# The app itself (publish = false) is under LICENSE, not a third party.
+private = { ignore = true }

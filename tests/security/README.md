@@ -1,10 +1,10 @@
 # プレビューの攻撃用ペイロード集
 
-`docs/security/2026-10-14-audit-plan.md`（第1回）と `2026-10-14-audit-plan-2.md`（第2回）の動的テスト用。
+プレビューのセキュリティ（CSP・`IsScriptEnabled = false`・`preview.rs` のハンドラー）の動的テスト用。
 外部への URL はすべて `*.mymdedit-canary.invalid`（名前解決できないホスト）を指す。通信が起きたかどうかは、
 WebView2 の netlog（`WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS=--log-net-log=…`）に、
 このホスト名が現れるかで判定する。SMB・WebDAV の試行は、どこにも届かない 192.0.2.0/24（TEST-NET-1）への
-TCP 接続として観測する。手順と結果は `docs/security/2026-10-14-dynamic-p1.md` と `2026-10-14-round2-results.md`。
+TCP 接続として観測する。
 
 ## まとめて流す
 

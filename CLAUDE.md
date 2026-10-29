@@ -2,7 +2,7 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-MyMDedit is a Rust port of the WinUI 3 Markdown editor MyWinApp (`../MyWinApp`): a single-window Win32 app with a RichEdit editor on the left and a WebView2 HTML preview on the right. MyWinApp's `docs/spec.md` is the behavioural spec this port follows; `README.md` lists where the two deliberately differ.
+MyMDedit is a Rust port of the WinUI 3 Markdown editor MyWinApp (not public, no longer maintained): a single-window Win32 app with a RichEdit editor on the left and a WebView2 HTML preview on the right. MyWinApp's spec, copied as `docs/spec.md`, is the behavioural spec this port follows; `README.md` lists where the two deliberately differ.
 
 ## Commands
 
@@ -15,6 +15,7 @@ cargo test                       # unit tests
 cargo clippy --all-targets       # lint
 cargo fmt                        # format (rustfmt.toml); run it in fuzz/ too — separate crate
 cargo deny check                 # dependency advisories, licenses, sources (deny.toml)
+cargo about generate about.hbs -o THIRD-PARTY-NOTICES.txt   # after any dependency change (cargo install cargo-about --features cli)
 .\target\debug\MyMDedit.exe [file.md]
 .\tests\security\tools\run-all.ps1   # preview security regression: every payload, PASS/FAIL (debug build, ~5 min)
 cargo +nightly fuzz run <target> -- -max_total_time=<s>   # fuzz/ ; targets: render_markdown render_settings document_decode md_ops search
@@ -65,4 +66,4 @@ Generating the AI tech-debt report (`scripts/Analyze-TechDebt.ps1`) has its own 
 
 - Before acting on a technical-debt, clippy or code-review finding (e.g. from `docs/tech-debt/`), invoke the `verify-then-fix` skill.
 - Before fixing a confirmed-real bug or tech-debt finding, invoke the `why5-and-horizontal-check` skill.
-- Security re-audit triggers (record results under `docs/security/`): bumping `webview2-com` or `comrak`; any change to a handler or setting in `preview.rs`; any new way content or a path enters the app (a new file source, drag-and-drop, clipboard format, IPC); a major WebView2 Runtime update. At minimum, run `run-all.ps1`, `cargo deny check` and the fuzz targets that cover the changed module.
+- Security re-audit triggers (record results in the commit message or PR description): bumping `webview2-com` or `comrak`; any change to a handler or setting in `preview.rs`; any new way content or a path enters the app (a new file source, drag-and-drop, clipboard format, IPC); a major WebView2 Runtime update. At minimum, run `run-all.ps1`, `cargo deny check` and the fuzz targets that cover the changed module.

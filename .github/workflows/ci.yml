@@ -1,0 +1,33 @@
+# The verification CLAUDE.md asks of every change.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - run: cargo build
+      # main.rs's test inspects the binary `cargo build` produced.
+      - run: cargo test
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo fmt --check
+      - run: cargo fmt --check
+        working-directory: fuzz
+
+  deny:
+    # cargo-deny-action runs in a Linux container; the policy itself is target-independent.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2

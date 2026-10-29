@@ -1,8 +1,10 @@
 # MyMDedit
 
-Windows向けのシンプルなMarkdownエディタです（MyWinAppのRust移植版）。左側でMarkdownを編集すると、右側にHTMLプレビューがリアルタイムに表示されます。
+Windows向けのシンプルなMarkdownエディタです。左側でMarkdownを編集すると、右側にHTMLプレビューがリアルタイムに表示されます。
 
 Win32 API（`windows`クレート）とWebView2で作った、単一の`.exe`だけで動くネイティブアプリです。.NETランタイムやVC++ランタイム、MSIXのインストールは要りません（必要なのはWebView2ランタイムだけです）。
+
+移植元は、同じ作者によるWinUI 3製のMarkdownエディタ「MyWinApp」です（非公開・開発終了）。動作の基準にしているMyWinAppの仕様書を[`docs/spec.md`](docs/spec.md)に収録しています。
 
 ## 主な機能
 
@@ -45,7 +47,7 @@ cargo test                               # 単体テスト
 
 ## 技術負債の検査
 
-AIレビュー（`claude`コマンド）とclippyを組み合わせて技術負債レポートを作ります。`docs/tech-debt/<日付>.md`と`latest.md`に出力されます。
+AIレビュー（`claude`コマンド）とclippyを組み合わせて技術負債レポートを作ります。`docs/tech-debt/<日付>.md`と`latest.md`に出力されます（リポジトリには含めません）。[Claude Code](https://claude.com/claude-code)の`claude`コマンドが必要です。
 
 ```powershell
 pwsh ./scripts/Analyze-TechDebt.ps1 -DryRun   # 対象ファイルの分け方とclippyの件数だけ確認（API呼び出しなし）
@@ -60,7 +62,7 @@ pwsh ./scripts/Analyze-TechDebt.ps1           # 実行（Opusを使うためAPI�
 - WebView2のデータ: `%LOCALAPPDATA%\MyMDedit\WebView2`
 - クラッシュ時の記録: `%LOCALAPPDATA%\MyMDedit\crash.log`
 
-## MyWinApp（WinUI 3版）との違い
+## 移植元（MyWinApp）との違い
 
 | 項目 | MyWinApp | MyMDedit |
 |---|---|---|
@@ -97,6 +99,15 @@ src/
 ├── win.rs              Win32の小さなヘルパー
 └── log.rs              エラーの記録先（OutputDebugString）
 res/                    アイコンとアプリケーションマニフェスト
+docs/spec.md            移植元（MyWinApp）の仕様書
+fuzz/                   純粋ロジックのファズテスト（cargo-fuzz）
+tests/security/         プレビューのセキュリティ回帰テスト（攻撃用ペイロードと検査ツール。Pythonが必要）
 scripts/                技術負債レポートの生成スクリプト
 .claude/skills/         技術負債への対応手順（Claude Code用スキル）
 ```
+
+## ライセンス
+
+[MIT License](LICENSE)（Copyright (c) 2026 あぽろ）
+
+`MyMDedit.exe`に含まれる第三者のソフトウェア（Rustのクレートと、静的リンクしているMicrosoft WebView2 SDKのローダー）のライセンスは[`THIRD-PARTY-NOTICES.txt`](THIRD-PARTY-NOTICES.txt)にまとめてあります。依存関係を変えたときは`cargo about generate about.hbs -o THIRD-PARTY-NOTICES.txt`で作り直してください。

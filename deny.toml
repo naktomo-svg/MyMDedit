@@ -15,8 +15,6 @@ allow = [
     "Unlicense",
     "Zlib",
 ]
-# The app itself has no license field and is never published.
-private = { ignore = true }
 
 [bans]
 # Two versions of one crate are worth knowing about but not a reason to fail.
