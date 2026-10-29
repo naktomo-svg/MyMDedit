@@ -113,6 +113,7 @@ docs/spec.md            仕様書
 fuzz/                   純粋ロジックのファズテスト（cargo-fuzz）
 tests/security/         プレビューのセキュリティ回帰テスト（攻撃用ペイロードと検査ツール。Pythonが必要）
 scripts/                技術負債レポートの生成スクリプト
+.github/workflows/      CI（ビルド・テスト・clippy・整形・依存関係の検査・ライセンス表記の確認）とリリース（タグでzipを作成）
 .claude/skills/         技術負債への対応手順（Claude Code用スキル）
 ```
 
