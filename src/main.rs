@@ -127,7 +127,8 @@ mod tests {
     #[test]
     fn exploit_mitigations_are_on() {
         let pe = read_pe(&std::fs::read(std::env::current_exe().unwrap()).unwrap());
-        // DYNAMIC_BASE, HIGH_ENTROPY_VA, NX_COMPAT, and GUARD_CF from .cargo/config.toml.
+        // DYNAMIC_BASE, HIGH_ENTROPY_VA and NX_COMPAT are the MSVC linker's defaults (kept
+        // on, never turned off here); GUARD_CF is `-C control-flow-guard` in .cargo/config.toml.
         for (bit, name) in [(0x0040, "ASLR"), (0x0020, "high-entropy ASLR"), (0x0100, "NX"), (0x4000, "CFG")] {
             assert_ne!(pe.dll_characteristics & bit, 0, "{name} is off");
         }

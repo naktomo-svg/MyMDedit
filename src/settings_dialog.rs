@@ -17,7 +17,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, SetActiveWindow,
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{PCWSTR, w};
 
-use crate::dialogs::{choose_color, format_hex_color, parse_hex_color};
+use crate::dialogs::{choose_color, custom_color_slots, custom_colors_to_save, format_hex_color, parse_hex_color};
 use crate::settings::{AppSettings, Theme, limits};
 use crate::theme::{Palette, fill, set_control_theme};
 use crate::win::{message_font, pcwstr, scale, send, wide, window_text};
@@ -121,12 +121,7 @@ pub fn show(
     palette: Palette,
     on_custom_colors: Box<dyn Fn(Vec<String>)>,
 ) -> windows::core::Result<Option<DialogEdits>> {
-    let mut custom = [COLORREF(0x00FF_FFFF); 16];
-    for (slot, hex) in custom.iter_mut().zip(&current.custom_colors) {
-        if let Some(c) = parse_hex_color(hex) {
-            *slot = c;
-        }
-    }
+    let custom = custom_color_slots(&current.custom_colors);
     let state = Box::new(DlgState {
         palette,
         done: Cell::new(false),
@@ -503,7 +498,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     *state.custom.borrow_mut() = custom;
                     // Persisted the moment the color dialog closes, whatever the outcome
                     // of this dialog — matching the native dialog keeping its palette.
-                    (state.on_custom_colors)(custom.iter().map(|&c| format_hex_color(c)).collect());
+                    (state.on_custom_colors)(custom_colors_to_save(&custom));
                     if let Some(c) = chosen {
                         state.bg_color.set(c);
                         unsafe {

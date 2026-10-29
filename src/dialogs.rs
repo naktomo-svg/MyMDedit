@@ -190,6 +190,27 @@ pub fn format_hex_color(c: COLORREF) -> String {
     format!("#{:02X}{:02X}{:02X}", c.0 & 0xFF, (c.0 >> 8) & 0xFF, (c.0 >> 16) & 0xFF)
 }
 
+/// What the color dialog shows in a custom-color slot nobody has filled.
+const EMPTY_CUSTOM_COLOR: COLORREF = COLORREF(0x00FF_FFFF);
+
+/// The color dialog's 16 custom-color slots from the saved list; the rest are empty.
+pub fn custom_color_slots(saved: &[String]) -> [COLORREF; 16] {
+    let mut slots = [EMPTY_CUSTOM_COLOR; 16];
+    for (slot, hex) in slots.iter_mut().zip(saved) {
+        if let Some(c) = parse_hex_color(hex) {
+            *slot = c;
+        }
+    }
+    slots
+}
+
+/// The slots as they are saved: trailing empty slots are dropped, since
+/// `custom_color_slots` fills them back in — so settings.json lists only what was picked.
+pub fn custom_colors_to_save(slots: &[COLORREF; 16]) -> Vec<String> {
+    let used = slots.iter().rposition(|&c| c != EMPTY_CUSTOM_COLOR).map_or(0, |i| i + 1);
+    slots[..used].iter().map(|&c| format_hex_color(c)).collect()
+}
+
 /// The classic Windows 「色の設定」 dialog (basic colors + 16 custom colors).
 /// `custom` is updated in place whatever the outcome — the native dialog keeps custom
 /// color edits even when cancelled. Returns the chosen color, or `None` on cancel.
@@ -256,6 +277,18 @@ mod tests {
         assert_eq!(format_hex_color(c), "#1E2F3A");
         assert_eq!(format_hex_color(parse_hex_color("#abc").unwrap()), "#AABBCC");
         assert!(parse_hex_color("red").is_none());
+    }
+
+    #[test]
+    fn custom_colors_save_only_the_used_slots() {
+        // Never opened the palette, or emptied it: nothing to save.
+        assert!(custom_colors_to_save(&custom_color_slots(&[])).is_empty());
+        // A white in the middle is a real pick; only the empty tail goes.
+        let saved: Vec<String> = ["#112233", "#FFFFFF", "#445566"].map(String::from).to_vec();
+        let slots = custom_color_slots(&saved);
+        assert_eq!(custom_colors_to_save(&slots), saved);
+        // Saving and loading again gives the dialog the same 16 slots.
+        assert_eq!(custom_color_slots(&custom_colors_to_save(&slots)), slots);
     }
 
     #[test]
