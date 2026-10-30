@@ -283,8 +283,8 @@ struct ListMarker {
 fn list_marker(line: &[u16]) -> Option<ListMarker> {
     let indent = line.iter().take_while(|&&c| c == b' ' as u16).count();
     let rest = &line[indent..];
-    let (marker_len, next) = if task_state(rest).is_some() {
-        (TASK_MARKER_LEN, "- [ ] ".to_string())
+    let (marker_len, next) = if let Some((_, len)) = task_state(rest) {
+        (len, "- [ ] ".to_string())
     } else if rest.starts_with(&w("- ")) {
         (2, "- ".to_string())
     } else {
@@ -297,14 +297,22 @@ fn list_marker(line: &[u16]) -> Option<ListMarker> {
 /// Length of `- [ ] `.
 const TASK_MARKER_LEN: usize = 6;
 
-/// `Some(checked)` when `rest` starts with a task marker (`- [ ] `, `- [x] `, `- [X] `).
-fn task_state(rest: &[u16]) -> Option<bool> {
-    if rest.len() < TASK_MARKER_LEN || !rest.starts_with(&w("- [")) || rest[4..6] != w("] ")[..] {
+/// `Some((checked, marker length))` when `rest` starts with a task marker (`- [ ] `,
+/// `- [x] `, `- [X] `), or is one without its trailing space (`- [ ]` ending the line —
+/// otherwise it would read as `- ` followed by text, and toggling would stack a second
+/// marker on it).
+fn task_state(rest: &[u16]) -> Option<(bool, usize)> {
+    if rest.len() < TASK_MARKER_LEN - 1 || !rest.starts_with(&w("- [")) || rest[4] != b']' as u16 {
         return None;
     }
+    let len = match rest.get(5) {
+        None => TASK_MARKER_LEN - 1,
+        Some(&c) if c == b' ' as u16 => TASK_MARKER_LEN,
+        Some(_) => return None,
+    };
     match char::from_u32(rest[3] as u32) {
-        Some(' ') => Some(false),
-        Some('x' | 'X') => Some(true),
+        Some(' ') => Some((false, len)),
+        Some('x' | 'X') => Some((true, len)),
         _ => None,
     }
 }
@@ -329,7 +337,7 @@ pub fn toggle_task(text: &[u16], start: usize, len: usize) -> Edit {
             continue;
         }
         let (old_marker, new_marker) = match task_state(rest) {
-            Some(checked) => (TASK_MARKER_LEN, if checked { "- [ ] " } else { "- [x] " }),
+            Some((checked, len)) => (len, if checked { "- [ ] " } else { "- [x] " }),
             None => (list_marker(line).map_or(0, |m| m.len - indent), "- [ ] "),
         };
         out.extend_from_slice(&line[..indent]);
@@ -367,11 +375,18 @@ pub fn headings(text: &[u16]) -> Vec<Heading> {
         let rest = if indent < 4 { &line[indent..] } else { &[][..] };
         let run = |c: u16| rest.iter().take_while(|&&x| x == c).count();
 
+        // CommonMark: a closing fence is the run and nothing but spaces after it (```js
+        // inside a ``` block is code), and a backtick fence's info string has no backtick
+        // (```a``` is inline code, not a fence) — so the outline matches the preview.
+        let only_spaces_after = |n: usize| rest[n..].iter().all(|&x| x == b' ' as u16 || x == b'\t' as u16);
         if let Some((c, n)) = fence {
-            if run(c) >= n {
+            if run(c) >= n && only_spaces_after(run(c)) {
                 fence = None;
             }
-        } else if let Some(c) = [b'`' as u16, b'~' as u16].into_iter().find(|&c| run(c) >= 3) {
+        } else if let Some(c) = [b'`' as u16, b'~' as u16]
+            .into_iter()
+            .find(|&c| run(c) >= 3 && (c == b'~' as u16 || !rest[run(c)..].contains(&c)))
+        {
             fence = Some((c, run(c)));
         } else {
             let level = run(b'#' as u16);
@@ -629,6 +644,26 @@ mod tests {
     fn headings_skips_fenced_code() {
         let t = "```\r# not\r```\r~~~~\r# not\r~~~\r# not\r~~~~\r# yes";
         assert_eq!(heading_list(t), vec![(1, 40, "yes".into())]);
+    }
+
+    #[test]
+    fn headings_close_fences_the_way_commonmark_does() {
+        // ```js does not close a ``` block (a closing fence has no info string)...
+        let t = "```\r```js\r# not\r```  \r# yes";
+        assert_eq!(heading_list(t), vec![(1, 22, "yes".into())]);
+        // ...and ```a``` with a backtick after the run opens no fence at all.
+        assert_eq!(heading_list("```a```\r# yes"), vec![(1, 8, "yes".into())]);
+        assert_eq!(heading_list("~~~a~\r# not"), vec![]);
+    }
+
+    #[test]
+    fn task_marker_ending_the_line_is_a_task() {
+        assert_eq!(apply("- [ ]", &toggle_task(&w("- [ ]"), 5, 0)).0, "- [x] ");
+        assert_eq!(apply("  - [x]", &toggle_task(&w("  - [x]"), 3, 0)).0, "  - [ ] ");
+        // Enter on it leaves the list, like any marker-only line.
+        assert_eq!(apply("- [ ]", &on_enter(&w("- [ ]"), 5, 0).unwrap()).0, "\r");
+        // Something right after the bracket is not a task marker.
+        assert_eq!(apply("- [ ]x", &toggle_task(&w("- [ ]x"), 0, 0)).0, "- [ ] [ ]x");
     }
 
     #[test]

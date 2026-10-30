@@ -282,7 +282,9 @@ pub fn check_disk(path: &Path, recorded: FileStamp) -> DiskChange {
 pub fn read(path: &Path) -> Result<OpenedDocument, ReadError> {
     // Taken before reading: a change that lands mid-read then still shows up later as a
     // difference, rather than being folded into the stamp unseen.
-    let stamp = stamp(path).ok();
+    // Without one, the external-change check and the overwrite check before saving are
+    // off for this document until its first save: worth a trace.
+    let stamp = stamp(path).inspect_err(|e| log::error("read stamp", e)).ok();
     let bytes = read_at_most(path, MAX_DOCUMENT_BYTES).map_err(ReadError::Io)?;
     let (content, format) = decode(&bytes).inspect_err(|e| {
         if !matches!(e, ReadError::Io(_)) {

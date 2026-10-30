@@ -1,11 +1,16 @@
 # cargo deny check — dependency policy (security audit round 2, item 14).
 
+[graph]
+# The only target the app builds for (build.rs), and the one about.toml lists.
+targets = ["x86_64-pc-windows-msvc"]
+
 [advisories]
 # Vulnerabilities, unmaintained and yanked crates all fail the check.
 yanked = "deny"
 
 [licenses]
 # Everything in the dependency tree today; a new license is a decision, not an accident.
+# Kept equal to about.toml's `accepted` (main.rs's `license_lists_agree` test).
 allow = [
     "Apache-2.0",
     "BSD-2-Clause",

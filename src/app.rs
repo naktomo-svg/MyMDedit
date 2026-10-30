@@ -30,7 +30,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, SetFocus, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent, VK_ADD, VK_CONTROL, VK_MENU, VK_NUMPAD0,
     VK_OEM_MINUS, VK_OEM_PLUS, VK_RETURN, VK_SHIFT, VK_SUBTRACT, VK_TAB,
 };
-use windows::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
+use windows::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{PCWSTR, PWSTR, w};
 
@@ -100,9 +100,8 @@ const WM_APP_FOLDER_PROBED: u32 = WM_APP + 1;
 const WM_APP_RENDER: u32 = WM_APP + 2;
 // WM_APP + 3 is preview::WM_APP_PREVIEW_FAILED.
 const WM_APP_CHECK_DISK: u32 = WM_APP + 4;
+// WM_APP + 5 is preview::WM_APP_PREVIEW_CLOSE.
 const TIMER_SCROLL_SYNC: usize = 1;
-/// Position of the separator above 終了 in the File menu; recent folders go before it.
-const EXIT_SEPARATOR_POS: u32 = 5;
 
 const ZOOM_STEP: i32 = 10;
 const ZOOM_MIN: i32 = 50;
@@ -412,7 +411,16 @@ pub fn run(launch_file: Option<PathBuf>) -> windows::core::Result<()> {
         SetTimer(Some(ui.hwnd), TIMER_SCROLL_SYNC, 50, None);
 
         let mut msg = MSG::default();
-        while GetMessageW(&mut msg, None, 0, 0).as_bool() {
+        loop {
+            // BOOL with three values: 0 is WM_QUIT, -1 an error that would repeat forever.
+            match GetMessageW(&mut msg, None, 0, 0).0 {
+                0 => break,
+                -1 => {
+                    log::error("GetMessageW", windows::core::Error::from_thread());
+                    break;
+                }
+                _ => {}
+            }
             let find = app.ui.get().find_dialog;
             if !find.is_invalid() && IsDialogMessageW(find, &msg).as_bool() {
                 continue;
@@ -508,12 +516,25 @@ impl App {
                 Some(instance.into()),
                 None,
             )?;
-            let dpi = win::dpi_of(hwnd);
-            // A comfortable default size for a split editor, centered on the screen.
-            let (w, h) = (scale(1200, dpi), scale(800, dpi));
-            let x = (GetSystemMetrics(SM_CXSCREEN) - w).max(0) / 2;
-            let y = (GetSystemMetrics(SM_CYSCREEN) - h).max(0) / 2;
-            let _ = SetWindowPos(hwnd, None, x, y, w, h, SWP_NOZORDER);
+            // A comfortable default size for a split editor, centered on the primary screen.
+            // The window may have been created on another monitor (Explorer passes the one
+            // it was launched from); moving it across a DPI boundary sends WM_DPICHANGED
+            // before main_proc knows this window, so it is lost. Hence the DPI is read
+            // again once the window has arrived, and the size redone if it changed.
+            let mut dpi = win::dpi_of(hwnd);
+            for _ in 0..2 {
+                let (w, h) = (scale(1200, dpi), scale(800, dpi));
+                let x = (GetSystemMetrics(SM_CXSCREEN) - w).max(0) / 2;
+                let y = (GetSystemMetrics(SM_CYSCREEN) - h).max(0) / 2;
+                if let Err(e) = SetWindowPos(hwnd, None, x, y, w, h, SWP_NOZORDER) {
+                    log::error("SetWindowPos", &e);
+                }
+                let arrived = win::dpi_of(hwnd);
+                if arrived == dpi {
+                    break;
+                }
+                dpi = arrived;
+            }
 
             let editor = Editor::create(hwnd, ID_EDITOR)?;
             let _ = SetWindowSubclass(editor.hwnd(), Some(editor_proc), 1, 0);
@@ -641,7 +662,7 @@ impl App {
             sep(file);
             add(file, ID_SAVE, "保存\tCtrl+S");
             add(file, ID_SAVE_AS, "名前を付けて保存\tCtrl+Shift+S");
-            sep(file); // EXIT_SEPARATOR_POS
+            sep(file); // Recent folders go just above this (rebuild_recent_menu).
             add(file, ID_EXIT, "終了\tAlt+F4");
             popup("ファイル", file);
 
@@ -1110,18 +1131,25 @@ impl App {
     /// the window, the editor and the preview never show a mix of old and new settings.
     fn persist_settings(&self, change: impl FnOnce(&mut AppSettings)) {
         let before = self.current_settings();
-        let ok = self.state.borrow_mut().settings.update(change);
-        if !ok {
+        let result = self.state.borrow_mut().settings.update(change);
+        if let Err(e) = result {
             self.report_error(
                 "SettingsStore.save",
                 "設定を保存できませんでした。この変更は次回の起動時には元に戻ります。",
-                None,
+                Some(&e),
             );
         }
-        if settings::display_differs(&before, &self.current_settings()) {
+        let after = self.current_settings();
+        if settings::display_differs(&before, &after) {
             self.apply_theme();
             self.apply_editor_font();
             self.rerender();
+        }
+        // The recent-folder items are looked up by position in the current list, so the
+        // menu is rebuilt whenever that list changes — including when the write brought in
+        // another instance's list, whatever this write was about.
+        if before.recent_folders != after.recent_folders {
+            self.rebuild_recent_menu();
         }
     }
 
@@ -1172,13 +1200,12 @@ impl App {
         if settings::add_recent_folder(&current, &folder) == current {
             return; // Saving the same file again changes nothing worth a settings write.
         }
+        // persist_settings rebuilds the menu.
         self.persist_settings(|s| s.recent_folders = settings::add_recent_folder(&s.recent_folders, &folder));
-        self.rebuild_recent_menu();
     }
 
     fn remove_recent_folder(&self, folder: &str) {
         self.persist_settings(|s| s.recent_folders = settings::remove_recent_folder(&s.recent_folders, folder));
-        self.rebuild_recent_menu();
     }
 
     fn rebuild_recent_menu(&self) {
@@ -1186,13 +1213,23 @@ impl App {
         let folders = self.current_settings().recent_folders;
         let previous = std::mem::take(&mut self.state.borrow_mut().recent_items);
         unsafe {
+            // The recent items sit just above the separator over 終了, found by its id
+            // rather than by a position that a new File menu item would shift.
+            let count = u32::try_from(GetMenuItemCount(Some(menu))).unwrap_or(0);
+            let Some(exit) = (0..count).find(|&i| GetMenuItemID(menu, i as i32) == ID_EXIT as u32) else {
+                log::error("rebuild_recent_menu", "終了 is not in the File menu");
+                return;
+            };
+            let start = exit.saturating_sub(1 + previous);
             for _ in 0..previous {
-                let _ = RemoveMenu(menu, EXIT_SEPARATOR_POS, MF_BYPOSITION);
+                if let Err(e) = RemoveMenu(menu, start, MF_BYPOSITION) {
+                    log::error("RemoveMenu", &e);
+                }
             }
             if folders.is_empty() {
                 return;
             }
-            let mut pos = EXIT_SEPARATOR_POS;
+            let mut pos = start;
             let _ = InsertMenuW(menu, pos, MF_BYPOSITION | MF_SEPARATOR, 0, None);
             pos += 1;
             for (i, folder) in folders.iter().enumerate() {
@@ -1209,7 +1246,7 @@ impl App {
                     InsertMenuW(menu, pos, MF_BYPOSITION | MF_STRING, (ID_RECENT_BASE + i as u16) as usize, pcwstr(&t));
                 pos += 1;
             }
-            self.state.borrow_mut().recent_items = pos - EXIT_SEPARATOR_POS;
+            self.state.borrow_mut().recent_items = pos - start;
         }
     }
 
@@ -1256,7 +1293,9 @@ impl App {
     /// that dialog's command finishes (see `command`). The result opens a discard prompt
     /// and a file picker, which must never stack on another modal.
     fn deliver_pending_probe(&self) {
-        if self.busy.replace(true) {
+        // Once closing is decided the window may already be destroyed (終了 runs
+        // DestroyWindow inside its command): a prompt owned by it must not appear.
+        if self.close_confirmed.get() || self.busy.replace(true) {
             return;
         }
         let result = self.pending_probe.borrow_mut().take();
@@ -1768,8 +1807,15 @@ impl App {
                 return;
             }
             unsafe {
-                let _ = DestroyWindow(ui.find_dialog);
+                if let Err(e) = DestroyWindow(ui.find_dialog) {
+                    log::error("DestroyWindow find dialog", &e);
+                }
             }
+            // Forget it now: should the new dialog fail, a dead handle left here would be
+            // "focused" by every later Ctrl+F instead of a new one being made.
+            let mut ui = self.ui.get();
+            ui.find_dialog = HWND::default();
+            self.ui.set(ui);
         }
         let data = unsafe { &mut *self.find.get() };
         // Seed the search box with a short single-line selection.
@@ -1798,7 +1844,16 @@ impl App {
         let dialog = unsafe { if replace { ReplaceTextW(&mut data.fr) } else { FindTextW(&mut data.fr) } };
         if dialog.is_invalid() {
             let code = unsafe { CommDlgExtendedError() };
-            log::error("FindTextW", format!("could not create the dialog: CommDlgExtendedError={}", code.0));
+            // The user asked for this dialog; its absence needs explaining, like the others'.
+            self.report_error(
+                "FindTextW",
+                if replace {
+                    "置換ダイアログを表示できませんでした。"
+                } else {
+                    "検索ダイアログを表示できませんでした。"
+                },
+                Some(&format!("could not create the dialog: CommDlgExtendedError={}", code.0)),
+            );
             return;
         }
         self.state.borrow_mut().find_is_replace = replace;
@@ -1836,6 +1891,22 @@ impl App {
             self.ui.set(ui);
             return;
         }
+        // The find dialog is modeless and its own top-level window, so a modal of ours
+        // does not disable it. Acting now would change the text under that modal (行へ移動
+        // has already counted the lines; the reload prompt has already read `dirty`).
+        // Its message boxes are modals too, so it takes `busy` like any modal command.
+        if self.busy.replace(true) {
+            unsafe {
+                let _ = MessageBeep(MB_OK);
+            }
+            return;
+        }
+        self.find_or_replace(flags, query, replacement);
+        self.busy.set(false);
+        self.deliver_pending_probe();
+    }
+
+    fn find_or_replace(&self, flags: FINDREPLACE_FLAGS, query: Vec<u16>, replacement: Vec<u16>) {
         let case = flags.contains(FR_MATCHCASE);
         let whole = flags.contains(FR_WHOLEWORD);
         let editor = self.editor();
@@ -1863,7 +1934,7 @@ impl App {
             let (start, len) = editor.selection();
             if len > 0 {
                 let text = editor.text();
-                if search::units_equal(&text[start..start + len], &query, case) {
+                if search::is_match_at(&text, start, len, &query, case, whole) {
                     editor.replace_selection(&replacement);
                     editor.set_selection(start + replacement.len(), 0);
                 }
@@ -1888,10 +1959,21 @@ impl App {
 
     fn command(&self, id: u16) {
         // Commands that open modal UI must not nest (e.g. a shortcut forwarded from the
-        // WebView while a dialog is already up).
-        let modal =
-            matches!(id, ID_NEW | ID_OPEN | ID_SAVE | ID_SAVE_AS | ID_EXIT | ID_SETTINGS | ID_GOTO_LINE | ID_OUTLINE)
-                || (ID_RECENT_BASE..ID_RECENT_END).contains(&id);
+        // WebView while a dialog is already up). A popup menu (TrackPopupMenu) is a modal
+        // loop too: a folder-probe result arriving during it must wait.
+        let modal = matches!(
+            id,
+            ID_NEW
+                | ID_OPEN
+                | ID_SAVE
+                | ID_SAVE_AS
+                | ID_EXIT
+                | ID_SETTINGS
+                | ID_GOTO_LINE
+                | ID_OUTLINE
+                | ID_HEADING
+                | ID_MORE
+        ) || (ID_RECENT_BASE..ID_RECENT_END).contains(&id);
         if modal && self.busy.replace(true) {
             return;
         }
@@ -2067,6 +2149,10 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
             preview::on_process_failed(&app, wparam.0 == 1);
             LRESULT(0)
         }
+        preview::WM_APP_PREVIEW_CLOSE => {
+            preview::close(&app);
+            LRESULT(0)
+        }
         WM_APP_RENDER => {
             app.render_pending.set(false);
             app.rerender();
@@ -2139,14 +2225,27 @@ fn wheel_steps(accum: i32, delta: i32) -> (i32, i32) {
 }
 const WM_MOUSELEAVE: u32 = 0x02A3;
 
+type SubclassProc = unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM, usize, usize) -> LRESULT;
+
+/// SetWindowSubclass's contract: the subclass goes before its window does. WM_NCDESTROY
+/// is the last message the window gets; DefSubclassProc still forwards it afterwards.
+fn remove_subclass(hwnd: HWND, proc: SubclassProc, id: usize) {
+    if !unsafe { RemoveWindowSubclass(hwnd, Some(proc), id) }.as_bool() {
+        log::error("RemoveWindowSubclass", "subclass was not installed");
+    }
+}
+
 unsafe extern "system" fn editor_proc(
     hwnd: HWND,
     msg: u32,
     wparam: WPARAM,
     lparam: LPARAM,
-    _id: usize,
+    id: usize,
     _data: usize,
 ) -> LRESULT {
+    if msg == WM_NCDESTROY {
+        remove_subclass(hwnd, editor_proc, id);
+    }
     if let Some(app) = try_app() {
         match msg {
             // Ctrl+wheel drives the app-wide zoom (editor + preview together) instead of
@@ -2199,9 +2298,12 @@ unsafe extern "system" fn button_proc(
     msg: u32,
     wparam: WPARAM,
     lparam: LPARAM,
-    _id: usize,
+    id: usize,
     _data: usize,
 ) -> LRESULT {
+    if msg == WM_NCDESTROY {
+        remove_subclass(hwnd, button_proc, id);
+    }
     if let Some(app) = try_app() {
         match msg {
             WM_MOUSEMOVE if app.hovered.get() != hwnd => {

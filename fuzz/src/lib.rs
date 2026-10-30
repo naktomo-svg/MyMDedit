@@ -92,6 +92,49 @@ pub fn is_contained_font_family(value: &str) -> bool {
     !value.contains('<')
 }
 
+/// Every non-overlapping match of `query` in `text`, scanning left to right, written
+/// over `char`s and `String`s rather than `search`'s code-unit folding. `text` and
+/// `query` are valid UTF-16. Ignore-case is the simple uppercase of each character when
+/// it keeps the UTF-16 length; "whole word" means no alphanumeric character touches
+/// either end.
+pub fn reference_find_all(text: &[u16], query: &[u16], case_sensitive: bool, whole_word: bool) -> Vec<usize> {
+    let upper = |units: &[u16]| -> Vec<u16> {
+        let s = String::from_utf16(units).unwrap();
+        s.chars()
+            .flat_map(|c| {
+                let u: Vec<char> = c.to_uppercase().collect();
+                let c = if !case_sensitive && u.len() == 1 && u[0].len_utf16() == c.len_utf16() { u[0] } else { c };
+                c.encode_utf16(&mut [0; 2]).to_vec()
+            })
+            .collect()
+    };
+    let word_at = |units: &[u16], last: bool| {
+        let s = String::from_utf16_lossy(units);
+        let c = if last { s.chars().next_back() } else { s.chars().next() };
+        c.is_some_and(char::is_alphanumeric)
+    };
+    let mut found = Vec::new();
+    if query.is_empty() {
+        return found;
+    }
+    let q = upper(query);
+    let mut pos = 0;
+    while pos + q.len() <= text.len() {
+        let end = pos + q.len();
+        // Only compare whole characters: a slice that splits a surrogate pair is no match.
+        let ok = String::from_utf16(&text[pos..end]).is_ok()
+            && upper(&text[pos..end]) == q
+            && (!whole_word || (!word_at(&text[..pos], true) && !word_at(&text[end..], false)));
+        if ok {
+            found.push(pos);
+            pos = end;
+        } else {
+            pos += 1;
+        }
+    }
+    found
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -109,5 +152,11 @@ mod tests {
         let html =
             render::to_html_document("<link rel=preconnect href=https://x>", &settings::AppSettings::default(), 0).html;
         assert!(!tag_names(&html).iter().any(|n| n == "link"));
+        let w = |s: &str| s.encode_utf16().collect::<Vec<u16>>();
+        assert_eq!(reference_find_all(&w("Cat concat CAT"), &w("cat"), false, true), [0, 11]);
+        assert_eq!(reference_find_all(&w("Cat concat CAT"), &w("cat"), true, false), [7]);
+        assert_eq!(reference_find_all(&w("x𐐨y 𐐨cat"), &w("𐐀"), false, false), [1, 5]);
+        assert_eq!(reference_find_all(&w("𐐨cat"), &w("cat"), false, true), [] as [usize; 0]);
+        assert_eq!(reference_find_all(&w("aaa"), &w("aa"), true, false), [0]);
     }
 }

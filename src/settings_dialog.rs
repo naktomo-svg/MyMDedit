@@ -17,7 +17,10 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, SetActiveWindow,
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{PCWSTR, w};
 
-use crate::dialogs::{choose_color, custom_color_slots, custom_colors_to_save, format_hex_color, parse_hex_color};
+use crate::dialogs::{
+    CustomColors, choose_color, custom_color_slots, custom_colors_to_save, format_hex_color, parse_hex_color,
+};
+use crate::log;
 use crate::settings::{AppSettings, Theme, limits};
 use crate::theme::{Palette, fill, set_control_theme};
 use crate::win::{message_font, pcwstr, scale, send, wide, window_text};
@@ -28,22 +31,29 @@ const IDCANCEL_: i32 = 2;
 const IDC_THEME: i32 = 10;
 const IDC_EDITOR_FONT: i32 = 11;
 const IDC_EDITOR_SIZE: i32 = 12;
+const IDC_EDITOR_SIZE_UD: i32 = 13;
 const IDC_PREVIEW_FONT: i32 = 14;
 const IDC_PREVIEW_SIZE: i32 = 15;
+const IDC_PREVIEW_SIZE_UD: i32 = 16;
 const IDC_BG_CHECK: i32 = 17;
 const IDC_BG_BUTTON: i32 = 18;
 const IDC_SWATCH: i32 = 19;
 const IDC_TABLE_HEADER: i32 = 20;
 const IDC_TABLE_STRIPE: i32 = 21;
 
+/// The theme combo box's items, in order: both directions read this one table.
+const THEMES: [(Theme, &str); 3] =
+    [(Theme::System, "システムの既定"), (Theme::Light, "ライト"), (Theme::Dark, "ダーク")];
+
 /// What the dialog edits. Applied onto the settings as of the moment 保存 was pressed
 /// (see [`DialogEdits::apply`]), not as of when the dialog opened: the color dialog
 /// reached from 「色を選択」 persists custom colors while this dialog is still open.
 pub struct DialogEdits {
     theme: Theme,
-    editor_font: String,
+    /// `None` when the field was left empty.
+    editor_font: Option<String>,
     editor_size: Option<f64>,
-    preview_font: String,
+    preview_font: Option<String>,
     preview_size: Option<f64>,
     background: Option<String>,
     table_header: bool,
@@ -54,11 +64,11 @@ impl DialogEdits {
     pub fn apply(self, current: &AppSettings) -> AppSettings {
         AppSettings {
             theme: self.theme,
-            editor_font_family: self.editor_font,
-            // A field that no longer holds a number falls back to that setting's own
-            // previous value; out-of-range values are clamped.
+            // A field left empty, or one that no longer holds a number, falls back to that
+            // setting's own previous value; out-of-range values are clamped.
+            editor_font_family: self.editor_font.unwrap_or_else(|| current.editor_font_family.clone()),
             editor_font_size: self.editor_size.map_or(current.editor_font_size, limits::clamp_font_size),
-            preview_font_family: self.preview_font,
+            preview_font_family: self.preview_font.unwrap_or_else(|| current.preview_font_family.clone()),
             preview_font_size: self.preview_size.map_or(current.preview_font_size, limits::clamp_font_size),
             preview_background_color: self.background,
             table_header_gray_background: self.table_header,
@@ -92,7 +102,7 @@ struct DlgState {
     done: Cell<bool>,
     result: RefCell<Option<DialogEdits>>,
     bg_color: Cell<COLORREF>,
-    custom: RefCell<[COLORREF; 16]>,
+    custom: RefCell<CustomColors>,
     on_custom_colors: Box<dyn Fn(Vec<String>)>,
     bg_brush: HBRUSH,
     field_brush: HBRUSH,
@@ -187,11 +197,15 @@ pub fn show(
     crate::theme::set_title_bar_dark(hwnd, palette.dark);
 
     // ---- controls ----
+    // The first control that could not be created. A missing control reads back as an
+    // empty font name, システムの既定 and unchecked boxes, which 保存 would then store; so
+    // a dialog missing any is not shown at all.
+    let failed: RefCell<Option<windows::core::Error>> = RefCell::new(None);
     let make =
         |class: PCWSTR, text: &str, style: u32, ex: u32, id: i32, x: i32, y: i32, cx: i32, cy: i32, f: HFONT| -> HWND {
             let text = wide(text);
             unsafe {
-                let h = CreateWindowExW(
+                let created = CreateWindowExW(
                     WINDOW_EX_STYLE(ex),
                     class,
                     pcwstr(&text),
@@ -204,8 +218,11 @@ pub fn show(
                     Some(HMENU(id as isize as *mut _)),
                     None,
                     None,
-                )
-                .unwrap_or_default();
+                );
+                let h = created.unwrap_or_else(|e| {
+                    failed.borrow_mut().get_or_insert(e);
+                    HWND::default()
+                });
                 send(h, WM_SETFONT, f.0 as usize, 1);
                 h
             }
@@ -232,91 +249,81 @@ pub fn show(
         200,
         ui_font,
     );
-    for t in ["システムの既定", "ライト", "ダーク"] {
+    for (_, t) in THEMES {
         let t = wide(t);
         send(theme, CB_ADDSTRING, 0, t.as_ptr() as isize);
     }
-    send(
-        theme,
-        CB_SETCURSEL,
-        match current.theme {
-            Theme::System => 0,
-            Theme::Light => 1,
-            Theme::Dark => 2,
-        },
-        0,
-    );
+    send(theme, CB_SETCURSEL, THEMES.iter().position(|(t, _)| *t == current.theme).unwrap_or(0), 0);
     y += 30 + 14;
 
-    let font_section = |title: &str, font_id: i32, size_id: i32, family: &str, size: f64, y: &mut i32| {
-        label(title, left, *y, full, true);
-        *y += 22;
-        let combo = make(
-            w!("COMBOBOX"),
-            "",
-            tab | (CBS_DROPDOWN | CBS_AUTOHSCROLL) as u32 | WS_VSCROLL.0,
-            0,
-            font_id,
-            left,
-            *y,
-            full,
-            300,
-            ui_font,
-        );
-        for f in fonts {
-            let f = wide(f);
-            send(combo, CB_ADDSTRING, 0, f.as_ptr() as isize);
-        }
-        let family_w = wide(family);
-        send(combo, WM_SETTEXT, 0, family_w.as_ptr() as isize);
-        *y += 32;
-        label("サイズ", left, *y + 3, 50, false);
-        let edit = make(
-            w!("EDIT"),
-            &format_size(size),
-            tab | ES_AUTOHSCROLL as u32,
-            WS_EX_CLIENTEDGE.0,
-            size_id,
-            left + 56,
-            *y,
-            80,
-            24,
-            ui_font,
-        );
-        let updown = make(
-            w!("msctls_updown32"),
-            "",
-            UDS_SETBUDDYINT | UDS_ALIGNRIGHT | UDS_ARROWKEYS | UDS_NOTHOUSANDS,
-            0,
-            size_id + 1,
-            0,
-            0,
-            0,
-            0,
-            ui_font,
-        );
-        send(updown, UDM_SETBUDDY, edit.0 as usize, 0);
-        send(updown, UDM_SETRANGE32, limits::MIN_FONT_SIZE as usize, limits::MAX_FONT_SIZE as isize);
-        send(updown, UDM_SETPOS32, 0, size.round() as isize);
-        // Set after attaching: UDS_SETBUDDYINT rewrites the buddy as an integer on
-        // attach, which would round a fractional size loaded from settings.
-        let text = wide(&format_size(size));
-        send(edit, WM_SETTEXT, 0, text.as_ptr() as isize);
-        *y += 24 + 18;
-        (combo, edit, updown)
-    };
+    let font_section =
+        |title: &str, (font_id, size_id, updown_id): (i32, i32, i32), family: &str, size: f64, y: &mut i32| {
+            label(title, left, *y, full, true);
+            *y += 22;
+            let combo = make(
+                w!("COMBOBOX"),
+                "",
+                tab | (CBS_DROPDOWN | CBS_AUTOHSCROLL) as u32 | WS_VSCROLL.0,
+                0,
+                font_id,
+                left,
+                *y,
+                full,
+                300,
+                ui_font,
+            );
+            for f in fonts {
+                let f = wide(f);
+                send(combo, CB_ADDSTRING, 0, f.as_ptr() as isize);
+            }
+            let family_w = wide(family);
+            send(combo, WM_SETTEXT, 0, family_w.as_ptr() as isize);
+            *y += 32;
+            label("サイズ", left, *y + 3, 50, false);
+            let edit = make(
+                w!("EDIT"),
+                &format_size(size),
+                tab | ES_AUTOHSCROLL as u32,
+                WS_EX_CLIENTEDGE.0,
+                size_id,
+                left + 56,
+                *y,
+                80,
+                24,
+                ui_font,
+            );
+            let updown = make(
+                w!("msctls_updown32"),
+                "",
+                UDS_SETBUDDYINT | UDS_ALIGNRIGHT | UDS_ARROWKEYS | UDS_NOTHOUSANDS,
+                0,
+                updown_id,
+                0,
+                0,
+                0,
+                0,
+                ui_font,
+            );
+            send(updown, UDM_SETBUDDY, edit.0 as usize, 0);
+            send(updown, UDM_SETRANGE32, limits::MIN_FONT_SIZE as usize, limits::MAX_FONT_SIZE as isize);
+            send(updown, UDM_SETPOS32, 0, size.round() as isize);
+            // Set after attaching: UDS_SETBUDDYINT rewrites the buddy as an integer on
+            // attach, which would round a fractional size loaded from settings.
+            let text = wide(&format_size(size));
+            send(edit, WM_SETTEXT, 0, text.as_ptr() as isize);
+            *y += 24 + 18;
+            (combo, edit, updown)
+        };
     let (efont, esize, eud) = font_section(
         "エディタのフォント",
-        IDC_EDITOR_FONT,
-        IDC_EDITOR_SIZE,
+        (IDC_EDITOR_FONT, IDC_EDITOR_SIZE, IDC_EDITOR_SIZE_UD),
         &current.editor_font_family,
         current.editor_font_size,
         &mut y,
     );
     let (pfont, psize, pud) = font_section(
         "プレビューのフォント",
-        IDC_PREVIEW_FONT,
-        IDC_PREVIEW_SIZE,
+        (IDC_PREVIEW_FONT, IDC_PREVIEW_SIZE, IDC_PREVIEW_SIZE_UD),
         &current.preview_font_family,
         current.preview_font_size,
         &mut y,
@@ -393,6 +400,13 @@ pub fn show(
     );
     y += 30 + 18;
 
+    if let Some(e) = failed.take() {
+        unsafe {
+            log::if_err("SettingsDialog DestroyWindow", DestroyWindow(hwnd));
+        }
+        return Err(e);
+    }
+
     // Theme the controls.
     for h in [theme, efont, pfont] {
         set_control_theme(h, palette.dark, "DarkMode_CFD");
@@ -456,16 +470,14 @@ pub fn show(
 }
 
 fn collect(dlg: HWND, state: &DlgState) -> DialogEdits {
-    let theme = match send(item(dlg, IDC_THEME), CB_GETCURSEL, 0, 0) {
-        1 => Theme::Light,
-        2 => Theme::Dark,
-        _ => Theme::System,
-    };
+    let index = usize::try_from(send(item(dlg, IDC_THEME), CB_GETCURSEL, 0, 0)).ok();
+    let theme = index.and_then(|i| THEMES.get(i)).map_or(Theme::System, |(t, _)| *t);
+    let font = |id| Some(window_text(item(dlg, id)).trim().to_string()).filter(|f| !f.is_empty());
     DialogEdits {
         theme,
-        editor_font: window_text(item(dlg, IDC_EDITOR_FONT)).trim().to_string(),
+        editor_font: font(IDC_EDITOR_FONT),
         editor_size: parse_size(&window_text(item(dlg, IDC_EDITOR_SIZE))),
-        preview_font: window_text(item(dlg, IDC_PREVIEW_FONT)).trim().to_string(),
+        preview_font: font(IDC_PREVIEW_FONT),
         preview_size: parse_size(&window_text(item(dlg, IDC_PREVIEW_SIZE))),
         background: checked(dlg, IDC_BG_CHECK).then(|| format_hex_color(state.bg_color.get())),
         table_header: checked(dlg, IDC_TABLE_HEADER),
@@ -571,9 +583,9 @@ mod tests {
         let current = AppSettings::default();
         let edits = DialogEdits {
             theme: Theme::Dark,
-            editor_font: "Consolas".into(),
+            editor_font: Some("Consolas".into()),
             editor_size: None,
-            preview_font: "Meiryo".into(),
+            preview_font: Some("Meiryo".into()),
             preview_size: Some(100.0),
             background: Some("#112233".into()),
             table_header: true,
@@ -584,5 +596,24 @@ mod tests {
         assert_eq!(s.preview_font_size, 48.0);
         assert_eq!(s.recent_folders, vec!["C:\\x"]);
         assert_eq!(s.theme, Theme::Dark);
+        assert_eq!(s.editor_font_family, "Consolas");
+    }
+
+    #[test]
+    fn empty_font_falls_back_to_previous_value() {
+        let current = AppSettings { editor_font_family: "Consolas".into(), ..AppSettings::default() };
+        let edits = DialogEdits {
+            theme: Theme::System,
+            editor_font: None,
+            editor_size: None,
+            preview_font: None,
+            preview_size: None,
+            background: None,
+            table_header: false,
+            table_striping: false,
+        };
+        let s = edits.apply(&current);
+        assert_eq!(s.editor_font_family, "Consolas");
+        assert_eq!(s.preview_font_family, current.preview_font_family);
     }
 }

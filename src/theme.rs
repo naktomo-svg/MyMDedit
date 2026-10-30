@@ -7,6 +7,7 @@
 //! covers it.
 
 use std::ffi::c_void;
+use std::sync::OnceLock;
 
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::{DWMWA_USE_IMMERSIVE_DARK_MODE, DwmSetWindowAttribute};
@@ -15,7 +16,9 @@ use windows::Win32::Graphics::Gdi::{
     GetWindowDC, HDC, HFONT, HGDIOBJ, MapWindowPoints, ReleaseDC, SelectObject, SetBkMode, SetTextColor, TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::{GetProcAddress, LOAD_LIBRARY_SEARCH_SYSTEM32, LoadLibraryExW};
-use windows::Win32::System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RegGetValueW};
+use windows::Win32::System::Registry::{
+    HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, RRF_RT_REG_DWORD, RRF_RT_REG_SZ, RegGetValueW,
+};
 use windows::Win32::UI::Controls::{DRAWITEMSTRUCT, SetWindowTheme};
 use windows::Win32::UI::WindowsAndMessaging::{
     DefWindowProcW, GetClientRect, GetMenuBarInfo, GetMenuItemInfoW, GetWindowRect, HMENU, MENUBARINFO, MENUITEMINFOW,
@@ -98,49 +101,128 @@ pub fn system_prefers_dark() -> bool {
     r.is_ok() && value == 0
 }
 
-fn uxtheme_ordinal(ordinal: u16) -> Option<unsafe extern "system" fn() -> isize> {
-    unsafe {
-        let module = LoadLibraryExW(w!("uxtheme.dll"), None, LOAD_LIBRARY_SEARCH_SYSTEM32).ok()?;
-        GetProcAddress(module, PCSTR(ordinal as usize as *const u8))
+/// What uxtheme's undocumented ordinal 135 is on a given build: its meaning changed in
+/// 1903, and calling it with the other signature would pass the wrong argument.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AppModeApi {
+    /// 1903 (18362) and later: SetPreferredAppMode(AppMode); 2 = ForceDark, 3 = ForceLight.
+    PreferredAppMode,
+    /// 1809 (17763): AllowDarkModeForApp(BOOL).
+    AllowDarkModeForApp,
+    /// Older, or unknown: the ordinals are not the functions this code means.
+    None,
+}
+
+fn app_mode_api(build: u32) -> AppModeApi {
+    match build {
+        18362.. => AppModeApi::PreferredAppMode,
+        17763.. => AppModeApi::AllowDarkModeForApp,
+        _ => AppModeApi::None,
     }
+}
+
+/// The Windows build number, from the registry (GetVersionEx's answer depends on the
+/// manifest, and RtlGetVersion would need ntdll bindings for one number).
+fn windows_build() -> Option<u32> {
+    let mut buf = [0u16; 32];
+    let mut size = size_of_val(&buf) as u32;
+    let r = unsafe {
+        RegGetValueW(
+            HKEY_LOCAL_MACHINE,
+            w!("SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion"),
+            w!("CurrentBuildNumber"),
+            RRF_RT_REG_SZ,
+            None,
+            Some(buf.as_mut_ptr().cast()),
+            Some(&mut size),
+        )
+    };
+    if let Err(e) = r.ok() {
+        crate::log::error("windows_build", &e);
+        return None;
+    }
+    let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+    String::from_utf16_lossy(&buf[..len]).parse().ok()
+}
+
+/// uxtheme's dark-mode ordinals, resolved once for the process — only on builds where
+/// they are known to be the functions they are called as.
+struct DarkModeApi {
+    app_mode: AppModeApi,
+    /// 135: SetPreferredAppMode or AllowDarkModeForApp, as `app_mode` says.
+    set_app_mode: Option<unsafe extern "system" fn(i32) -> i32>,
+    /// 136: FlushMenuThemes().
+    flush_menu_themes: Option<unsafe extern "system" fn()>,
+    /// 133: AllowDarkModeForWindow(HWND, BOOL).
+    allow_for_window: Option<unsafe extern "system" fn(HWND, BOOL) -> BOOL>,
+}
+
+fn dark_mode_api() -> &'static DarkModeApi {
+    static API: OnceLock<DarkModeApi> = OnceLock::new();
+    API.get_or_init(|| {
+        let app_mode = windows_build().map_or(AppModeApi::None, app_mode_api);
+        let none = DarkModeApi { app_mode, set_app_mode: None, flush_menu_themes: None, allow_for_window: None };
+        if app_mode == AppModeApi::None {
+            crate::log::error("dark_mode_api", "unknown Windows build; menus and scrollbars stay light");
+            return none;
+        }
+        // Never freed: the pointers are used for the life of the process.
+        let module = match unsafe { LoadLibraryExW(w!("uxtheme.dll"), None, LOAD_LIBRARY_SEARCH_SYSTEM32) } {
+            Ok(m) => m,
+            Err(e) => {
+                crate::log::error("dark_mode_api LoadLibraryExW", &e);
+                return none;
+            }
+        };
+        let ordinal = |n: u16| unsafe { GetProcAddress(module, PCSTR(n as usize as *const u8)) };
+        // SAFETY: on the builds `app_mode_api` admits, these ordinals have exactly these
+        // signatures (both meanings of 135 take one 32-bit argument and return one).
+        unsafe {
+            DarkModeApi {
+                app_mode,
+                set_app_mode: ordinal(135).map(|f| std::mem::transmute(f)),
+                flush_menu_themes: ordinal(136).map(|f| std::mem::transmute(f)),
+                allow_for_window: ordinal(133).map(|f| std::mem::transmute(f)),
+            }
+        }
+    })
 }
 
 /// Makes popup menus, context menus and scrollbars of this process follow `dark`.
 pub fn set_app_dark_mode(dark: bool) {
-    // 135 = SetPreferredAppMode(AppMode) on 1903+; 2 = ForceDark, 3 = ForceLight.
-    // 136 = FlushMenuThemes().
+    let api = dark_mode_api();
     unsafe {
-        if let Some(f) = uxtheme_ordinal(135) {
-            let set: unsafe extern "system" fn(i32) -> i32 = std::mem::transmute(f);
-            set(if dark { 2 } else { 3 });
+        if let Some(set) = api.set_app_mode {
+            match api.app_mode {
+                AppModeApi::PreferredAppMode => set(if dark { 2 } else { 3 }),
+                AppModeApi::AllowDarkModeForApp => set(dark.into()),
+                AppModeApi::None => 0,
+            };
         }
-        if let Some(f) = uxtheme_ordinal(136) {
-            let flush: unsafe extern "system" fn() = std::mem::transmute(f);
+        if let Some(flush) = api.flush_menu_themes {
             flush();
         }
     }
 }
 
-/// 133 = AllowDarkModeForWindow(HWND, BOOL).
 pub fn allow_dark_for_window(hwnd: HWND, dark: bool) {
-    unsafe {
-        if let Some(f) = uxtheme_ordinal(133) {
-            let allow: unsafe extern "system" fn(HWND, BOOL) -> BOOL = std::mem::transmute(f);
-            let _ = allow(hwnd, dark.into());
-        }
+    if let Some(allow) = dark_mode_api().allow_for_window {
+        // Returns whether it applied, which the window's own theme call then shows anyway.
+        let _ = unsafe { allow(hwnd, dark.into()) };
     }
 }
 
 pub fn set_title_bar_dark(hwnd: HWND, dark: bool) {
     let value = BOOL::from(dark);
-    unsafe {
-        let _ = DwmSetWindowAttribute(
+    let r = unsafe {
+        DwmSetWindowAttribute(
             hwnd,
             DWMWA_USE_IMMERSIVE_DARK_MODE,
             &value as *const BOOL as *const c_void,
             size_of::<BOOL>() as u32,
-        );
-    }
+        )
+    };
+    crate::log::if_err("DwmSetWindowAttribute", r);
 }
 
 /// Explorer-style visual theme for a control, in the dark variant when `dark`.
@@ -277,5 +359,19 @@ pub fn handle_menu_bar_message(
             }
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dark_mode_ordinals_are_only_trusted_on_known_builds() {
+        assert_eq!(app_mode_api(17762), AppModeApi::None);
+        assert_eq!(app_mode_api(17763), AppModeApi::AllowDarkModeForApp); // 1809
+        assert_eq!(app_mode_api(18361), AppModeApi::AllowDarkModeForApp);
+        assert_eq!(app_mode_api(18362), AppModeApi::PreferredAppMode); // 1903
+        assert_eq!(app_mode_api(26100), AppModeApi::PreferredAppMode);
     }
 }

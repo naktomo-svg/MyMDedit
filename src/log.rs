@@ -18,6 +18,14 @@ pub fn error(context: &str, message: impl std::fmt::Display) {
     eprint!("{line}");
 }
 
+/// Records `result`'s error, if any: for calls whose failure the app cannot do anything
+/// about, but which must not fail without a trace.
+pub fn if_err<T, E: std::fmt::Display>(context: &str, result: Result<T, E>) {
+    if let Err(e) = result {
+        error(context, e);
+    }
+}
+
 /// `%LOCALAPPDATA%\MyMDedit\crash.log`. Release builds have no console and are
 /// stripped, so a panic would otherwise leave nothing behind.
 pub fn crash_log_path() -> Option<PathBuf> {

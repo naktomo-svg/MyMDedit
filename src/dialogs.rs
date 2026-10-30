@@ -12,17 +12,28 @@ use windows::Win32::UI::Controls::{
 };
 use windows::Win32::UI::Shell::Common::COMDLG_FILTERSPEC;
 use windows::Win32::UI::Shell::{
-    FOLDERID_Documents, FileOpenDialog, FileSaveDialog, IFileOpenDialog, IFileSaveDialog, IShellItem, KF_FLAG_DEFAULT,
-    SHCreateItemFromParsingName, SHGetKnownFolderItem, SIGDN_FILESYSPATH,
+    FOLDERID_Documents, FileOpenDialog, FileSaveDialog, IFileDialog, IFileOpenDialog, IFileSaveDialog, IShellItem,
+    KF_FLAG_DEFAULT, SHCreateItemFromParsingName, SHGetKnownFolderItem, SIGDN_FILESYSPATH,
 };
 use windows::core::{HRESULT, HSTRING, PCWSTR, w};
+
+use crate::log;
+use crate::settings::limits;
 
 fn is_cancelled(e: &windows::core::Error) -> bool {
     e.code() == HRESULT::from_win32(ERROR_CANCELLED.0)
 }
 
-fn documents_folder() -> Option<IShellItem> {
-    unsafe { SHGetKnownFolderItem(&FOLDERID_Documents, KF_FLAG_DEFAULT, None).ok() }
+/// Documents as the folder a file dialog starts in when it has nothing better. A
+/// convenience: without it the dialog picks its own, so a failure is only logged.
+fn set_default_folder(dlg: &IFileDialog) {
+    let set = unsafe {
+        SHGetKnownFolderItem::<IShellItem>(&FOLDERID_Documents, KF_FLAG_DEFAULT, None)
+            .and_then(|docs| dlg.SetDefaultFolder(&docs))
+    };
+    if let Err(e) = set {
+        log::error("SetDefaultFolder(Documents)", &e);
+    }
 }
 
 fn item_path(item: &IShellItem) -> windows::core::Result<PathBuf> {
@@ -45,12 +56,15 @@ pub fn open_file(owner: HWND, folder: Option<&Path>) -> windows::core::Result<Op
             pszSpec: w!("*.md;*.markdown;*.txt"),
         }];
         dlg.SetFileTypes(&filters)?;
-        if let Some(docs) = documents_folder() {
-            dlg.SetDefaultFolder(&docs)?;
-        }
+        set_default_folder(&dlg);
+        // Only where the dialog starts: a folder gone since it was checked (or a dropped
+        // network drive) is no reason to fail before the user has picked anything.
         if let Some(folder) = folder {
-            let item: IShellItem = SHCreateItemFromParsingName(&HSTRING::from(folder.as_os_str()), None)?;
-            dlg.SetFolder(&item)?;
+            let set = SHCreateItemFromParsingName(&HSTRING::from(folder.as_os_str()), None)
+                .and_then(|item: IShellItem| dlg.SetFolder(&item));
+            if let Err(e) = set {
+                log::error(&format!("open_file SetFolder({})", folder.display()), &e);
+            }
         }
         match dlg.Show(Some(owner)) {
             Err(e) if is_cancelled(&e) => return Ok(None),
@@ -69,9 +83,7 @@ pub fn save_file(owner: HWND, suggested_name: &str) -> windows::core::Result<Opt
         dlg.SetDefaultExtension(w!("md"))?;
         let stem = Path::new(suggested_name).file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
         dlg.SetFileName(&HSTRING::from(stem))?;
-        if let Some(docs) = documents_folder() {
-            dlg.SetDefaultFolder(&docs)?;
-        }
+        set_default_folder(&dlg);
         match dlg.Show(Some(owner)) {
             Err(e) if is_cancelled(&e) => return Ok(None),
             r => r?,
@@ -193,9 +205,14 @@ pub fn format_hex_color(c: COLORREF) -> String {
 /// What the color dialog shows in a custom-color slot nobody has filled.
 const EMPTY_CUSTOM_COLOR: COLORREF = COLORREF(0x00FF_FFFF);
 
-/// The color dialog's 16 custom-color slots from the saved list; the rest are empty.
-pub fn custom_color_slots(saved: &[String]) -> [COLORREF; 16] {
-    let mut slots = [EMPTY_CUSTOM_COLOR; 16];
+/// The color dialog's custom-color slots. ChooseColorW reads exactly 16 through a bare
+/// pointer, and the settings keep as many: the one bound, checked against the other.
+pub type CustomColors = [COLORREF; limits::CUSTOM_COLOR_COUNT];
+const _: () = assert!(limits::CUSTOM_COLOR_COUNT == 16, "ChooseColorW's lpCustColors holds 16 colors");
+
+/// The color dialog's custom-color slots from the saved list; the rest are empty.
+pub fn custom_color_slots(saved: &[String]) -> CustomColors {
+    let mut slots = [EMPTY_CUSTOM_COLOR; limits::CUSTOM_COLOR_COUNT];
     for (slot, hex) in slots.iter_mut().zip(saved) {
         if let Some(c) = parse_hex_color(hex) {
             *slot = c;
@@ -206,7 +223,7 @@ pub fn custom_color_slots(saved: &[String]) -> [COLORREF; 16] {
 
 /// The slots as they are saved: trailing empty slots are dropped, since
 /// `custom_color_slots` fills them back in — so settings.json lists only what was picked.
-pub fn custom_colors_to_save(slots: &[COLORREF; 16]) -> Vec<String> {
+pub fn custom_colors_to_save(slots: &CustomColors) -> Vec<String> {
     let used = slots.iter().rposition(|&c| c != EMPTY_CUSTOM_COLOR).map_or(0, |i| i + 1);
     slots[..used].iter().map(|&c| format_hex_color(c)).collect()
 }
@@ -214,7 +231,7 @@ pub fn custom_colors_to_save(slots: &[COLORREF; 16]) -> Vec<String> {
 /// The classic Windows 「色の設定」 dialog (basic colors + 16 custom colors).
 /// `custom` is updated in place whatever the outcome — the native dialog keeps custom
 /// color edits even when cancelled. Returns the chosen color, or `None` on cancel.
-pub fn choose_color(owner: HWND, initial: COLORREF, custom: &mut [COLORREF; 16]) -> Option<COLORREF> {
+pub fn choose_color(owner: HWND, initial: COLORREF, custom: &mut CustomColors) -> Option<COLORREF> {
     let mut cc = CHOOSECOLORW {
         lStructSize: size_of::<CHOOSECOLORW>() as u32,
         hwndOwner: owner,

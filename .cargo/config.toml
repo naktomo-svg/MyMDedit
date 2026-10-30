@@ -6,6 +6,8 @@
 # Control Flow Guard (audit F10): the code is heavy on `unsafe`, COM vtables and
 # callbacks, so an indirect call through a corrupted pointer is the likely shape of an
 # exploit. The standard library itself is not CFG-instrumented; this covers our code
-# and the crates'. `main.rs`'s tests check both settings in the built binary.
+# and the crates'. `main.rs`'s tests check both settings in the built binary, and
+# build.rs refuses to build without them (RUSTFLAGS in the environment replaces this
+# list rather than adding to it).
 [target.'cfg(target_env = "msvc")']
 rustflags = ["-C", "target-feature=+crt-static", "-C", "control-flow-guard"]
