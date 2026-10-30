@@ -300,7 +300,7 @@ pub fn read(path: &Path) -> Result<OpenedDocument, ReadError> {
 /// on one volume) and are then swapped in. A disk-full, a dropped network drive or a
 /// crash midway leaves the original intact rather than truncated.
 pub fn save_atomic(path: &Path, content: &str, format: &DocumentFormat) -> io::Result<()> {
-    let full = std::path::absolute(path)?;
+    let full = resolve_symlink(&std::path::absolute(path)?)?;
     let dir = full
         .parent()
         .ok_or_else(|| io::Error::other(format!("保存先のフォルダを特定できませんでした: {}", path.display())))?;
@@ -334,6 +334,26 @@ pub fn save_atomic(path: &Path, content: &str, format: &DocumentFormat) -> io::R
         _ => remove_if_exists(&temp),
     }
     result
+}
+
+/// The file a symbolic link at `full` points to, or `full` itself. The save swaps a new
+/// file in at the path it is given: given the link, ReplaceFile refuses
+/// (ERROR_NOT_SUPPORTED_ON_SYMLINK) and the fallback rename replaced the link with a plain
+/// file, leaving the real document untouched. A hard link is a different matter: every
+/// atomic save breaks it, which is accepted (docs/spec.md 4.12).
+fn resolve_symlink(full: &Path) -> io::Result<PathBuf> {
+    match fs::symlink_metadata(full) {
+        Ok(m) if m.file_type().is_symlink() => {
+            let target = fs::canonicalize(full)?;
+            // canonicalize answers with a \\?\ path; a drive path reads better in messages.
+            let s = target.to_string_lossy();
+            Ok(match s.strip_prefix(r"\\?\") {
+                Some(rest) if !rest.starts_with("UNC\\") => PathBuf::from(rest),
+                _ => target,
+            })
+        }
+        _ => Ok(full.to_path_buf()),
+    }
 }
 
 /// The file-system calls `swap_into_place` makes, injectable so its recovery paths can
@@ -454,6 +474,22 @@ mod tests {
             return Err(io::Error::from_raw_os_error(32));
         }
         move_file(from, to, overwrite)
+    }
+
+    #[test]
+    fn saving_through_a_symlink_updates_its_target() {
+        let dir = temp_dir();
+        let (target, link) = (dir.join("target.md"), dir.join("link.md"));
+        fs::write(&target, "old").unwrap();
+        // Needs Developer Mode or the privilege; without it there is nothing to test.
+        if std::os::windows::fs::symlink_file(&target, &link).is_err() {
+            fs::remove_dir_all(&dir).unwrap();
+            return;
+        }
+        save_atomic(&link, "new", &DocumentFormat::default()).unwrap();
+        assert_eq!(fs::read_to_string(&target).unwrap(), "new", "the link's target was not updated");
+        assert!(fs::symlink_metadata(&link).unwrap().file_type().is_symlink(), "the link was replaced by a file");
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

@@ -31,14 +31,16 @@ use webview2_com::Microsoft::Web::WebView2::Win32::{
     COREWEBVIEW2_WEB_ERROR_STATUS, COREWEBVIEW2_WEB_RESOURCE_CONTEXT, COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL,
     COREWEBVIEW2_WEB_RESOURCE_CONTEXT_IMAGE, COREWEBVIEW2_WEB_RESOURCE_REQUEST_SOURCE_KINDS_ALL,
     CreateCoreWebView2EnvironmentWithOptions, GetAvailableCoreWebView2BrowserVersionString, ICoreWebView2,
-    ICoreWebView2_4, ICoreWebView2_5, ICoreWebView2_18, ICoreWebView2_22, ICoreWebView2AcceleratorKeyPressedEventArgs,
-    ICoreWebView2Controller, ICoreWebView2Controller2, ICoreWebView2CreateCoreWebView2ControllerCompletedHandler,
-    ICoreWebView2Environment, ICoreWebView2Environment10, ICoreWebView2EnvironmentOptions,
-    ICoreWebView2NavigationCompletedEventArgs, ICoreWebView2NavigationStartingEventArgs,
-    ICoreWebView2ProcessFailedEventArgs, ICoreWebView2Settings4, ICoreWebView2WebResourceRequestedEventArgs,
+    ICoreWebView2_4, ICoreWebView2_5, ICoreWebView2_10, ICoreWebView2_18, ICoreWebView2_22,
+    ICoreWebView2AcceleratorKeyPressedEventArgs, ICoreWebView2Controller, ICoreWebView2Controller2,
+    ICoreWebView2CreateCoreWebView2ControllerCompletedHandler, ICoreWebView2Environment, ICoreWebView2Environment10,
+    ICoreWebView2EnvironmentOptions, ICoreWebView2NavigationCompletedEventArgs,
+    ICoreWebView2NavigationStartingEventArgs, ICoreWebView2ProcessFailedEventArgs, ICoreWebView2Settings4,
+    ICoreWebView2WebResourceRequestedEventArgs,
 };
 use webview2_com::{
-    AcceleratorKeyPressedEventHandler, ClientCertificateRequestedEventHandler, CoreWebView2EnvironmentOptions,
+    AcceleratorKeyPressedEventHandler, BasicAuthenticationRequestedEventHandler,
+    ClientCertificateRequestedEventHandler, CoreWebView2EnvironmentOptions,
     CreateCoreWebView2ControllerCompletedHandler, CreateCoreWebView2EnvironmentCompletedHandler,
     DownloadStartingEventHandler, ExecuteScriptCompletedHandler, LaunchingExternalUriSchemeEventHandler,
     NavigationCompletedEventHandler, NavigationStartingEventHandler, NewWindowRequestedEventHandler,
@@ -59,6 +61,10 @@ pub struct Preview {
     /// rest of the session. Unlike `ready`, nothing ever clears it — not a crash restart,
     /// which would otherwise configure a fresh controller and set `ready` once more.
     stopped: bool,
+    /// Counts `start` calls. Creating a controller is asynchronous, so a second start
+    /// (a duplicated crash notice, say) can be in flight beside the first; only the
+    /// controller of the newest one is kept.
+    generation: u32,
     /// Navigations this app started that have not reached NavigationStarting yet — the
     /// only signal the guard trusts. A count, not a bool: a render per keystroke can put
     /// two of our own navigations in flight, and a bool would cancel the second.
@@ -263,6 +269,24 @@ fn allow_navigation(args: &ICoreWebView2NavigationStartingEventArgs) -> windows:
     Ok(true)
 }
 
+/// A guard's own action (cancel, handled) failed: what it was meant to stop may get
+/// through, so the preview stops.
+fn enforce(context: &str, result: windows::core::Result<()>) {
+    if let Err(e) = result {
+        stop_preview(context, &e);
+    }
+}
+
+/// The URI an event names, for the log. One that cannot be read says why, rather than
+/// passing for an event that named none.
+fn event_uri(read: impl FnOnce(&mut PWSTR) -> windows::core::Result<()>) -> String {
+    let mut uri = PWSTR::null();
+    match read(&mut uri) {
+        Ok(()) => describe_uri(&take_pwstr(uri)),
+        Err(e) => format!("(uri を取得できませんでした: {e})"),
+    }
+}
+
 fn describe_uri(uri: &str) -> String {
     const LIMIT: usize = 200;
     match uri.char_indices().nth(LIMIT) {
@@ -275,6 +299,11 @@ fn describe_uri(uri: &str) -> String {
 const INIT_FAILED: &str = "プレビューを初期化できませんでした。WebView2 ランタイムがインストールされているか確認してください。編集は引き続き行えます。";
 
 pub fn start(this: &App, parent: HWND) {
+    let generation = {
+        let mut p = this.preview.borrow_mut();
+        p.generation = p.generation.wrapping_add(1);
+        p.generation
+    };
     let data_dir = std::env::var_os("LOCALAPPDATA")
         .map(|d| std::path::PathBuf::from(d).join("MyMDedit").join("WebView2"))
         .unwrap_or_else(|| std::env::temp_dir().join("MyMDedit-WebView2"));
@@ -291,11 +320,17 @@ pub fn start(this: &App, parent: HWND) {
         let handler = CreateCoreWebView2ControllerCompletedHandler::create(Box::new(move |result, controller| {
             match (result, controller) {
                 (Ok(()), Some(controller)) => {
-                    if let Err(e) = configure(&controller, &env_for_configure) {
+                    if let Err(e) = configure(&controller, &env_for_configure, generation) {
                         // Never stored, so nothing else would close it: its child window
                         // would linger over the preview's area.
                         log::if_err("ConfigureWebView2 Close", unsafe { controller.Close() });
-                        app().report_error("ConfigureWebView2", INIT_FAILED, Some(&e));
+                        if e.code() == windows::Win32::Foundation::E_ABORT {
+                            // Superseded or stopped on purpose: nothing failed that the user
+                            // has not already been told about.
+                            log::error("ConfigureWebView2", &e);
+                        } else {
+                            app().report_error("ConfigureWebView2", INIT_FAILED, Some(&e));
+                        }
                     }
                 }
                 (r, _) => app().report_error("CreateCoreWebView2Controller", INIT_FAILED, Some(&format!("{r:?}"))),
@@ -341,7 +376,11 @@ fn create_controller(
 }
 
 #[allow(unused_unsafe)]
-fn configure(controller: &ICoreWebView2Controller, env: &ICoreWebView2Environment) -> windows::core::Result<()> {
+fn configure(
+    controller: &ICoreWebView2Controller,
+    env: &ICoreWebView2Environment,
+    generation: u32,
+) -> windows::core::Result<()> {
     let webview = unsafe { controller.CoreWebView2()? };
     unsafe {
         let settings = webview.Settings()?;
@@ -432,18 +471,9 @@ fn configure(controller: &ICoreWebView2Controller, env: &ICoreWebView2Environmen
         webview.add_FrameNavigationStarting(
             &NavigationStartingEventHandler::create(Box::new(|_, args| {
                 let Some(args) = args else { return Ok(()) };
-                if let Err(e) = unsafe { args.SetCancel(true) } {
-                    stop_preview("PreviewFrameNavigationGuard", &e);
-                }
-                let mut uri = PWSTR::null();
-                let uri = match unsafe { args.Uri(&mut uri) } {
-                    Ok(()) => take_pwstr(uri),
-                    Err(_) => String::new(),
-                };
-                log::error(
-                    "PreviewFrameNavigationBlocked",
-                    format!("blocked frame navigation to {}", describe_uri(&uri)),
-                );
+                enforce("PreviewFrameNavigationGuard", unsafe { args.SetCancel(true) });
+                let uri = event_uri(|uri| unsafe { args.Uri(uri) });
+                log::error("PreviewFrameNavigationBlocked", format!("blocked frame navigation to {uri}"));
                 Ok(())
             })),
             &mut token,
@@ -456,10 +486,7 @@ fn configure(controller: &ICoreWebView2Controller, env: &ICoreWebView2Environmen
         webview.cast::<ICoreWebView2_4>()?.add_DownloadStarting(
             &DownloadStartingEventHandler::create(Box::new(|_, args| {
                 let Some(args) = args else { return Ok(()) };
-                let cancelled = unsafe { args.SetCancel(true).and_then(|()| args.SetHandled(true)) };
-                if let Err(e) = cancelled {
-                    stop_preview("PreviewDownloadGuard", &e);
-                }
+                enforce("PreviewDownloadGuard", unsafe { args.SetCancel(true).and_then(|()| args.SetHandled(true)) });
                 log::error("PreviewDownloadBlocked", "blocked a download");
                 Ok(())
             })),
@@ -473,9 +500,7 @@ fn configure(controller: &ICoreWebView2Controller, env: &ICoreWebView2Environmen
         webview.cast::<ICoreWebView2_5>()?.add_ClientCertificateRequested(
             &ClientCertificateRequestedEventHandler::create(Box::new(|_, args| {
                 let Some(args) = args else { return Ok(()) };
-                if let Err(e) = unsafe { args.SetCancel(true) } {
-                    stop_preview("PreviewClientCertificateGuard", &e);
-                }
+                enforce("PreviewClientCertificateGuard", unsafe { args.SetCancel(true) });
                 log::error("PreviewClientCertificateBlocked", "refused a client certificate request");
                 Ok(())
             })),
@@ -488,15 +513,9 @@ fn configure(controller: &ICoreWebView2Controller, env: &ICoreWebView2Environmen
         webview.add_NewWindowRequested(
             &NewWindowRequestedEventHandler::create(Box::new(|_, args| {
                 let Some(args) = args else { return Ok(()) };
-                if let Err(e) = unsafe { args.SetHandled(true) } {
-                    stop_preview("PreviewNewWindowGuard", &e);
-                }
-                let mut uri = PWSTR::null();
-                let uri = match unsafe { args.Uri(&mut uri) } {
-                    Ok(()) => take_pwstr(uri),
-                    Err(_) => String::new(),
-                };
-                log::error("PreviewNewWindowBlocked", format!("blocked new window for {}", describe_uri(&uri)));
+                enforce("PreviewNewWindowGuard", unsafe { args.SetHandled(true) });
+                let uri = event_uri(|uri| unsafe { args.Uri(uri) });
+                log::error("PreviewNewWindowBlocked", format!("blocked new window for {uri}"));
                 Ok(())
             })),
             &mut token,
@@ -508,9 +527,7 @@ fn configure(controller: &ICoreWebView2Controller, env: &ICoreWebView2Environmen
             wv18.add_LaunchingExternalUriScheme(
                 &LaunchingExternalUriSchemeEventHandler::create(Box::new(|_, args| {
                     let Some(args) = args else { return Ok(()) };
-                    if let Err(e) = unsafe { args.SetCancel(true) } {
-                        stop_preview("PreviewExternalSchemeGuard", &e);
-                    }
+                    enforce("PreviewExternalSchemeGuard", unsafe { args.SetCancel(true) });
                     log::error("PreviewExternalSchemeBlocked", "blocked an external URI scheme launch");
                     Ok(())
                 })),
@@ -520,6 +537,28 @@ fn configure(controller: &ICoreWebView2Controller, env: &ICoreWebView2Environmen
             log::error(
                 "ConfigureWebView2",
                 "ICoreWebView2_18 unavailable; external URI schemes are stopped by the navigation guard alone",
+            );
+        }
+
+        // The other way an https image's server can ask the user for something: a 401
+        // with Basic/NTLM authentication. Unhandled, the runtime decides whether to show a
+        // credential prompt — answered, the user's name and password would go to the
+        // document's author. Refused like the client certificate above.
+        if let Ok(wv10) = webview.cast::<ICoreWebView2_10>() {
+            wv10.add_BasicAuthenticationRequested(
+                &BasicAuthenticationRequestedEventHandler::create(Box::new(|_, args| {
+                    let Some(args) = args else { return Ok(()) };
+                    enforce("PreviewBasicAuthenticationGuard", unsafe { args.SetCancel(true) });
+                    let uri = event_uri(|uri| unsafe { args.Uri(uri) });
+                    log::error("PreviewBasicAuthenticationBlocked", format!("refused authentication for {uri}"));
+                    Ok(())
+                })),
+                &mut token,
+            )?;
+        } else {
+            log::error(
+                "ConfigureWebView2",
+                "ICoreWebView2_10 unavailable; authentication requests are left to the runtime",
             );
         }
 
@@ -556,14 +595,18 @@ fn configure(controller: &ICoreWebView2Controller, env: &ICoreWebView2Environmen
     }
 
     let app = app();
-    let (bounds, background, stopped) = {
+    let (bounds, background, stopped, current) = {
         let p = app.preview.borrow();
-        (p.bounds, p.background, p.stopped)
+        (p.bounds, p.background, p.stopped, p.generation)
     };
     if stopped {
         // Only a restart gets here after a stop, and on_process_failed refuses those;
         // should another path appear, it still never brings the preview back.
         return Err(windows::core::Error::new(windows::Win32::Foundation::E_ABORT, "the preview was stopped"));
+    }
+    if generation != current {
+        // A newer start is under way; this controller is closed by the caller.
+        return Err(windows::core::Error::new(windows::Win32::Foundation::E_ABORT, "superseded by a newer start"));
     }
     unsafe {
         log::if_err("ConfigureWebView2 SetBounds", controller.SetBounds(bounds));
@@ -573,11 +616,16 @@ fn configure(controller: &ICoreWebView2Controller, env: &ICoreWebView2Environmen
         }
         controller.SetIsVisible(true)?;
     }
-    {
+    let previous = {
         let mut p = app.preview.borrow_mut();
-        p.controller = Some(controller.clone());
         p.webview = Some(webview);
         p.ready = true;
+        p.controller.replace(controller.clone())
+    };
+    // A controller from an earlier start that nobody closed: its child window would
+    // otherwise linger. (No borrow is held: Close can call back into the app.)
+    if let Some(old) = previous {
+        log::if_err("ConfigureWebView2 Close previous", unsafe { old.Close() });
     }
     app.refresh_preview();
     Ok(())
@@ -735,7 +783,7 @@ pub fn sync_view(this: &App) {
         p.webview.clone()
     };
     let Some(webview) = webview else {
-        // Not reachable while eady implies a webview, but a stuck flag would end zoom
+        // Not reachable while `ready` implies a webview, but a stuck flag would end zoom
         // and scroll sync for good.
         this.preview.borrow_mut().script_busy = false;
         return;
@@ -827,6 +875,11 @@ pub fn close(app: &App) {
         let mut p = app.preview.borrow_mut();
         p.ready = false;
         p.webview = None;
+        // Whatever was in flight goes with the controller; left set, a later start
+        // would find zoom/scroll sync waiting forever on a script that never completes.
+        p.pending_self = 0;
+        p.script_busy = false;
+        p.script_again = false;
         p.controller.take()
     };
     if let Some(c) = controller {

@@ -1,5 +1,6 @@
 //! Thin wrappers over OS-native dialogs and lists.
 
+use std::cell::Cell;
 use std::path::{Path, PathBuf};
 
 use windows::Win32::Foundation::{COLORREF, ERROR_CANCELLED, HWND, LPARAM, S_OK, WPARAM};
@@ -13,11 +14,11 @@ use windows::Win32::UI::Controls::{
     TDF_POSITION_RELATIVE_TO_WINDOW, TDN_HYPERLINK_CLICKED, TaskDialogIndirect,
 };
 use windows::Win32::UI::Shell::Common::COMDLG_FILTERSPEC;
-use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::Shell::{
     FOLDERID_Documents, FileOpenDialog, FileSaveDialog, IFileDialog, IFileOpenDialog, IFileSaveDialog, IShellItem,
     KF_FLAG_DEFAULT, SHCreateItemFromParsingName, SHGetKnownFolderItem, SIGDN_FILESYSPATH,
 };
+use windows::Win32::UI::Shell::{SEE_MASK_FLAG_NO_UI, SEE_MASK_NOASYNC, SHELLEXECUTEINFOW, ShellExecuteExW};
 use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 use windows::core::{HRESULT, HSTRING, PCWSTR, w};
 
@@ -192,35 +193,60 @@ pub fn confirm_overwrite(owner: HWND, file_name: &str) -> windows::core::Result<
 }
 
 /// The project's page: `repository` in Cargo.toml.
-pub const REPOSITORY_URL: &str = env!("CARGO_PKG_REPOSITORY");
+const REPOSITORY_URL: &str = env!("CARGO_PKG_REPOSITORY");
 
-/// The page for the newest release; GitHub redirects it to the latest tag.
-pub fn releases_url() -> String {
-    format!("{REPOSITORY_URL}/releases/latest")
+/// `license` in Cargo.toml, as the exe's VERSIONINFO also shows it.
+const LICENSE: &str = env!("CARGO_PKG_LICENSE");
+
+/// The only pages the app ever opens in a browser. An enum rather than a URL string,
+/// so nothing that came from a document can be handed to the shell through here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProjectPage {
+    Repository,
+    /// GitHub redirects it to the newest release.
+    LatestRelease,
 }
 
-/// Opens an https page of this project in the default browser. Only ever given the
-/// constants above: a URL from a document never gets here.
-pub fn open_url(owner: HWND, url: &str) -> windows::core::Result<()> {
-    debug_assert!(url.starts_with(REPOSITORY_URL));
-    let result = unsafe { ShellExecuteW(Some(owner), w!("open"), &HSTRING::from(url), None, None, SW_SHOWNORMAL) };
-    // Not an HINSTANCE in any real sense: above 32 is success, anything else an error code.
-    if result.0 as usize > 32 { Ok(()) } else { Err(windows::core::Error::from_thread()) }
+impl ProjectPage {
+    pub fn url(self) -> String {
+        match self {
+            ProjectPage::Repository => REPOSITORY_URL.to_string(),
+            ProjectPage::LatestRelease => format!("{REPOSITORY_URL}/releases/latest"),
+        }
+    }
+}
+
+/// Opens `page` in the default browser. The shell's own error UI is off: a failure is
+/// returned (with the error ShellExecuteEx sets) for the caller to show on the banner.
+pub fn open_project_page(owner: HWND, page: ProjectPage) -> windows::core::Result<()> {
+    let url = HSTRING::from(page.url());
+    let mut info = SHELLEXECUTEINFOW {
+        cbSize: size_of::<SHELLEXECUTEINFOW>() as u32,
+        fMask: SEE_MASK_FLAG_NO_UI | SEE_MASK_NOASYNC,
+        hwnd: owner,
+        lpVerb: w!("open"),
+        lpFile: PCWSTR(url.as_ptr()),
+        nShow: SW_SHOWNORMAL.0,
+        ..Default::default()
+    };
+    unsafe { ShellExecuteExW(&mut info) }
 }
 
 /// The body of バージョン情報. `webview2` is the installed runtime's version, if any.
 pub fn about_text(version: &str, copyright: &str, webview2: Option<&str>) -> String {
     let host = REPOSITORY_URL.trim_start_matches("https://");
     format!(
-        "バージョン {version}\nWindows 向けのシンプルな Markdown エディタ\n\n{copyright}\nMIT License\n\n\
+        "バージョン {version}\nWindows 向けのシンプルな Markdown エディタ\n\n{copyright}\n{LICENSE} License\n\n\
          WebView2 ランタイム: {}\n\n<a href=\"{REPOSITORY_URL}\">{host}</a>",
         webview2.unwrap_or("見つかりません")
     )
 }
 
 /// 「バージョン情報」: the app's icon, `content` from [`about_text`], and its link opening
-/// the project page.
-pub fn show_about(owner: HWND, content: &str) -> windows::core::Result<()> {
+/// the project page. `Ok(Some(e))`: the dialog was shown, but its link could not be
+/// opened — for the caller to report, like the menu's own 「GitHub のページを開く」.
+pub fn show_about(owner: HWND, content: &str) -> windows::core::Result<Option<windows::core::Error>> {
+    let link_error: Cell<Option<windows::core::Error>> = Cell::new(None);
     let content = HSTRING::from(content);
     let config = TASKDIALOGCONFIG {
         cbSize: size_of::<TASKDIALOGCONFIG>() as u32,
@@ -236,9 +262,12 @@ pub fn show_about(owner: HWND, content: &str) -> windows::core::Result<()> {
         Anonymous2: TASKDIALOGCONFIG_1 { pszFooterIcon: TD_INFORMATION_ICON },
         pszFooter: w!("同梱している第三者のソフトウェアのライセンスは THIRD-PARTY-NOTICES.txt にあります。"),
         pfCallback: Some(about_callback),
+        // Outlives the dialog: TaskDialogIndirect returns only once it is closed.
+        lpCallbackData: &raw const link_error as isize,
         ..Default::default()
     };
-    unsafe { TaskDialogIndirect(&config, None, None, None) }
+    unsafe { TaskDialogIndirect(&config, None, None, None)? };
+    Ok(link_error.into_inner())
 }
 
 unsafe extern "system" fn about_callback(
@@ -246,15 +275,18 @@ unsafe extern "system" fn about_callback(
     msg: TASKDIALOG_NOTIFICATIONS,
     _: WPARAM,
     lparam: LPARAM,
-    _: isize,
+    data: isize,
 ) -> HRESULT {
     if msg == TDN_HYPERLINK_CLICKED {
         // The href as written in about_text; anything else is not followed.
         let href = unsafe { PCWSTR(lparam.0 as *const u16).to_string() }.unwrap_or_default();
-        if href == REPOSITORY_URL
-            && let Err(e) = open_url(hwnd, &href)
+        if href == ProjectPage::Repository.url()
+            && let Err(e) = open_project_page(hwnd, ProjectPage::Repository)
         {
-            log::error("about open_url", &e);
+            log::error("about open_project_page", &e);
+            // show_about's `link_error`, alive for the whole dialog.
+            let link_error = unsafe { &*(data as *const Cell<Option<windows::core::Error>>) };
+            link_error.set(Some(e));
         }
     }
     S_OK
@@ -385,7 +417,8 @@ mod tests {
         assert!(t.contains("WebView2 ランタイム: 141.0.1"));
         assert!(t.ends_with(&format!("<a href=\"{REPOSITORY_URL}\">github.com/naktomo-svg/MyMDedit</a>")));
         assert!(about_text("1", "c", None).contains("WebView2 ランタイム: 見つかりません"));
-        assert_eq!(releases_url(), "https://github.com/naktomo-svg/MyMDedit/releases/latest");
+        assert_eq!(ProjectPage::Repository.url(), "https://github.com/naktomo-svg/MyMDedit");
+        assert_eq!(ProjectPage::LatestRelease.url(), "https://github.com/naktomo-svg/MyMDedit/releases/latest");
     }
 
     #[test]

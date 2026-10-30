@@ -50,8 +50,13 @@ fn main() {
     log::install_panic_hook();
     unsafe {
         // WebView2 and the shell dialogs both require an STA thread; without one they fail
-        // later with errors that no longer say why.
-        log::if_err("CoInitializeEx", CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok());
+        // later with errors that no longer say why, and nothing could be opened or saved.
+        // So say why now, and stop. (S_FALSE, "already initialized", counts as success.)
+        if let Err(e) = CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok() {
+            log::error("CoInitializeEx", &e);
+            fatal(&format!("COM を初期化できなかったため、起動を中止しました。\n{e}"));
+            return;
+        }
         if !InitCommonControlsEx(&INITCOMMONCONTROLSEX {
             dwSize: size_of::<INITCOMMONCONTROLSEX>() as u32,
             dwICC: ICC_STANDARD_CLASSES | ICC_BAR_CLASSES | ICC_UPDOWN_CLASS | ICC_TAB_CLASSES,
@@ -179,21 +184,73 @@ mod tests {
     /// only would fail the other tool's run with no hint of where the list lives.
     #[test]
     fn license_lists_agree() {
-        fn list<'a>(toml: &'a str, key: &str) -> Vec<&'a str> {
-            let start = toml.find(&format!("{key} = [")).unwrap() + key.len() + 4;
-            let mut v: Vec<&str> = toml[start..start + toml[start..].find(']').unwrap()]
-                .split(',')
-                .map(|s| s.trim().trim_matches('"'))
-                .filter(|s| !s.is_empty())
-                .collect();
-            v.sort();
-            v
-        }
         assert_eq!(
-            list(include_str!("../about.toml"), "accepted"),
-            list(include_str!("../deny.toml"), "allow"),
-            "about.toml's `accepted` and deny.toml's `allow` differ"
+            string_array(include_str!("../about.toml"), "", "accepted"),
+            string_array(include_str!("../deny.toml"), "licenses", "allow"),
+            "about.toml's `accepted` and deny.toml's `[licenses] allow` differ"
         );
+    }
+
+    /// The string array `key` of TOML table `table` ("" for the top level), sorted. Just
+    /// enough TOML for these files: comments stripped, the array may span lines, and a key
+    /// of the same name in another table (or commented out) is not it.
+    fn string_array(toml: &str, table: &str, key: &str) -> Vec<String> {
+        let mut current = String::new();
+        let mut array: Option<String> = None;
+        for raw in toml.lines() {
+            let line = raw.split('#').next().unwrap_or("").trim();
+            if let Some(a) = &mut array {
+                a.push_str(line);
+            } else if line.starts_with('[') {
+                current = line.trim_matches(['[', ']']).trim().to_string();
+            } else if current == table
+                && let Some((k, v)) = line.split_once('=')
+                && k.trim() == key
+            {
+                array = Some(v.trim().to_string());
+            }
+            if array.as_deref().is_some_and(|a| a.contains(']')) {
+                break;
+            }
+        }
+        let array = array.unwrap_or_else(|| panic!("no `{key}` in [{table}]"));
+        let inner = array.trim().strip_prefix('[').and_then(|a| a.split(']').next()).expect("not an array");
+        let mut v: Vec<String> =
+            inner.split(',').map(|s| s.trim().trim_matches('"').to_string()).filter(|s| !s.is_empty()).collect();
+        v.sort();
+        v
+    }
+
+    /// A lone CR or other control character in a source or document reads as text in
+    /// some tools and as a line break in others (a PowerShell-written `` `r `` once turned
+    /// a comment's `ready` into CR + "eady"). Tabs and CRLF/LF line ends are fine.
+    #[test]
+    fn sources_hold_no_stray_control_characters() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut files = vec![root.join("build.rs"), root.join("CLAUDE.md"), root.join("README.md")];
+        for dir in ["src", "docs", "fuzz/src", "fuzz/fuzz_targets"] {
+            for entry in std::fs::read_dir(root.join(dir)).unwrap() {
+                let path = entry.unwrap().path();
+                if path.extension().is_some_and(|e| e == "rs" || e == "md") {
+                    files.push(path);
+                }
+            }
+        }
+        for path in files {
+            let text = std::fs::read_to_string(&path).unwrap();
+            for (n, line) in text.split('\n').enumerate() {
+                let line = line.strip_suffix('\r').unwrap_or(line);
+                let bad = line.chars().find(|&c| c.is_control() && c != '\t');
+                assert!(bad.is_none(), "{}:{}: control character {:?}", path.display(), n + 1, bad.unwrap());
+            }
+        }
+    }
+
+    #[test]
+    fn string_array_reads_only_the_named_table() {
+        let toml = "# allow = [\"X\"]\n[bans]\nallow = [\"Y\"]\n[licenses]\nallow = [\n  \"MIT\", # a comment with ] in it\n  \"Apache-2.0\",\n]\n";
+        assert_eq!(string_array(toml, "licenses", "allow"), ["Apache-2.0", "MIT"]);
+        assert_eq!(string_array(toml, "bans", "allow"), ["Y"]);
     }
 
     #[test]

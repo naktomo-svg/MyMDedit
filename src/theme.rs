@@ -230,7 +230,7 @@ pub fn set_control_theme(hwnd: HWND, dark: bool, dark_class: &str) {
     let class = crate::win::wide(if dark { dark_class } else { "Explorer" });
     allow_dark_for_window(hwnd, dark);
     unsafe {
-        let _ = SetWindowTheme(hwnd, crate::win::pcwstr(&class), None);
+        crate::log::if_err("SetWindowTheme", SetWindowTheme(hwnd, crate::win::pcwstr(&class), None));
     }
 }
 
@@ -321,7 +321,7 @@ pub fn handle_menu_bar_message(
                     cch: (buf.len() - 1) as u32,
                     ..Default::default()
                 };
-                let _ = GetMenuItemInfoW(item.um.hmenu, item.umi.position as u32, true, &mut mii);
+                crate::log::if_err("GetMenuItemInfoW", GetMenuItemInfoW(item.um.hmenu, item.umi.position as u32, true, &mut mii));
                 let text_len = buf.iter().position(|&c| c == 0).unwrap_or(0);
 
                 let state = item.dis.itemState.0;
@@ -345,11 +345,11 @@ pub fn handle_menu_bar_message(
             0x0085 /* WM_NCPAINT */ | 0x0086 /* WM_NCACTIVATE */ => {
                 let result = DefWindowProcW(hwnd, msg, wparam, lparam);
                 let mut client = RECT::default();
-                let _ = GetClientRect(hwnd, &mut client);
+                crate::log::if_err("GetClientRect", GetClientRect(hwnd, &mut client));
                 let mut pts = [windows::Win32::Foundation::POINT { x: client.left, y: client.top }];
                 MapWindowPoints(Some(hwnd), None, &mut pts);
                 let mut win = RECT::default();
-                let _ = GetWindowRect(hwnd, &mut win);
+                crate::log::if_err("GetWindowRect", GetWindowRect(hwnd, &mut win));
                 let top = pts[0].y - win.top;
                 let line = RECT { left: pts[0].x - win.left, top: top - 1, right: pts[0].x - win.left + client.right, bottom: top };
                 let hdc = GetWindowDC(Some(hwnd));

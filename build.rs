@@ -1,9 +1,15 @@
-/// Written once: the exe's VERSIONINFO and the app's バージョン情報 both show it.
-const COPYRIGHT: &str = "Copyright (c) 2026 あぽろ";
+/// Written once: the exe's VERSIONINFO (CompanyName, LegalCopyright) and the app's
+/// バージョン情報 both show it. The license comes from Cargo.toml's `license`.
+const AUTHOR: &str = "あぽろ";
+const COPYRIGHT_YEAR: &str = "2026";
+
+fn copyright() -> String {
+    format!("Copyright (c) {COPYRIGHT_YEAR} {AUTHOR}")
+}
 
 fn main() {
     check_hardening();
-    println!("cargo:rustc-env=MYMDEDIT_COPYRIGHT={COPYRIGHT}");
+    println!("cargo:rustc-env=MYMDEDIT_COPYRIGHT={}", copyright());
     embed_resource::compile("res/app.rc", embed_resource::NONE).manifest_required().unwrap();
     embed_resource::compile(write_version_rc(), embed_resource::NONE).manifest_optional().unwrap();
 
@@ -44,6 +50,7 @@ fn check_hardening() {
 fn write_version_rc() -> std::path::PathBuf {
     let env = |k: &str| std::env::var(k).unwrap();
     let version = env("CARGO_PKG_VERSION");
+    let (copyright, license) = (copyright(), env("CARGO_PKG_LICENSE"));
     let numeric = format!(
         "{},{},{},0",
         env("CARGO_PKG_VERSION_MAJOR"),
@@ -62,11 +69,11 @@ BEGIN
     BEGIN
         BLOCK "041104B0"
         BEGIN
-            VALUE "CompanyName", "あぽろ"
+            VALUE "CompanyName", "{AUTHOR}"
             VALUE "FileDescription", "MyMDedit"
             VALUE "FileVersion", "{version}"
             VALUE "InternalName", "MyMDedit"
-            VALUE "LegalCopyright", "{COPYRIGHT} (MIT License)"
+            VALUE "LegalCopyright", "{copyright} ({license} License)"
             VALUE "OriginalFilename", "MyMDedit.exe"
             VALUE "ProductName", "MyMDedit"
             VALUE "ProductVersion", "{version}"

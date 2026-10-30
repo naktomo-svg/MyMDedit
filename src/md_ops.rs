@@ -78,8 +78,32 @@ pub fn wrap_selection(text: &[u16], start: usize, len: usize, prefix: &str, suff
     }
 }
 
+/// The longest run of backticks in `units`.
+fn longest_backtick_run(units: &[u16]) -> usize {
+    units.split(|&c| c != b'`' as u16).map(<[u16]>::len).max().unwrap_or(0)
+}
+
+/// Inline code: like [`wrap_selection`], but with as many backticks as it takes for the
+/// selection's own backticks not to close the span early (one more than its longest
+/// run), and a space inside each end when the selection starts or ends with a backtick
+/// — CommonMark strips one such space from each end, so the code reads unchanged.
+pub fn inline_code(text: &[u16], start: usize, len: usize) -> Edit {
+    let inner = if len > 0 { text[start..start + len].to_vec() } else { w("コード") };
+    let ticks = "`".repeat(longest_backtick_run(&inner) + 1);
+    let pad = if inner.first() == Some(&(b'`' as u16)) || inner.last() == Some(&(b'`' as u16)) { " " } else { "" };
+    let (prefix, suffix) = (w(&format!("{ticks}{pad}")), w(&format!("{pad}{ticks}")));
+    Edit {
+        start,
+        end: start + len,
+        text: concat(&[&prefix, &inner, &suffix]),
+        sel_start: start + prefix.len(),
+        sel_len: inner.len(),
+    }
+}
+
 /// Link / image: `[text](url)` with the `url` part selected afterwards, so a URL already
-/// on the clipboard can be pasted straight over it.
+/// on the clipboard can be pasted straight over it. `\`, `[` and `]` in the selection
+/// are escaped, or a `]` in it would end the label early and leave no link at all.
 pub fn insert_link(
     text: &[u16],
     start: usize,
@@ -89,7 +113,17 @@ pub fn insert_link(
     url_placeholder: &str,
 ) -> Edit {
     let (opening, close_label, close_url) = (w(opening), w("]("), w(")"));
-    let label = if len > 0 { text[start..start + len].to_vec() } else { w(text_placeholder) };
+    let label = if len > 0 {
+        text[start..start + len]
+            .iter()
+            .flat_map(|&c| {
+                let escape = [b'\\' as u16, b'[' as u16, b']' as u16].contains(&c);
+                escape.then_some(b'\\' as u16).into_iter().chain([c])
+            })
+            .collect()
+    } else {
+        w(text_placeholder)
+    };
     let url = w(url_placeholder);
     Edit {
         start,
@@ -255,12 +289,15 @@ pub fn insert_block(text: &[u16], start: usize, len: usize, block: &str, blank_l
 }
 
 /// Fenced code block around the selection (or a placeholder), with the inside selected.
+/// The fence is longer than any backtick run inside (three at least), so a fence in the
+/// selection cannot close the block early.
 pub fn code_block(text: &[u16], start: usize, len: usize) -> Edit {
     let end = start + len;
     let inner = if len > 0 { text[start..end].to_vec() } else { w("コード") };
     let leading = boundary(text, start, true, false);
     let trailing = boundary(text, end, false, false);
-    let (open, close) = (w("```\r"), w("\r```"));
+    let fence = "`".repeat((longest_backtick_run(&inner) + 1).max(3));
+    let (open, close) = (w(&format!("{fence}\r")), w(&format!("\r{fence}")));
     Edit {
         start,
         end,
@@ -390,12 +427,13 @@ pub fn headings(text: &[u16]) -> Vec<Heading> {
             fence = Some((c, run(c)));
         } else {
             let level = run(b'#' as u16);
-            if (1..=6).contains(&level) && rest.get(level).is_none_or(|&c| c == b' ' as u16) {
+            if (1..=6).contains(&level) && rest.get(level).is_none_or(|&c| c == b' ' as u16 || c == b'\t' as u16) {
                 let title = String::from_utf16_lossy(&rest[level..]);
                 let title = title.trim();
                 // A closing run of #s is decoration, but only after a space: `# C#` is "C#".
                 let stripped = title.trim_end_matches('#');
-                let title = if stripped.is_empty() || stripped.ends_with(' ') { stripped.trim_end() } else { title };
+                let title =
+                    if stripped.is_empty() || stripped.ends_with([' ', '\t']) { stripped.trim_end() } else { title };
                 out.push(Heading { level, line_start: i, title: title.to_string() });
             }
         }
@@ -654,6 +692,30 @@ mod tests {
         // ...and ```a``` with a backtick after the run opens no fence at all.
         assert_eq!(heading_list("```a```\r# yes"), vec![(1, 8, "yes".into())]);
         assert_eq!(heading_list("~~~a~\r# not"), vec![]);
+    }
+
+    #[test]
+    fn delimiters_inside_the_selection_do_not_break_the_markup() {
+        // A fence in the selection would close a ``` block early.
+        let t = "a\r```\rb\r```";
+        let e = code_block(&w(t), 2, 9);
+        assert_eq!(apply(t, &e), ("a\r````\r```\rb\r```\r````".into(), "```\rb\r```".into()));
+        // Backticks in inline code: one more than the longest run, padded at a backtick end.
+        let e = inline_code(&w("a`b"), 0, 3);
+        assert_eq!(apply("a`b", &e), ("``a`b``".into(), "a`b".into()));
+        let e = inline_code(&w("`x`"), 0, 3);
+        assert_eq!(apply("`x`", &e), ("`` `x` ``".into(), "`x`".into()));
+        assert_eq!(apply("", &inline_code(&w(""), 0, 0)), ("`コード`".into(), "コード".into()));
+        // A ] in a link label would end the label; escaped, the link stays a link.
+        let e = insert_link(&w("a]b"), 0, 3, "[", "リンクテキスト", "url");
+        assert_eq!(apply("a]b", &e), ("[a\\]b](url)".into(), "url".into()));
+        let e = insert_link(&w("C:\\x[1]"), 0, 7, "![", "代替テキスト", "url");
+        assert_eq!(apply("C:\\x[1]", &e).0, "![C:\\\\x\\[1\\]](url)");
+    }
+
+    #[test]
+    fn heading_marker_may_be_followed_by_a_tab() {
+        assert_eq!(heading_list("#\tTitle\r##\tA\t##"), vec![(1, 0, "Title".into()), (2, 8, "A".into())]);
     }
 
     #[test]

@@ -34,7 +34,7 @@ use windows::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindow
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{PCWSTR, PWSTR, w};
 
-use crate::dialogs::{self, DiscardChoice};
+use crate::dialogs::{self, DiscardChoice, ProjectPage};
 use crate::document::{self, DiskChange, DocumentFormat, FileStamp, OpenedDocument, ReadError};
 use crate::editor::Editor;
 use crate::goto_dialog;
@@ -95,6 +95,7 @@ const ID_SHORTCUTS: u16 = 190;
 const ID_HELP_GITHUB: u16 = 191;
 const ID_HELP_RELEASES: u16 = 192;
 const ID_ABOUT: u16 = 193;
+const ID_RECENT_SEPARATOR: u16 = 199;
 const ID_RECENT_BASE: u16 = 200;
 /// One command id per recent-folder slot, derived from the cap so the two can't drift.
 const ID_RECENT_END: u16 = ID_RECENT_BASE + settings::limits::RECENT_FOLDER_COUNT as u16;
@@ -105,6 +106,7 @@ const WM_APP_RENDER: u32 = WM_APP + 2;
 // WM_APP + 3 is preview::WM_APP_PREVIEW_FAILED.
 const WM_APP_CHECK_DISK: u32 = WM_APP + 4;
 // WM_APP + 5 is preview::WM_APP_PREVIEW_CLOSE.
+const WM_APP_DISK_CHECKED: u32 = WM_APP + 6;
 const TIMER_SCROLL_SYNC: usize = 1;
 
 const ZOOM_STEP: i32 = 10;
@@ -138,33 +140,66 @@ pub fn accelerator_command(vk: u16, ctrl: bool, shift: bool) -> Option<u16> {
     ACCELERATORS.iter().find(|a| a.0 == vk && a.1 == ctrl && a.2 == shift).map(|a| a.3)
 }
 
-/// ヘルプ → ショートカット一覧, as (the accelerator's command, if it is one; what it
-/// does; the keys). Every command in ACCELERATORS has a row (a test checks), so a new
-/// shortcut cannot go unlisted.
-const SHORTCUT_HELP: &[(Option<u16>, &str, &str)] = &[
-    (Some(ID_NEW), "新規", "Ctrl+N"),
-    (Some(ID_OPEN), "開く", "Ctrl+O"),
-    (Some(ID_SAVE), "保存", "Ctrl+S"),
-    (Some(ID_SAVE_AS), "名前を付けて保存", "Ctrl+Shift+S"),
-    (Some(ID_FIND), "検索", "Ctrl+F"),
-    (Some(ID_REPLACE), "置換", "Ctrl+H"),
-    (Some(ID_GOTO_LINE), "行へ移動", "Ctrl+G"),
-    (Some(ID_OUTLINE), "見出しへ移動", "Ctrl+Shift+O"),
-    (Some(ID_TASK), "タスクの切り替え", "Ctrl+Enter"),
-    (Some(ID_ZOOM_IN), "ズームイン", "Ctrl++"),
-    (Some(ID_ZOOM_OUT), "ズームアウト", "Ctrl+-"),
-    (Some(ID_ZOOM_RESET), "ズームを100%に戻す", "Ctrl+0"),
-    (None, "終了", "Alt+F4"),
-    (None, "元に戻す / やり直し", "Ctrl+Z / Ctrl+Y"),
-    (None, "切り取り / コピー / 貼り付け", "Ctrl+X / Ctrl+C / Ctrl+V"),
-    (None, "すべて選択", "Ctrl+A"),
-    (None, "ズーム(エディタ上)", "Ctrl+マウスホイール"),
-    (None, "リストの自動継続", "Enter"),
-    (None, "リストの字下げ / 字下げを戻す", "Tab / Shift+Tab"),
+/// How a shortcut is written for people: `Ctrl+Shift+S`.
+fn key_text(vk: u16, ctrl: bool, shift: bool) -> String {
+    let key = match vk {
+        v if v == VK_RETURN.0 => "Enter".to_string(),
+        v if v == VK_OEM_PLUS.0 || v == VK_ADD.0 => "+".to_string(),
+        v if v == VK_OEM_MINUS.0 || v == VK_SUBTRACT.0 => "-".to_string(),
+        v if v == VK_NUMPAD0.0 => "0".to_string(),
+        // Letters and digits are their own virtual-key codes.
+        v => char::from(v as u8).to_string(),
+    };
+    format!("{}{}{key}", if ctrl { "Ctrl+" } else { "" }, if shift { "Shift+" } else { "" })
+}
+
+/// The shortcut shown for `cmd`: its first entry in ACCELERATORS, so menus and the
+/// shortcut list name the key that actually works.
+fn shortcut_of(cmd: u16) -> Option<String> {
+    ACCELERATORS.iter().find(|a| a.3 == cmd).map(|&(vk, ctrl, shift, _)| key_text(vk, ctrl, shift))
+}
+
+/// A row of ヘルプ → ショートカット一覧.
+enum ShortcutRow {
+    /// An accelerator: its keys come from ACCELERATORS.
+    Command(u16, &'static str),
+    /// Keys the system or RichEdit handle, written out by hand.
+    Other(&'static str, &'static str),
+}
+
+/// Every command in ACCELERATORS has a row (a test checks), so a new shortcut cannot go
+/// unlisted.
+const SHORTCUT_HELP: &[ShortcutRow] = &[
+    ShortcutRow::Command(ID_NEW, "新規"),
+    ShortcutRow::Command(ID_OPEN, "開く"),
+    ShortcutRow::Command(ID_SAVE, "保存"),
+    ShortcutRow::Command(ID_SAVE_AS, "名前を付けて保存"),
+    ShortcutRow::Command(ID_FIND, "検索"),
+    ShortcutRow::Command(ID_REPLACE, "置換"),
+    ShortcutRow::Command(ID_GOTO_LINE, "行へ移動"),
+    ShortcutRow::Command(ID_OUTLINE, "見出しへ移動"),
+    ShortcutRow::Command(ID_TASK, "タスクの切り替え"),
+    ShortcutRow::Command(ID_ZOOM_IN, "ズームイン"),
+    ShortcutRow::Command(ID_ZOOM_OUT, "ズームアウト"),
+    ShortcutRow::Command(ID_ZOOM_RESET, "ズームを100%に戻す"),
+    ShortcutRow::Other("終了", "Alt+F4"),
+    ShortcutRow::Other("元に戻す / やり直し", "Ctrl+Z / Ctrl+Y"),
+    ShortcutRow::Other("切り取り / コピー / 貼り付け", "Ctrl+X / Ctrl+C / Ctrl+V"),
+    ShortcutRow::Other("すべて選択", "Ctrl+A"),
+    ShortcutRow::Other("ズーム(エディタ上)", "Ctrl+マウスホイール"),
+    ShortcutRow::Other("リストの自動継続", "Enter"),
+    ShortcutRow::Other("リストの字下げ / 字下げを戻す", "Tab / Shift+Tab"),
 ];
 
 fn shortcut_help_text() -> String {
-    SHORTCUT_HELP.iter().map(|(_, what, keys)| format!("{what}: {keys}")).collect::<Vec<_>>().join("\n")
+    SHORTCUT_HELP
+        .iter()
+        .map(|row| match *row {
+            ShortcutRow::Command(id, what) => format!("{what}: {}", shortcut_of(id).unwrap_or_default()),
+            ShortcutRow::Other(what, keys) => format!("{what}: {keys}"),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 struct ToolButton {
@@ -299,7 +334,6 @@ pub struct State {
     layout: Layout,
     installed_fonts: Vec<String>,
     icon_face: &'static str,
-    recent_items: u32,
     find_is_replace: bool,
     /// The folder a recent-folder click is waiting on the background probe for.
     probing_folder: Option<String>,
@@ -346,10 +380,16 @@ pub struct App {
     /// Results of the background folder probe. The window message is only a doorbell:
     /// the payload never travels in lparam, so a forged or duplicated message can't hand
     /// the UI thread a pointer to free.
-    probe_tx: std::sync::mpsc::Sender<std::io::Result<()>>,
-    probe_rx: std::sync::mpsc::Receiver<std::io::Result<()>>,
+    probe_tx: std::sync::mpsc::Sender<(String, std::io::Result<()>)>,
+    probe_rx: std::sync::mpsc::Receiver<(String, std::io::Result<()>)>,
     /// A probe result waiting for the current modal dialog to close.
     pending_probe: RefCell<Option<std::io::Result<()>>>,
+    /// The external-change check's results: (file, stamp it was compared with, verdict).
+    /// Delivered the same way as the folder probe's.
+    disk_tx: std::sync::mpsc::Sender<(PathBuf, FileStamp, DiskChange)>,
+    disk_rx: std::sync::mpsc::Receiver<(PathBuf, FileStamp, DiskChange)>,
+    /// A check is running on a worker thread.
+    disk_check_running: Cell<bool>,
 }
 
 thread_local! {
@@ -378,6 +418,7 @@ pub fn run(launch_file: Option<PathBuf>) -> windows::core::Result<()> {
     theme::set_app_dark_mode(dark);
 
     let (probe_tx, probe_rx) = std::sync::mpsc::channel();
+    let (disk_tx, disk_rx) = std::sync::mpsc::channel();
     let app = Rc::new(App {
         ui: Cell::new(Ui::default()),
         state: RefCell::new(State {
@@ -398,7 +439,6 @@ pub fn run(launch_file: Option<PathBuf>) -> windows::core::Result<()> {
             layout: Layout::default(),
             installed_fonts,
             icon_face,
-            recent_items: 0,
             find_is_replace: false,
             probing_folder: None,
             disk_stamp: None,
@@ -419,6 +459,9 @@ pub fn run(launch_file: Option<PathBuf>) -> windows::core::Result<()> {
         probe_tx,
         probe_rx,
         pending_probe: RefCell::new(None),
+        disk_tx,
+        disk_rx,
+        disk_check_running: Cell::new(false),
     });
     APP.with(|a| *a.borrow_mut() = Some(app.clone()));
 
@@ -570,7 +613,9 @@ impl App {
             }
 
             let editor = Editor::create(hwnd, ID_EDITOR)?;
-            let _ = SetWindowSubclass(editor.hwnd(), Some(editor_proc), 1, 0);
+            // Without it list continuation, Tab indenting and the app-wide Ctrl+wheel zoom are
+            // silently gone; the log says why.
+            install_subclass(editor.hwnd(), editor_proc, "editor");
 
             let mut buttons = [HWND::default(); TOOL_BUTTON_COUNT];
             for (slot, b) in buttons.iter_mut().zip(TOOL_BUTTONS.iter()) {
@@ -599,7 +644,7 @@ impl App {
                 Some(instance.into()),
                 None,
             )?;
-            send(tooltip, TTM_SETMAXTIPWIDTH, 0, scale(400, dpi) as isize);
+            send(tooltip, TTM_SETMAXTIPWIDTH, 0, tooltip_width(dpi));
             for (h, b) in buttons.iter().zip(TOOL_BUTTONS.iter()) {
                 let mut text = wide(b.tip);
                 let ti = TTTOOLINFOW {
@@ -630,7 +675,9 @@ impl App {
 
             let find_message = RegisterWindowMessageW(FINDMSGSTRINGW);
             self.find_message.set(find_message);
-            let find = Box::leak(Box::new(FindData { fr: FINDREPLACEW::default(), find: [0; 512], replace: [0; 512] }));
+            // Leaked, and only ever reached through this raw pointer (see show_find).
+            let find =
+                Box::into_raw(Box::new(FindData { fr: FINDREPLACEW::default(), find: [0; 512], replace: [0; 512] }));
             self.find.set(find);
 
             self.ui.set(Ui {
@@ -669,7 +716,7 @@ impl App {
                 None,
                 None,
             )?;
-            let _ = SetWindowSubclass(h, Some(button_proc), 1, 0);
+            install_subclass(h, button_proc, "toolbar button");
             Ok(h)
         }
     }
@@ -677,9 +724,16 @@ impl App {
     fn build_menu(&self) -> windows::core::Result<HMENU> {
         unsafe {
             let bar = CreateMenu()?;
+            // A command with an accelerator gets its keys from ACCELERATORS; the others
+            // (RichEdit's own keys, Alt+F4) write theirs after a tab.
             let add = |menu: HMENU, id: u16, text: &str| {
-                let t = menu_label(text);
-                let _ = AppendMenuW(menu, MF_STRING, id as usize, pcwstr(&t));
+                debug_assert!(shortcut_of(id).is_none() || !text.contains('\t'), "{text}: keys come from ACCELERATORS");
+                let label = match shortcut_of(id) {
+                    Some(keys) => format!("{text}\t{keys}"),
+                    None => text.to_string(),
+                };
+                let t = menu_label(&label);
+                log::if_err("AppendMenuW", AppendMenuW(menu, MF_STRING, id as usize, pcwstr(&t)));
             };
             let sep = |menu: HMENU| {
                 let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
@@ -690,11 +744,11 @@ impl App {
             };
 
             let file = CreatePopupMenu()?;
-            add(file, ID_NEW, "新規\tCtrl+N");
-            add(file, ID_OPEN, "開く\tCtrl+O");
+            add(file, ID_NEW, "新規");
+            add(file, ID_OPEN, "開く");
             sep(file);
-            add(file, ID_SAVE, "保存\tCtrl+S");
-            add(file, ID_SAVE_AS, "名前を付けて保存\tCtrl+Shift+S");
+            add(file, ID_SAVE, "保存");
+            add(file, ID_SAVE_AS, "名前を付けて保存");
             sep(file); // Recent folders go just above this (rebuild_recent_menu).
             add(file, ID_EXIT, "終了\tAlt+F4");
             popup("ファイル", file);
@@ -709,15 +763,15 @@ impl App {
             sep(edit);
             add(edit, ID_SELECT_ALL, "すべて選択\tCtrl+A");
             sep(edit);
-            add(edit, ID_TASK, "タスクの切り替え\tCtrl+Enter");
+            add(edit, ID_TASK, "タスクの切り替え");
             popup("編集", edit);
 
             let find = CreatePopupMenu()?;
-            add(find, ID_FIND, "検索...\tCtrl+F");
-            add(find, ID_REPLACE, "置換...\tCtrl+H");
+            add(find, ID_FIND, "検索...");
+            add(find, ID_REPLACE, "置換...");
             sep(find);
-            add(find, ID_OUTLINE, "見出しへ移動...\tCtrl+Shift+O");
-            add(find, ID_GOTO_LINE, "行へ移動...\tCtrl+G");
+            add(find, ID_OUTLINE, "見出しへ移動...");
+            add(find, ID_GOTO_LINE, "行へ移動...");
             popup("検索", find);
 
             let settings = CreatePopupMenu()?;
@@ -1250,31 +1304,38 @@ impl App {
         self.persist_settings(|s| s.recent_folders = settings::remove_recent_folder(&s.recent_folders, folder));
     }
 
+    /// The recent-folder items (and the separator above them) are found by their ids,
+    /// never by position or count: an insert that failed, or a File menu item added later,
+    /// cannot make the next rebuild remove the wrong item.
     fn rebuild_recent_menu(&self) {
         let menu = self.ui.get().file_menu;
         let folders = self.current_settings().recent_folders;
-        let previous = std::mem::take(&mut self.state.borrow_mut().recent_items);
         unsafe {
-            // The recent items sit just above the separator over 終了, found by its id
-            // rather than by a position that a new File menu item would shift.
-            let count = u32::try_from(GetMenuItemCount(Some(menu))).unwrap_or(0);
-            let Some(exit) = (0..count).find(|&i| GetMenuItemID(menu, i as i32) == ID_EXIT as u32) else {
-                log::error("rebuild_recent_menu", "終了 is not in the File menu");
-                return;
-            };
-            let start = exit.saturating_sub(1 + previous);
-            for _ in 0..previous {
-                if let Err(e) = RemoveMenu(menu, start, MF_BYPOSITION) {
-                    log::error("RemoveMenu", &e);
-                }
+            // Whatever is there now goes; ids that are not present simply fail.
+            for id in std::iter::once(ID_RECENT_SEPARATOR).chain(ID_RECENT_BASE..ID_RECENT_END) {
+                let _ = RemoveMenu(menu, id as u32, MF_BYCOMMAND);
             }
             if folders.is_empty() {
                 return;
             }
-            let mut pos = start;
-            let _ = InsertMenuW(menu, pos, MF_BYPOSITION | MF_SEPARATOR, 0, None);
-            pos += 1;
-            for (i, folder) in folders.iter().enumerate() {
+            // Each insert goes just above the separator over 終了, so they line up in order.
+            let insert = |item: &MENUITEMINFOW| {
+                let count = u32::try_from(GetMenuItemCount(Some(menu))).unwrap_or(0);
+                let Some(exit) = (0..count).find(|&i| GetMenuItemID(menu, i as i32) == ID_EXIT as u32) else {
+                    log::error("rebuild_recent_menu", "終了 is not in the File menu");
+                    return;
+                };
+                log::if_err("InsertMenuItemW", InsertMenuItemW(menu, exit.saturating_sub(1), true, item));
+            };
+            insert(&MENUITEMINFOW {
+                cbSize: size_of::<MENUITEMINFOW>() as u32,
+                fMask: MIIM_FTYPE | MIIM_ID,
+                fType: MFT_SEPARATOR,
+                wID: ID_RECENT_SEPARATOR as u32,
+                ..Default::default()
+            });
+            // The cap keeps every id inside its reserved range, whatever the list holds.
+            for (i, folder) in folders.iter().take(settings::limits::RECENT_FOLDER_COUNT).enumerate() {
                 let name =
                     Path::new(folder).file_name().map(|n| n.to_string_lossy().into_owned()).filter(|n| !n.is_empty());
                 // Win32 menus have no per-item tooltip; the full path goes in the
@@ -1283,12 +1344,16 @@ impl App {
                     Some(n) => format!("{}\t{}", n.replace('&', "&&"), folder.replace('&', "&&")),
                     None => folder.replace('&', "&&"),
                 };
-                let t = wide(&label);
-                let _ =
-                    InsertMenuW(menu, pos, MF_BYPOSITION | MF_STRING, (ID_RECENT_BASE + i as u16) as usize, pcwstr(&t));
-                pos += 1;
+                let mut t = wide(&label);
+                insert(&MENUITEMINFOW {
+                    cbSize: size_of::<MENUITEMINFOW>() as u32,
+                    fMask: MIIM_FTYPE | MIIM_ID | MIIM_STRING,
+                    fType: MFT_STRING,
+                    wID: (ID_RECENT_BASE + i as u16) as u32,
+                    dwTypeData: PWSTR(t.as_mut_ptr()),
+                    ..Default::default()
+                });
             }
-            self.state.borrow_mut().recent_items = pos - start;
         }
     }
 
@@ -1298,11 +1363,11 @@ impl App {
         let Some(folder) = self.current_settings().recent_folders.get(index).cloned() else {
             return;
         };
-        let already_probing = self.state.borrow().probing_folder.is_some();
-        if already_probing {
-            // A doorbell may have been lost; pick up a result that is already there.
-            if let Ok(result) = self.probe_rx.try_recv() {
-                *self.pending_probe.borrow_mut() = Some(result);
+        let probing = self.state.borrow().probing_folder.clone();
+        if probing.as_deref() == Some(folder.as_str()) {
+            // The same folder again. A doorbell may have been lost; pick up a result that
+            // is already there.
+            if self.collect_probe_result() {
                 self.deliver_pending_probe();
             } else {
                 // Still checking (an unreachable network drive takes a while).
@@ -1312,6 +1377,8 @@ impl App {
             }
             return;
         }
+        // Another folder (or none): this click is what counts now. An earlier probe still
+        // running reports a folder nobody is waiting for, and its result is dropped.
         self.state.borrow_mut().probing_folder = Some(folder.clone());
         let hwnd = self.hwnd().0 as isize;
         let tx = self.probe_tx.clone();
@@ -1319,7 +1386,7 @@ impl App {
             // Listing must actually be attempted: one entry is enough. An empty folder
             // is a perfectly good folder; only the error matters.
             let result = std::fs::read_dir(&folder).and_then(|mut it| it.next().transpose().map(|_| ()));
-            if tx.send(result).is_err() {
+            if tx.send((folder, result)).is_err() {
                 return; // The app is gone.
             }
             unsafe {
@@ -1329,6 +1396,23 @@ impl App {
                 }
             }
         });
+    }
+
+    /// Moves the result for the folder being probed now from the channel to
+    /// `pending_probe`, dropping results for folders clicked before it. Whether one was
+    /// found.
+    fn collect_probe_result(&self) -> bool {
+        let probing = self.state.borrow().probing_folder.clone();
+        let mut found = false;
+        while let Ok((folder, result)) = self.probe_rx.try_recv() {
+            if probing.as_deref() == Some(folder.as_str()) {
+                *self.pending_probe.borrow_mut() = Some(result);
+                found = true;
+            } else {
+                log::error("FolderProbe", format!("dropped the result for {folder}: another folder was clicked since"));
+            }
+        }
+        found
     }
 
     /// Handles a waiting probe result unless a modal dialog is up; then it is retried when
@@ -1573,8 +1657,43 @@ impl App {
     }
 
     /// The window was activated: has another program changed or removed the open file?
-    /// Runs from a posted message, never inside WM_ACTIVATE, as it may show a dialog.
+    /// Runs from a posted message, never inside WM_ACTIVATE. Looking is left to a worker
+    /// thread, like the recent-folder probe: a file on a network drive that has dropped
+    /// blocks the stat for the SMB timeout, and this runs on every activation.
     fn check_external_change(&self) {
+        if self.disk_check_running.get() {
+            // One at a time. A doorbell may have been lost; pick up a result already there.
+            self.on_disk_checked();
+            return;
+        }
+        let (path, recorded) = {
+            let st = self.state.borrow();
+            (st.file_path.clone(), st.disk_stamp)
+        };
+        let (Some(path), Some(recorded)) = (path, recorded) else { return };
+        self.disk_check_running.set(true);
+        let hwnd = self.hwnd().0 as isize;
+        let tx = self.disk_tx.clone();
+        std::thread::spawn(move || {
+            let change = document::check_disk(&path, recorded);
+            if tx.send((path, recorded, change)).is_err() {
+                return; // The app is gone.
+            }
+            unsafe {
+                if let Err(e) = PostMessageW(Some(HWND(hwnd as *mut _)), WM_APP_DISK_CHECKED, WPARAM(0), LPARAM(0)) {
+                    // The result waits in the channel; the next activation collects it.
+                    log::error("check_external_change PostMessage", &e);
+                }
+            }
+        });
+    }
+
+    /// The worker's verdict on the open file, acted on only if it still concerns the
+    /// document as it is now (another file may have been opened, or this one saved,
+    /// while it looked).
+    fn on_disk_checked(&self) {
+        let Some((checked_path, checked_stamp, change)) = self.disk_rx.try_iter().last() else { return };
+        self.disk_check_running.set(false);
         // Our own modal is up (its closing reactivates the window and checks again).
         if self.busy.replace(true) {
             return;
@@ -1590,8 +1709,11 @@ impl App {
                 st.declined_overwrite,
             )
         };
-        if let (Some(path), Some(recorded)) = (path, recorded) {
-            match document::check_disk(&path, recorded) {
+        if let (Some(path), Some(recorded)) = (path, recorded)
+            && path == checked_path
+            && recorded == checked_stamp
+        {
+            match change {
                 DiskChange::Unchanged => {}
                 DiskChange::Missing if !missing_reported => {
                     self.state.borrow_mut().missing_reported = true;
@@ -1852,16 +1974,23 @@ impl App {
             env!("MYMDEDIT_COPYRIGHT"),
             preview::runtime_version().as_deref(),
         );
-        if let Err(e) = dialogs::show_about(self.hwnd(), &text) {
-            self.report_error("About", "バージョン情報を表示できませんでした。", Some(&e));
+        match dialogs::show_about(self.hwnd(), &text) {
+            Ok(None) => {}
+            // Its link failed: told the same way as the menu's 「GitHub のページを開く」.
+            Ok(Some(e)) => self.report_open_failure(ProjectPage::Repository, &e),
+            Err(e) => self.report_error("About", "バージョン情報を表示できませんでした。", Some(&e)),
         }
         self.editor().focus();
     }
 
-    fn open_project_page(&self, url: &str) {
-        if let Err(e) = dialogs::open_url(self.hwnd(), url) {
-            self.report_error("OpenUrl", &format!("ブラウザでページを開けませんでした: {url}"), Some(&e));
+    fn open_project_page(&self, page: ProjectPage) {
+        if let Err(e) = dialogs::open_project_page(self.hwnd(), page) {
+            self.report_open_failure(page, &e);
         }
+    }
+
+    fn report_open_failure(&self, page: ProjectPage, e: &windows::core::Error) {
+        self.report_error("OpenUrl", &format!("ブラウザでページを開けませんでした: {}", page.url()), Some(e));
     }
 
     // ---- find / replace --------------------------------------------------------------
@@ -1886,31 +2015,41 @@ impl App {
             ui.find_dialog = HWND::default();
             self.ui.set(ui);
         }
-        let data = unsafe { &mut *self.find.get() };
+        // Never a reference to FindData: the dialog writes through the pointers handed to
+        // it below for as long as it is open, and a `&mut` they were derived from would be
+        // invalidated (under the aliasing rules) by the next read of the same memory, after
+        // which the dialog's writes are undefined behaviour. Raw pointers from the one
+        // allocation are all of equal standing.
+        let data = self.find.get();
+        const BUF: usize = 512;
         // Seed the search box with a short single-line selection.
         let editor = self.editor();
         let (start, len) = editor.selection();
-        if len > 0 && len < data.find.len() {
+        if len > 0 && len < BUF {
             let text = editor.text();
             let sel = &text[start..start + len];
             if !sel.iter().any(|&c| line_endings::is_break(c)) {
-                data.find.fill(0);
-                data.find[..len].copy_from_slice(sel);
+                let mut seeded = [0u16; BUF];
+                seeded[..len].copy_from_slice(sel);
+                unsafe { (&raw mut (*data).find).write(seeded) };
             }
         }
-        let flags =
-            if data.fr.Flags.0 == 0 { FR_DOWN } else { data.fr.Flags & (FR_DOWN | FR_MATCHCASE | FR_WHOLEWORD) };
-        data.fr = FINDREPLACEW {
-            lStructSize: size_of::<FINDREPLACEW>() as u32,
-            hwndOwner: ui.hwnd,
-            Flags: flags,
-            lpstrFindWhat: PWSTR(data.find.as_mut_ptr()),
-            lpstrReplaceWith: PWSTR(data.replace.as_mut_ptr()),
-            wFindWhatLen: data.find.len() as u16,
-            wReplaceWithLen: data.replace.len() as u16,
-            ..Default::default()
-        };
-        let dialog = unsafe { if replace { ReplaceTextW(&mut data.fr) } else { FindTextW(&mut data.fr) } };
+        let old_flags = unsafe { (*data).fr.Flags };
+        let flags = if old_flags.0 == 0 { FR_DOWN } else { old_flags & (FR_DOWN | FR_MATCHCASE | FR_WHOLEWORD) };
+        let fr = unsafe { &raw mut (*data).fr };
+        unsafe {
+            fr.write(FINDREPLACEW {
+                lStructSize: size_of::<FINDREPLACEW>() as u32,
+                hwndOwner: ui.hwnd,
+                Flags: flags,
+                lpstrFindWhat: PWSTR((&raw mut (*data).find).cast()),
+                lpstrReplaceWith: PWSTR((&raw mut (*data).replace).cast()),
+                wFindWhatLen: BUF as u16,
+                wReplaceWithLen: BUF as u16,
+                ..Default::default()
+            });
+        }
+        let dialog = unsafe { if replace { ReplaceTextW(fr) } else { FindTextW(fr) } };
         if dialog.is_invalid() {
             let code = unsafe { CommDlgExtendedError() };
             // The user asked for this dialog; its absence needs explaining, like the others'.
@@ -1947,12 +2086,14 @@ impl App {
     }
 
     fn on_find_message(&self) {
-        // Copy everything out first: no reference into FindData may outlive this block.
-        // The message boxes below run a modal loop in which show_find can take `&mut`.
+        // Copy everything out first: the message boxes below run a modal loop in which the
+        // dialog (or show_find) can rewrite FindData. Read through the raw pointer, never
+        // a reference (see show_find).
         let (flags, query, replacement): (FINDREPLACE_FLAGS, Vec<u16>, Vec<u16>) = unsafe {
-            let data = &*self.find.get();
+            let data = self.find.get();
+            let (find, replace) = ((&raw const (*data).find).read(), (&raw const (*data).replace).read());
             let cut = |b: &[u16]| b[..b.iter().position(|&c| c == 0).unwrap_or(b.len())].to_vec();
-            (data.fr.Flags, cut(&data.find), cut(&data.replace))
+            ((*data).fr.Flags, cut(&find), cut(&replace))
         };
         if flags.contains(FR_DIALOGTERM) {
             let mut ui = self.ui.get();
@@ -2044,6 +2185,9 @@ impl App {
                 | ID_MORE
                 | ID_SHORTCUTS
                 | ID_ABOUT
+                // ShellExecuteEx can pump messages (DDE) while it starts the browser.
+                | ID_HELP_GITHUB
+                | ID_HELP_RELEASES
         ) || (ID_RECENT_BASE..ID_RECENT_END).contains(&id);
         if modal && self.busy.replace(true) {
             return;
@@ -2078,7 +2222,7 @@ impl App {
             ID_BULLET => self.apply_op(|t, s, l| md_ops::prefix_lines(t, s, l, false, |_| "- ".into())),
             ID_NUMBERED => self.apply_op(|t, s, l| md_ops::prefix_lines(t, s, l, false, |i| format!("{}. ", i + 1))),
             ID_LINK => self.apply_op(|t, s, l| md_ops::insert_link(t, s, l, "[", "リンクテキスト", "url")),
-            ID_CODE => self.apply_op(|t, s, l| md_ops::wrap_selection(t, s, l, "`", "`", "コード")),
+            ID_CODE => self.apply_op(md_ops::inline_code),
             ID_QUOTE => self.apply_op(|t, s, l| md_ops::prefix_lines(t, s, l, false, |_| "> ".into())),
             ID_RULE => self.apply_op(|t, s, l| md_ops::insert_block(t, s, l, "---", true)),
             ID_IMAGE => self.apply_op(|t, s, l| md_ops::insert_link(t, s, l, "![", "代替テキスト", "url")),
@@ -2091,8 +2235,8 @@ impl App {
             ID_GOTO_LINE => self.goto_line(),
             ID_OUTLINE => self.show_outline(),
             ID_SHORTCUTS => self.show_shortcuts(),
-            ID_HELP_GITHUB => self.open_project_page(dialogs::REPOSITORY_URL),
-            ID_HELP_RELEASES => self.open_project_page(&dialogs::releases_url()),
+            ID_HELP_GITHUB => self.open_project_page(ProjectPage::Repository),
+            ID_HELP_RELEASES => self.open_project_page(ProjectPage::LatestRelease),
             ID_ABOUT => self.show_about(),
             id if (ID_RECENT_BASE..ID_RECENT_END).contains(&id) => {
                 self.open_from_recent((id - ID_RECENT_BASE) as usize)
@@ -2113,6 +2257,7 @@ impl App {
         ui.dpi = dpi;
         self.ui.set(ui);
         self.create_fonts();
+        send(ui.tooltip, TTM_SETMAXTIPWIDTH, 0, tooltip_width(dpi));
         unsafe {
             let _ = SetWindowPos(
                 ui.hwnd,
@@ -2211,6 +2356,10 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
             }
             unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
         }
+        WM_APP_DISK_CHECKED => {
+            app.on_disk_checked();
+            LRESULT(0)
+        }
         WM_APP_CHECK_DISK => {
             app.disk_check_pending.set(false);
             app.check_external_change();
@@ -2234,8 +2383,7 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
             LRESULT(0)
         }
         WM_APP_FOLDER_PROBED => {
-            if let Ok(result) = app.probe_rx.try_recv() {
-                *app.pending_probe.borrow_mut() = Some(result);
+            if app.collect_probe_result() {
                 app.deliver_pending_probe();
             }
             LRESULT(0)
@@ -2301,6 +2449,18 @@ fn wheel_steps(accum: i32, delta: i32) -> (i32, i32) {
 const WM_MOUSELEAVE: u32 = 0x02A3;
 
 type SubclassProc = unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM, usize, usize) -> LRESULT;
+
+fn install_subclass(hwnd: HWND, proc: SubclassProc, what: &str) {
+    // FALSE is all it reports: no last error is documented, so none is quoted.
+    if !unsafe { SetWindowSubclass(hwnd, Some(proc), 1, 0) }.as_bool() {
+        log::error("SetWindowSubclass", format!("{what}: could not be installed"));
+    }
+}
+
+/// The tooltips' wrap width, which tracks the window's DPI like everything else drawn.
+fn tooltip_width(dpi: u32) -> isize {
+    scale(400, dpi) as isize
+}
 
 /// SetWindowSubclass's contract: the subclass goes before its window does. WM_NCDESTROY
 /// is the last message the window gets; DefSubclassProc still forwards it afterwards.
@@ -2426,11 +2586,18 @@ mod tests {
 
     #[test]
     fn every_shortcut_is_in_the_help_list() {
+        use super::ShortcutRow;
         for &(_, _, _, cmd) in super::ACCELERATORS {
-            assert!(super::SHORTCUT_HELP.iter().any(|(id, _, _)| *id == Some(cmd)), "command {cmd} has no help row");
+            assert!(
+                super::SHORTCUT_HELP.iter().any(|row| matches!(row, ShortcutRow::Command(id, _) if *id == cmd)),
+                "command {cmd} has no help row"
+            );
         }
         let text = super::shortcut_help_text();
         assert!(text.starts_with("新規: Ctrl+N\n開く: Ctrl+O"));
+        assert!(text.contains("名前を付けて保存: Ctrl+Shift+S\n"));
+        assert!(text.contains("タスクの切り替え: Ctrl+Enter\n"));
+        assert!(text.contains("ズームイン: Ctrl++\nズームアウト: Ctrl+-\nズームを100%に戻す: Ctrl+0\n"));
         assert_eq!(text.lines().count(), super::SHORTCUT_HELP.len());
     }
 

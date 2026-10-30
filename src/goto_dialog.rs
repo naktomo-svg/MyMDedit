@@ -14,6 +14,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, SetActiveWindow,
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{PCWSTR, w};
 
+use crate::log;
 use crate::theme::{Palette, fill, set_control_theme};
 use crate::win::{message_font, pcwstr, scale, send, wide, window_text};
 
@@ -108,10 +109,10 @@ pub fn show(
         RegisterClassW(&wc); // A second registration fails harmlessly.
 
         let mut outer = RECT { left: 0, top: 0, right: s(client_w), bottom: s(client_h) };
-        let _ = AdjustWindowRectExForDpi(&mut outer, style, false, ex, dpi);
+        crate::log::if_err("AdjustWindowRectExForDpi", AdjustWindowRectExForDpi(&mut outer, style, false, ex, dpi));
         let (w, h) = (outer.right - outer.left, outer.bottom - outer.top);
         let mut owner_rect = RECT::default();
-        let _ = GetWindowRect(owner, &mut owner_rect);
+        crate::log::if_err("GetWindowRect", GetWindowRect(owner, &mut owner_rect));
         let x = owner_rect.left + ((owner_rect.right - owner_rect.left) - w) / 2;
         let y = owner_rect.top + ((owner_rect.bottom - owner_rect.top) - h) / 2;
 
@@ -133,10 +134,13 @@ pub fn show(
     unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, &*state as *const DlgState as isize) };
     crate::theme::set_title_bar_dark(hwnd, palette.dark);
 
+    // The first control that could not be created: a dialog without its input field
+    // cannot do its job, so it is not shown (the caller reports it).
+    let failed: RefCell<Option<windows::core::Error>> = RefCell::new(None);
     let make = |class: PCWSTR, text: &str, style: u32, ex: u32, id: i32, x: i32, y: i32, cx: i32, cy: i32| -> HWND {
         let text = wide(text);
         unsafe {
-            let h = CreateWindowExW(
+            let created = CreateWindowExW(
                 WINDOW_EX_STYLE(ex),
                 class,
                 pcwstr(&text),
@@ -149,8 +153,11 @@ pub fn show(
                 Some(HMENU(id as isize as *mut _)),
                 None,
                 None,
-            )
-            .unwrap_or_default();
+            );
+            let h = created.unwrap_or_else(|e| {
+                failed.borrow_mut().get_or_insert(e);
+                HWND::default()
+            });
             send(h, WM_SETFONT, font.0.0 as usize, 1);
             h
         }
@@ -170,6 +177,12 @@ pub fn show(
     );
     let ok = make(w!("BUTTON"), "移動", tab | BS_DEFPUSHBUTTON as u32, 0, IDOK_, 84, 76, 96, 30);
     let cancel = make(w!("BUTTON"), "キャンセル", tab | BS_PUSHBUTTON as u32, 0, IDCANCEL_, 188, 76, 96, 30);
+    if let Some(e) = failed.take() {
+        unsafe {
+            log::if_err("GotoDialog DestroyWindow", DestroyWindow(hwnd));
+        }
+        return Err(e);
+    }
     set_control_theme(edit, palette.dark, "DarkMode_CFD");
     for h in [ok, cancel] {
         set_control_theme(h, palette.dark, "DarkMode_Explorer");
@@ -185,6 +198,9 @@ pub fn show(
     unsafe {
         let _ = EnableWindow(owner, false);
         let mut msg = MSG::default();
+        // Set when the loop could not go on: told to the caller rather than passed off as
+        // キャンセル.
+        let mut loop_error = None;
         while !state.done.get() {
             match GetMessageW(&mut msg, None, 0, 0).0 {
                 0 => {
@@ -192,7 +208,10 @@ pub fn show(
                     PostQuitMessage(msg.wParam.0 as i32);
                     break;
                 }
-                -1 => break,
+                -1 => {
+                    loop_error = Some(windows::core::Error::from_thread());
+                    break;
+                }
                 _ => {
                     if !IsDialogMessageW(hwnd, &msg).as_bool() {
                         let _ = TranslateMessage(&msg);
@@ -203,7 +222,10 @@ pub fn show(
         }
         let _ = EnableWindow(owner, true);
         let _ = SetActiveWindow(owner);
-        let _ = DestroyWindow(hwnd);
+        crate::log::if_err("DestroyWindow", DestroyWindow(hwnd));
+        if let Some(e) = loop_error {
+            return Err(e);
+        }
     }
     Ok(state.result.borrow_mut().take())
 }
@@ -244,7 +266,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         WM_ERASEBKGND => {
             let mut rc = RECT::default();
             unsafe {
-                let _ = GetClientRect(hwnd, &mut rc);
+                crate::log::if_err("GetClientRect", GetClientRect(hwnd, &mut rc));
             }
             fill(HDC(wparam.0 as *mut _), &rc, p.window_bg);
             LRESULT(1)
