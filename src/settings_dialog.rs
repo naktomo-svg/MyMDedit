@@ -171,10 +171,10 @@ pub fn show(
         let mut outer = client;
         let style = WS_POPUP | WS_CAPTION | WS_SYSMENU;
         let ex = WS_EX_DLGMODALFRAME | WS_EX_CONTROLPARENT;
-        let _ = AdjustWindowRectExForDpi(&mut outer, style, false, ex, dpi);
+        crate::log::if_err("AdjustWindowRectExForDpi", AdjustWindowRectExForDpi(&mut outer, style, false, ex, dpi));
         let (w, h) = (outer.right - outer.left, outer.bottom - outer.top);
         let mut owner_rect = RECT::default();
-        let _ = GetWindowRect(owner, &mut owner_rect);
+        crate::log::if_err("GetWindowRect", GetWindowRect(owner, &mut owner_rect));
         let x = owner_rect.left + ((owner_rect.right - owner_rect.left) - w) / 2;
         let y = owner_rect.top + ((owner_rect.bottom - owner_rect.top) - h) / 2;
 
@@ -422,7 +422,7 @@ pub fn show(
         // ignores WM_CTLCOLORBTN; unthemed, it honours the color we hand it.
         for h in [bg_check, header, stripe] {
             unsafe {
-                let _ = windows::Win32::UI::Controls::SetWindowTheme(h, w!(""), w!(""));
+                crate::log::if_err("SetWindowTheme", windows::Win32::UI::Controls::SetWindowTheme(h, w!(""), w!("")));
             }
         }
     }
@@ -430,14 +430,20 @@ pub fn show(
     // Fit the window to the content.
     unsafe {
         let mut rc = RECT { left: 0, top: 0, right: s(420), bottom: s(y) };
-        let _ = AdjustWindowRectExForDpi(
-            &mut rc,
-            WS_POPUP | WS_CAPTION | WS_SYSMENU,
-            false,
-            WS_EX_DLGMODALFRAME | WS_EX_CONTROLPARENT,
-            dpi,
+        crate::log::if_err(
+            "AdjustWindowRectExForDpi",
+            AdjustWindowRectExForDpi(
+                &mut rc,
+                WS_POPUP | WS_CAPTION | WS_SYSMENU,
+                false,
+                WS_EX_DLGMODALFRAME | WS_EX_CONTROLPARENT,
+                dpi,
+            ),
         );
-        let _ = SetWindowPos(hwnd, None, 0, 0, rc.right - rc.left, rc.bottom - rc.top, SWP_NOMOVE | SWP_NOZORDER);
+        crate::log::if_err(
+            "SetWindowPos",
+            SetWindowPos(hwnd, None, 0, 0, rc.right - rc.left, rc.bottom - rc.top, SWP_NOMOVE | SWP_NOZORDER),
+        );
         let _ = ShowWindow(hwnd, SW_SHOW);
         let _ = SetFocus(Some(theme));
     }
@@ -470,7 +476,7 @@ pub fn show(
         }
         let _ = EnableWindow(owner, true);
         let _ = SetActiveWindow(owner);
-        let _ = DestroyWindow(hwnd);
+        crate::log::if_err("DestroyWindow", DestroyWindow(hwnd));
         if let Some(e) = loop_error {
             return Err(e);
         }
@@ -540,7 +546,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         WM_ERASEBKGND => {
             let mut rc = RECT::default();
             unsafe {
-                let _ = GetClientRect(hwnd, &mut rc);
+                crate::log::if_err("GetClientRect", GetClientRect(hwnd, &mut rc));
             }
             fill(HDC(wparam.0 as *mut _), &rc, p.window_bg);
             LRESULT(1)

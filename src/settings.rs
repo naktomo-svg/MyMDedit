@@ -190,6 +190,9 @@ pub struct SettingsStore {
     writable: bool,
     /// Something the user should be told at startup about how the settings were loaded.
     load_warning: Option<String>,
+    /// What the last backup held: a file still broken the same way is not copied again
+    /// on every write.
+    last_backup_at: Option<(Vec<u8>, PathBuf)>,
 }
 
 impl SettingsStore {
@@ -201,8 +204,13 @@ impl SettingsStore {
     }
 
     pub fn open(path: Option<PathBuf>) -> Self {
-        let mut store =
-            Self { path: path.clone(), current: AppSettings::default(), writable: true, load_warning: None };
+        let mut store = Self {
+            path: path.clone(),
+            current: AppSettings::default(),
+            writable: true,
+            load_warning: None,
+            last_backup_at: None,
+        };
         if let Some(path) = path {
             store.read(&path);
         }
@@ -240,7 +248,7 @@ impl SettingsStore {
         self.current = settings;
         if let Some(problem) = problem {
             // The next save will drop whatever could not be read, so keep the original.
-            self.load_warning = Some(match back_up(path) {
+            self.load_warning = Some(match self.back_up(path) {
                 Ok(backup) => format!("{problem}元のファイルは {} に保存してあります。", backup.display()),
                 Err(e) => {
                     log::error("SettingsStore.load backup", &e);
@@ -292,7 +300,7 @@ impl SettingsStore {
             Ok(None) => self.current.clone(),
             Ok(Some(Parsed::Clean(s))) => s,
             // What could be read is newer than our view; the rest is about to be dropped.
-            Ok(Some(Parsed::Partial(s, _))) => match back_up(&path) {
+            Ok(Some(Parsed::Partial(s, _))) => match self.back_up(&path) {
                 Ok(_) => s,
                 Err(e) => {
                     self.current = apply(self.current.clone());
@@ -303,7 +311,7 @@ impl SettingsStore {
             // replaced it is safe.
             Ok(Some(Parsed::Unreadable(reason))) => {
                 log::error("SettingsStore.update parse", &reason);
-                if let Err(e) = back_up(&path) {
+                if let Err(e) = self.back_up(&path) {
                     self.current = apply(self.current.clone());
                     return Err(e);
                 }
@@ -326,10 +334,40 @@ impl SettingsStore {
 
 /// Copies a settings file that is about to lose fields to `settings.broken-<time>.json`
 /// beside it.
-fn back_up(path: &Path) -> std::io::Result<PathBuf> {
-    let backup = path.with_file_name(format!("settings.broken-{}.json", unix_seconds()));
-    std::fs::copy(path, &backup)?;
-    Ok(backup)
+impl SettingsStore {
+    /// Backs the file up unless it holds exactly what was backed up last time; the path
+    /// of the copy that has it either way.
+    fn back_up(&mut self, path: &Path) -> std::io::Result<PathBuf> {
+        let bytes = std::fs::read(path)?;
+        if let Some((done, at)) = &self.last_backup_at
+            && *done == bytes
+        {
+            return Ok(at.clone());
+        }
+        let at = write_backup(path, &bytes)?;
+        self.last_backup_at = Some((bytes, at.clone()));
+        Ok(at)
+    }
+}
+
+/// A name already taken (two backups within one second) gets a counter instead of
+/// overwriting the earlier backup.
+fn write_backup(path: &Path, bytes: &[u8]) -> std::io::Result<PathBuf> {
+    let secs = unix_seconds();
+    for n in 1..100 {
+        let name =
+            if n == 1 { format!("settings.broken-{secs}.json") } else { format!("settings.broken-{secs}-{n}.json") };
+        let backup = path.with_file_name(name);
+        match std::fs::File::create_new(&backup) {
+            Ok(mut f) => {
+                std::io::Write::write_all(&mut f, bytes)?;
+                return Ok(backup);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(std::io::Error::other("no free name for the settings backup"))
 }
 
 /// What is on disk right now. `Ok(None)` = no file yet.
@@ -580,6 +618,24 @@ mod tests {
         assert_eq!(names.len(), 1);
         assert_eq!(std::fs::read_to_string(dir.join(&names[0])).unwrap(), "{\"theme\": \"Dark\",}");
         assert_eq!(SettingsStore::open(Some(path)).current().theme, Theme::Light);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn backups_within_one_second_do_not_overwrite_each_other() {
+        let dir = test_dir("backup-names");
+        let path = dir.join("settings.json");
+        let mut store = SettingsStore::open(None);
+        std::fs::write(&path, "first").unwrap();
+        let a = store.back_up(&path).unwrap();
+        // The same broken content again is not copied twice...
+        assert_eq!(store.back_up(&path).unwrap(), a);
+        // ...but different content gets its own backup, even within the same second.
+        std::fs::write(&path, "second").unwrap();
+        let b = store.back_up(&path).unwrap();
+        assert_ne!(a, b);
+        assert_eq!(std::fs::read_to_string(&a).unwrap(), "first");
+        assert_eq!(std::fs::read_to_string(&b).unwrap(), "second");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
