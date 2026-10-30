@@ -34,7 +34,7 @@ use windows::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindow
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{PCWSTR, PWSTR, w};
 
-use crate::dialogs::{self, DiscardChoice};
+use crate::dialogs::{self, DiscardChoice, ProjectPage};
 use crate::document::{self, DiskChange, DocumentFormat, FileStamp, OpenedDocument, ReadError};
 use crate::editor::Editor;
 use crate::goto_dialog;
@@ -1906,16 +1906,23 @@ impl App {
             env!("MYMDEDIT_COPYRIGHT"),
             preview::runtime_version().as_deref(),
         );
-        if let Err(e) = dialogs::show_about(self.hwnd(), &text) {
-            self.report_error("About", "バージョン情報を表示できませんでした。", Some(&e));
+        match dialogs::show_about(self.hwnd(), &text) {
+            Ok(None) => {}
+            // Its link failed: told the same way as the menu's 「GitHub のページを開く」.
+            Ok(Some(e)) => self.report_open_failure(ProjectPage::Repository, &e),
+            Err(e) => self.report_error("About", "バージョン情報を表示できませんでした。", Some(&e)),
         }
         self.editor().focus();
     }
 
-    fn open_project_page(&self, url: &str) {
-        if let Err(e) = dialogs::open_url(self.hwnd(), url) {
-            self.report_error("OpenUrl", &format!("ブラウザでページを開けませんでした: {url}"), Some(&e));
+    fn open_project_page(&self, page: ProjectPage) {
+        if let Err(e) = dialogs::open_project_page(self.hwnd(), page) {
+            self.report_open_failure(page, &e);
         }
+    }
+
+    fn report_open_failure(&self, page: ProjectPage, e: &windows::core::Error) {
+        self.report_error("OpenUrl", &format!("ブラウザでページを開けませんでした: {}", page.url()), Some(e));
     }
 
     // ---- find / replace --------------------------------------------------------------
@@ -2110,6 +2117,9 @@ impl App {
                 | ID_MORE
                 | ID_SHORTCUTS
                 | ID_ABOUT
+                // ShellExecuteEx can pump messages (DDE) while it starts the browser.
+                | ID_HELP_GITHUB
+                | ID_HELP_RELEASES
         ) || (ID_RECENT_BASE..ID_RECENT_END).contains(&id);
         if modal && self.busy.replace(true) {
             return;
@@ -2157,8 +2167,8 @@ impl App {
             ID_GOTO_LINE => self.goto_line(),
             ID_OUTLINE => self.show_outline(),
             ID_SHORTCUTS => self.show_shortcuts(),
-            ID_HELP_GITHUB => self.open_project_page(dialogs::REPOSITORY_URL),
-            ID_HELP_RELEASES => self.open_project_page(&dialogs::releases_url()),
+            ID_HELP_GITHUB => self.open_project_page(ProjectPage::Repository),
+            ID_HELP_RELEASES => self.open_project_page(ProjectPage::LatestRelease),
             ID_ABOUT => self.show_about(),
             id if (ID_RECENT_BASE..ID_RECENT_END).contains(&id) => {
                 self.open_from_recent((id - ID_RECENT_BASE) as usize)
