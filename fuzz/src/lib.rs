@@ -65,6 +65,15 @@ pub fn css_blocks(css: &str) -> usize {
     count
 }
 
+/// `#RGB` or `#RRGGBB` and nothing else: the only background color the preview may
+/// write into its CSS. Written apart from `settings::is_hex_color`, which it checks.
+pub fn is_strict_hex_color(value: &str) -> bool {
+    let b = value.as_bytes();
+    (b.len() == 4 || b.len() == 7)
+        && b[0] == b'#'
+        && b[1..].iter().all(|c| matches!(c, b'0'..=b'9' | b'a'..=b'f' | b'A'..=b'F'))
+}
+
 /// Whether `value` holds only what a `font-family` value may: closed quoted strings
 /// without a raw newline, bare idents, commas and spaces. Anything else (`;`, `{`, `}`,
 /// an unclosed string) could reach past the declaration.
@@ -148,6 +157,9 @@ mod tests {
         assert!(!is_contained_font_family("\"a\nb\""));
         assert!(is_contained_font_family("\"Segoe UI\", sans-serif, \"a\\\"{\""));
         assert_eq!(css_blocks("a { x: \"{\" } b{}"), 2);
+        assert!(is_strict_hex_color("#1e1E1e") && is_strict_hex_color("#fff"));
+        assert!(!is_strict_hex_color("#ffff") && !is_strict_hex_color("red") && !is_strict_hex_color("#fff;x:y"));
+        assert!(!is_strict_hex_color("#ｆｆｆ"), "full-width digits are not hex");
         // The real pipeline: a fetching tag in raw HTML is neutralised.
         let html =
             render::to_html_document("<link rel=preconnect href=https://x>", &settings::AppSettings::default(), 0).html;

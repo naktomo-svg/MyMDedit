@@ -194,6 +194,9 @@ pub fn confirm_overwrite(owner: HWND, file_name: &str) -> windows::core::Result<
 /// The project's page: `repository` in Cargo.toml.
 pub const REPOSITORY_URL: &str = env!("CARGO_PKG_REPOSITORY");
 
+/// `license` in Cargo.toml, as the exe's VERSIONINFO also shows it.
+const LICENSE: &str = env!("CARGO_PKG_LICENSE");
+
 /// The page for the newest release; GitHub redirects it to the latest tag.
 pub fn releases_url() -> String {
     format!("{REPOSITORY_URL}/releases/latest")
@@ -212,7 +215,7 @@ pub fn open_url(owner: HWND, url: &str) -> windows::core::Result<()> {
 pub fn about_text(version: &str, copyright: &str, webview2: Option<&str>) -> String {
     let host = REPOSITORY_URL.trim_start_matches("https://");
     format!(
-        "バージョン {version}\nWindows 向けのシンプルな Markdown エディタ\n\n{copyright}\nMIT License\n\n\
+        "バージョン {version}\nWindows 向けのシンプルな Markdown エディタ\n\n{copyright}\n{LICENSE} License\n\n\
          WebView2 ランタイム: {}\n\n<a href=\"{REPOSITORY_URL}\">{host}</a>",
         webview2.unwrap_or("見つかりません")
     )

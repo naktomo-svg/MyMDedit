@@ -128,7 +128,7 @@ const SETTINGS_FILE_FORMAT: DocumentFormat =
 
 /// What [`parse_settings`] made of a settings file.
 #[derive(Debug)]
-enum Parsed {
+pub enum Parsed {
     /// Every field read cleanly.
     Clean(AppSettings),
     /// Readable as a whole, but these fields were invalid and fell back to defaults.
@@ -139,7 +139,7 @@ enum Parsed {
 
 /// Reads settings field by field, so one bad value (a misspelt theme, a string where a
 /// number belongs) costs only that field instead of every setting.
-fn parse_settings(text: &str) -> Parsed {
+pub fn parse_settings(text: &str) -> Parsed {
     // Editors that save "UTF-8" with a BOM are common; JSON parsers reject it.
     let text = text.strip_prefix('\u{FEFF}').unwrap_or(text);
     let object = match serde_json::from_str::<serde_json::Value>(text) {
