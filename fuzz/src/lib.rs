@@ -107,6 +107,30 @@ pub fn is_contained_font_family(value: &str) -> bool {
 /// it keeps the UTF-16 length; "whole word" means no alphanumeric character touches
 /// either end.
 pub fn reference_find_all(text: &[u16], query: &[u16], case_sensitive: bool, whole_word: bool) -> Vec<usize> {
+    let mut found = Vec::new();
+    let mut pos = 0;
+    while pos + query.len() <= text.len() {
+        if reference_is_match_at(text, pos, query.len(), query, case_sensitive, whole_word) {
+            found.push(pos);
+            pos += query.len();
+        } else {
+            pos += 1;
+        }
+    }
+    found
+}
+
+/// Whether `text[start..start + len]` is a match by the rules of [`reference_find_all`]:
+/// what the Replace button may replace. `query` is valid UTF-16; `start` and `len` are
+/// anything (a selection can split a surrogate pair, or end past the text).
+pub fn reference_is_match_at(
+    text: &[u16],
+    start: usize,
+    len: usize,
+    query: &[u16],
+    case_sensitive: bool,
+    whole_word: bool,
+) -> bool {
     let upper = |units: &[u16]| -> Vec<u16> {
         let s = String::from_utf16(units).unwrap();
         s.chars()
@@ -122,26 +146,14 @@ pub fn reference_find_all(text: &[u16], query: &[u16], case_sensitive: bool, who
         let c = if last { s.chars().next_back() } else { s.chars().next() };
         c.is_some_and(char::is_alphanumeric)
     };
-    let mut found = Vec::new();
-    if query.is_empty() {
-        return found;
-    }
-    let q = upper(query);
-    let mut pos = 0;
-    while pos + q.len() <= text.len() {
-        let end = pos + q.len();
-        // Only compare whole characters: a slice that splits a surrogate pair is no match.
-        let ok = String::from_utf16(&text[pos..end]).is_ok()
-            && upper(&text[pos..end]) == q
-            && (!whole_word || (!word_at(&text[..pos], true) && !word_at(&text[end..], false)));
-        if ok {
-            found.push(pos);
-            pos = end;
-        } else {
-            pos += 1;
-        }
-    }
-    found
+    let end = start + len;
+    !query.is_empty()
+        && len == query.len()
+        && end <= text.len()
+        // Only whole characters: a slice that splits a surrogate pair is no match.
+        && String::from_utf16(&text[start..end]).is_ok()
+        && upper(&text[start..end]) == upper(query)
+        && (!whole_word || (!word_at(&text[..start], true) && !word_at(&text[end..], false)))
 }
 
 #[cfg(test)]
@@ -170,5 +182,9 @@ mod tests {
         assert_eq!(reference_find_all(&w("x𐐨y 𐐨cat"), &w("𐐀"), false, false), [1, 5]);
         assert_eq!(reference_find_all(&w("𐐨cat"), &w("cat"), false, true), [] as [usize; 0]);
         assert_eq!(reference_find_all(&w("aaa"), &w("aa"), true, false), [0]);
+        assert!(!reference_is_match_at(&w("category"), 0, 3, &w("cat"), false, true), "part of a word");
+        assert!(reference_is_match_at(&w("category"), 0, 3, &w("CAT"), false, false));
+        assert!(!reference_is_match_at(&w("cat"), 0, 2, &w("cat"), false, false), "length differs");
+        assert!(!reference_is_match_at(&w("cat"), 2, 3, &w("cat"), false, false), "past the end");
     }
 }

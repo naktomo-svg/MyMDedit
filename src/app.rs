@@ -379,8 +379,8 @@ pub struct App {
     /// Results of the background folder probe. The window message is only a doorbell:
     /// the payload never travels in lparam, so a forged or duplicated message can't hand
     /// the UI thread a pointer to free.
-    probe_tx: std::sync::mpsc::Sender<std::io::Result<()>>,
-    probe_rx: std::sync::mpsc::Receiver<std::io::Result<()>>,
+    probe_tx: std::sync::mpsc::Sender<(String, std::io::Result<()>)>,
+    probe_rx: std::sync::mpsc::Receiver<(String, std::io::Result<()>)>,
     /// A probe result waiting for the current modal dialog to close.
     pending_probe: RefCell<Option<std::io::Result<()>>>,
 }
@@ -1352,11 +1352,11 @@ impl App {
         let Some(folder) = self.current_settings().recent_folders.get(index).cloned() else {
             return;
         };
-        let already_probing = self.state.borrow().probing_folder.is_some();
-        if already_probing {
-            // A doorbell may have been lost; pick up a result that is already there.
-            if let Ok(result) = self.probe_rx.try_recv() {
-                *self.pending_probe.borrow_mut() = Some(result);
+        let probing = self.state.borrow().probing_folder.clone();
+        if probing.as_deref() == Some(folder.as_str()) {
+            // The same folder again. A doorbell may have been lost; pick up a result that
+            // is already there.
+            if self.collect_probe_result() {
                 self.deliver_pending_probe();
             } else {
                 // Still checking (an unreachable network drive takes a while).
@@ -1366,6 +1366,8 @@ impl App {
             }
             return;
         }
+        // Another folder (or none): this click is what counts now. An earlier probe still
+        // running reports a folder nobody is waiting for, and its result is dropped.
         self.state.borrow_mut().probing_folder = Some(folder.clone());
         let hwnd = self.hwnd().0 as isize;
         let tx = self.probe_tx.clone();
@@ -1373,7 +1375,7 @@ impl App {
             // Listing must actually be attempted: one entry is enough. An empty folder
             // is a perfectly good folder; only the error matters.
             let result = std::fs::read_dir(&folder).and_then(|mut it| it.next().transpose().map(|_| ()));
-            if tx.send(result).is_err() {
+            if tx.send((folder, result)).is_err() {
                 return; // The app is gone.
             }
             unsafe {
@@ -1383,6 +1385,23 @@ impl App {
                 }
             }
         });
+    }
+
+    /// Moves the result for the folder being probed now from the channel to
+    /// `pending_probe`, dropping results for folders clicked before it. Whether one was
+    /// found.
+    fn collect_probe_result(&self) -> bool {
+        let probing = self.state.borrow().probing_folder.clone();
+        let mut found = false;
+        while let Ok((folder, result)) = self.probe_rx.try_recv() {
+            if probing.as_deref() == Some(folder.as_str()) {
+                *self.pending_probe.borrow_mut() = Some(result);
+                found = true;
+            } else {
+                log::error("FolderProbe", format!("dropped the result for {folder}: another folder was clicked since"));
+            }
+        }
+        found
     }
 
     /// Handles a waiting probe result unless a modal dialog is up; then it is retried when
@@ -2311,8 +2330,7 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
             LRESULT(0)
         }
         WM_APP_FOLDER_PROBED => {
-            if let Ok(result) = app.probe_rx.try_recv() {
-                *app.pending_probe.borrow_mut() = Some(result);
+            if app.collect_probe_result() {
                 app.deliver_pending_probe();
             }
             LRESULT(0)

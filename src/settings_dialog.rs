@@ -446,6 +446,9 @@ pub fn show(
     unsafe {
         let _ = EnableWindow(owner, false);
         let mut msg = MSG::default();
+        // Set when the loop could not go on: told to the caller rather than passed off as
+        // キャンセル.
+        let mut loop_error = None;
         while !state.done.get() {
             match GetMessageW(&mut msg, None, 0, 0).0 {
                 0 => {
@@ -453,7 +456,10 @@ pub fn show(
                     PostQuitMessage(msg.wParam.0 as i32);
                     break;
                 }
-                -1 => break,
+                -1 => {
+                    loop_error = Some(windows::core::Error::from_thread());
+                    break;
+                }
                 _ => {
                     if !IsDialogMessageW(hwnd, &msg).as_bool() {
                         let _ = TranslateMessage(&msg);
@@ -465,6 +471,9 @@ pub fn show(
         let _ = EnableWindow(owner, true);
         let _ = SetActiveWindow(owner);
         let _ = DestroyWindow(hwnd);
+        if let Some(e) = loop_error {
+            return Err(e);
+        }
     }
     Ok(state.result.borrow_mut().take())
 }
