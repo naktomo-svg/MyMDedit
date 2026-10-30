@@ -5,6 +5,8 @@ edition = "2024"
 publish = false
 license = "MIT"
 description = "MyMDedit - Windows向けのシンプルなMarkdownエディタ(Win32 + WebView2)"
+# Also what ヘルプ → GitHub のページ / 最新版を確認 open.
+repository = "https://github.com/naktomo-svg/MyMDedit"
 
 [[bin]]
 name = "MyMDedit"

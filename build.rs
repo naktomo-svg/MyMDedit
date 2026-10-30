@@ -1,5 +1,9 @@
+/// Written once: the exe's VERSIONINFO and the app's バージョン情報 both show it.
+const COPYRIGHT: &str = "Copyright (c) 2026 あぽろ";
+
 fn main() {
     check_hardening();
+    println!("cargo:rustc-env=MYMDEDIT_COPYRIGHT={COPYRIGHT}");
     embed_resource::compile("res/app.rc", embed_resource::NONE).manifest_required().unwrap();
     embed_resource::compile(write_version_rc(), embed_resource::NONE).manifest_optional().unwrap();
 
@@ -62,7 +66,7 @@ BEGIN
             VALUE "FileDescription", "MyMDedit"
             VALUE "FileVersion", "{version}"
             VALUE "InternalName", "MyMDedit"
-            VALUE "LegalCopyright", "Copyright (c) 2026 あぽろ (MIT License)"
+            VALUE "LegalCopyright", "{COPYRIGHT} (MIT License)"
             VALUE "OriginalFilename", "MyMDedit.exe"
             VALUE "ProductName", "MyMDedit"
             VALUE "ProductVersion", "{version}"
