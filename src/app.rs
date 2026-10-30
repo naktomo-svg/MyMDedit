@@ -95,6 +95,7 @@ const ID_SHORTCUTS: u16 = 190;
 const ID_HELP_GITHUB: u16 = 191;
 const ID_HELP_RELEASES: u16 = 192;
 const ID_ABOUT: u16 = 193;
+const ID_RECENT_SEPARATOR: u16 = 199;
 const ID_RECENT_BASE: u16 = 200;
 /// One command id per recent-folder slot, derived from the cap so the two can't drift.
 const ID_RECENT_END: u16 = ID_RECENT_BASE + settings::limits::RECENT_FOLDER_COUNT as u16;
@@ -138,33 +139,66 @@ pub fn accelerator_command(vk: u16, ctrl: bool, shift: bool) -> Option<u16> {
     ACCELERATORS.iter().find(|a| a.0 == vk && a.1 == ctrl && a.2 == shift).map(|a| a.3)
 }
 
-/// ヘルプ → ショートカット一覧, as (the accelerator's command, if it is one; what it
-/// does; the keys). Every command in ACCELERATORS has a row (a test checks), so a new
-/// shortcut cannot go unlisted.
-const SHORTCUT_HELP: &[(Option<u16>, &str, &str)] = &[
-    (Some(ID_NEW), "新規", "Ctrl+N"),
-    (Some(ID_OPEN), "開く", "Ctrl+O"),
-    (Some(ID_SAVE), "保存", "Ctrl+S"),
-    (Some(ID_SAVE_AS), "名前を付けて保存", "Ctrl+Shift+S"),
-    (Some(ID_FIND), "検索", "Ctrl+F"),
-    (Some(ID_REPLACE), "置換", "Ctrl+H"),
-    (Some(ID_GOTO_LINE), "行へ移動", "Ctrl+G"),
-    (Some(ID_OUTLINE), "見出しへ移動", "Ctrl+Shift+O"),
-    (Some(ID_TASK), "タスクの切り替え", "Ctrl+Enter"),
-    (Some(ID_ZOOM_IN), "ズームイン", "Ctrl++"),
-    (Some(ID_ZOOM_OUT), "ズームアウト", "Ctrl+-"),
-    (Some(ID_ZOOM_RESET), "ズームを100%に戻す", "Ctrl+0"),
-    (None, "終了", "Alt+F4"),
-    (None, "元に戻す / やり直し", "Ctrl+Z / Ctrl+Y"),
-    (None, "切り取り / コピー / 貼り付け", "Ctrl+X / Ctrl+C / Ctrl+V"),
-    (None, "すべて選択", "Ctrl+A"),
-    (None, "ズーム(エディタ上)", "Ctrl+マウスホイール"),
-    (None, "リストの自動継続", "Enter"),
-    (None, "リストの字下げ / 字下げを戻す", "Tab / Shift+Tab"),
+/// How a shortcut is written for people: `Ctrl+Shift+S`.
+fn key_text(vk: u16, ctrl: bool, shift: bool) -> String {
+    let key = match vk {
+        v if v == VK_RETURN.0 => "Enter".to_string(),
+        v if v == VK_OEM_PLUS.0 || v == VK_ADD.0 => "+".to_string(),
+        v if v == VK_OEM_MINUS.0 || v == VK_SUBTRACT.0 => "-".to_string(),
+        v if v == VK_NUMPAD0.0 => "0".to_string(),
+        // Letters and digits are their own virtual-key codes.
+        v => char::from(v as u8).to_string(),
+    };
+    format!("{}{}{key}", if ctrl { "Ctrl+" } else { "" }, if shift { "Shift+" } else { "" })
+}
+
+/// The shortcut shown for `cmd`: its first entry in ACCELERATORS, so menus and the
+/// shortcut list name the key that actually works.
+fn shortcut_of(cmd: u16) -> Option<String> {
+    ACCELERATORS.iter().find(|a| a.3 == cmd).map(|&(vk, ctrl, shift, _)| key_text(vk, ctrl, shift))
+}
+
+/// A row of ヘルプ → ショートカット一覧.
+enum ShortcutRow {
+    /// An accelerator: its keys come from ACCELERATORS.
+    Command(u16, &'static str),
+    /// Keys the system or RichEdit handle, written out by hand.
+    Other(&'static str, &'static str),
+}
+
+/// Every command in ACCELERATORS has a row (a test checks), so a new shortcut cannot go
+/// unlisted.
+const SHORTCUT_HELP: &[ShortcutRow] = &[
+    ShortcutRow::Command(ID_NEW, "新規"),
+    ShortcutRow::Command(ID_OPEN, "開く"),
+    ShortcutRow::Command(ID_SAVE, "保存"),
+    ShortcutRow::Command(ID_SAVE_AS, "名前を付けて保存"),
+    ShortcutRow::Command(ID_FIND, "検索"),
+    ShortcutRow::Command(ID_REPLACE, "置換"),
+    ShortcutRow::Command(ID_GOTO_LINE, "行へ移動"),
+    ShortcutRow::Command(ID_OUTLINE, "見出しへ移動"),
+    ShortcutRow::Command(ID_TASK, "タスクの切り替え"),
+    ShortcutRow::Command(ID_ZOOM_IN, "ズームイン"),
+    ShortcutRow::Command(ID_ZOOM_OUT, "ズームアウト"),
+    ShortcutRow::Command(ID_ZOOM_RESET, "ズームを100%に戻す"),
+    ShortcutRow::Other("終了", "Alt+F4"),
+    ShortcutRow::Other("元に戻す / やり直し", "Ctrl+Z / Ctrl+Y"),
+    ShortcutRow::Other("切り取り / コピー / 貼り付け", "Ctrl+X / Ctrl+C / Ctrl+V"),
+    ShortcutRow::Other("すべて選択", "Ctrl+A"),
+    ShortcutRow::Other("ズーム(エディタ上)", "Ctrl+マウスホイール"),
+    ShortcutRow::Other("リストの自動継続", "Enter"),
+    ShortcutRow::Other("リストの字下げ / 字下げを戻す", "Tab / Shift+Tab"),
 ];
 
 fn shortcut_help_text() -> String {
-    SHORTCUT_HELP.iter().map(|(_, what, keys)| format!("{what}: {keys}")).collect::<Vec<_>>().join("\n")
+    SHORTCUT_HELP
+        .iter()
+        .map(|row| match *row {
+            ShortcutRow::Command(id, what) => format!("{what}: {}", shortcut_of(id).unwrap_or_default()),
+            ShortcutRow::Other(what, keys) => format!("{what}: {keys}"),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 struct ToolButton {
@@ -299,7 +333,6 @@ pub struct State {
     layout: Layout,
     installed_fonts: Vec<String>,
     icon_face: &'static str,
-    recent_items: u32,
     find_is_replace: bool,
     /// The folder a recent-folder click is waiting on the background probe for.
     probing_folder: Option<String>,
@@ -398,7 +431,6 @@ pub fn run(launch_file: Option<PathBuf>) -> windows::core::Result<()> {
             layout: Layout::default(),
             installed_fonts,
             icon_face,
-            recent_items: 0,
             find_is_replace: false,
             probing_folder: None,
             disk_stamp: None,
@@ -570,7 +602,9 @@ impl App {
             }
 
             let editor = Editor::create(hwnd, ID_EDITOR)?;
-            let _ = SetWindowSubclass(editor.hwnd(), Some(editor_proc), 1, 0);
+            // Without it list continuation, Tab indenting and the app-wide Ctrl+wheel zoom are
+            // silently gone; the log says why.
+            install_subclass(editor.hwnd(), editor_proc, "editor");
 
             let mut buttons = [HWND::default(); TOOL_BUTTON_COUNT];
             for (slot, b) in buttons.iter_mut().zip(TOOL_BUTTONS.iter()) {
@@ -599,7 +633,7 @@ impl App {
                 Some(instance.into()),
                 None,
             )?;
-            send(tooltip, TTM_SETMAXTIPWIDTH, 0, scale(400, dpi) as isize);
+            send(tooltip, TTM_SETMAXTIPWIDTH, 0, tooltip_width(dpi));
             for (h, b) in buttons.iter().zip(TOOL_BUTTONS.iter()) {
                 let mut text = wide(b.tip);
                 let ti = TTTOOLINFOW {
@@ -671,7 +705,7 @@ impl App {
                 None,
                 None,
             )?;
-            let _ = SetWindowSubclass(h, Some(button_proc), 1, 0);
+            install_subclass(h, button_proc, "toolbar button");
             Ok(h)
         }
     }
@@ -679,9 +713,16 @@ impl App {
     fn build_menu(&self) -> windows::core::Result<HMENU> {
         unsafe {
             let bar = CreateMenu()?;
+            // A command with an accelerator gets its keys from ACCELERATORS; the others
+            // (RichEdit's own keys, Alt+F4) write theirs after a tab.
             let add = |menu: HMENU, id: u16, text: &str| {
-                let t = menu_label(text);
-                let _ = AppendMenuW(menu, MF_STRING, id as usize, pcwstr(&t));
+                debug_assert!(shortcut_of(id).is_none() || !text.contains('\t'), "{text}: keys come from ACCELERATORS");
+                let label = match shortcut_of(id) {
+                    Some(keys) => format!("{text}\t{keys}"),
+                    None => text.to_string(),
+                };
+                let t = menu_label(&label);
+                log::if_err("AppendMenuW", AppendMenuW(menu, MF_STRING, id as usize, pcwstr(&t)));
             };
             let sep = |menu: HMENU| {
                 let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
@@ -692,11 +733,11 @@ impl App {
             };
 
             let file = CreatePopupMenu()?;
-            add(file, ID_NEW, "新規\tCtrl+N");
-            add(file, ID_OPEN, "開く\tCtrl+O");
+            add(file, ID_NEW, "新規");
+            add(file, ID_OPEN, "開く");
             sep(file);
-            add(file, ID_SAVE, "保存\tCtrl+S");
-            add(file, ID_SAVE_AS, "名前を付けて保存\tCtrl+Shift+S");
+            add(file, ID_SAVE, "保存");
+            add(file, ID_SAVE_AS, "名前を付けて保存");
             sep(file); // Recent folders go just above this (rebuild_recent_menu).
             add(file, ID_EXIT, "終了\tAlt+F4");
             popup("ファイル", file);
@@ -711,15 +752,15 @@ impl App {
             sep(edit);
             add(edit, ID_SELECT_ALL, "すべて選択\tCtrl+A");
             sep(edit);
-            add(edit, ID_TASK, "タスクの切り替え\tCtrl+Enter");
+            add(edit, ID_TASK, "タスクの切り替え");
             popup("編集", edit);
 
             let find = CreatePopupMenu()?;
-            add(find, ID_FIND, "検索...\tCtrl+F");
-            add(find, ID_REPLACE, "置換...\tCtrl+H");
+            add(find, ID_FIND, "検索...");
+            add(find, ID_REPLACE, "置換...");
             sep(find);
-            add(find, ID_OUTLINE, "見出しへ移動...\tCtrl+Shift+O");
-            add(find, ID_GOTO_LINE, "行へ移動...\tCtrl+G");
+            add(find, ID_OUTLINE, "見出しへ移動...");
+            add(find, ID_GOTO_LINE, "行へ移動...");
             popup("検索", find);
 
             let settings = CreatePopupMenu()?;
@@ -1252,31 +1293,38 @@ impl App {
         self.persist_settings(|s| s.recent_folders = settings::remove_recent_folder(&s.recent_folders, folder));
     }
 
+    /// The recent-folder items (and the separator above them) are found by their ids,
+    /// never by position or count: an insert that failed, or a File menu item added later,
+    /// cannot make the next rebuild remove the wrong item.
     fn rebuild_recent_menu(&self) {
         let menu = self.ui.get().file_menu;
         let folders = self.current_settings().recent_folders;
-        let previous = std::mem::take(&mut self.state.borrow_mut().recent_items);
         unsafe {
-            // The recent items sit just above the separator over 終了, found by its id
-            // rather than by a position that a new File menu item would shift.
-            let count = u32::try_from(GetMenuItemCount(Some(menu))).unwrap_or(0);
-            let Some(exit) = (0..count).find(|&i| GetMenuItemID(menu, i as i32) == ID_EXIT as u32) else {
-                log::error("rebuild_recent_menu", "終了 is not in the File menu");
-                return;
-            };
-            let start = exit.saturating_sub(1 + previous);
-            for _ in 0..previous {
-                if let Err(e) = RemoveMenu(menu, start, MF_BYPOSITION) {
-                    log::error("RemoveMenu", &e);
-                }
+            // Whatever is there now goes; ids that are not present simply fail.
+            for id in std::iter::once(ID_RECENT_SEPARATOR).chain(ID_RECENT_BASE..ID_RECENT_END) {
+                let _ = RemoveMenu(menu, id as u32, MF_BYCOMMAND);
             }
             if folders.is_empty() {
                 return;
             }
-            let mut pos = start;
-            let _ = InsertMenuW(menu, pos, MF_BYPOSITION | MF_SEPARATOR, 0, None);
-            pos += 1;
-            for (i, folder) in folders.iter().enumerate() {
+            // Each insert goes just above the separator over 終了, so they line up in order.
+            let insert = |item: &MENUITEMINFOW| {
+                let count = u32::try_from(GetMenuItemCount(Some(menu))).unwrap_or(0);
+                let Some(exit) = (0..count).find(|&i| GetMenuItemID(menu, i as i32) == ID_EXIT as u32) else {
+                    log::error("rebuild_recent_menu", "終了 is not in the File menu");
+                    return;
+                };
+                log::if_err("InsertMenuItemW", InsertMenuItemW(menu, exit.saturating_sub(1), true, item));
+            };
+            insert(&MENUITEMINFOW {
+                cbSize: size_of::<MENUITEMINFOW>() as u32,
+                fMask: MIIM_FTYPE | MIIM_ID,
+                fType: MFT_SEPARATOR,
+                wID: ID_RECENT_SEPARATOR as u32,
+                ..Default::default()
+            });
+            // The cap keeps every id inside its reserved range, whatever the list holds.
+            for (i, folder) in folders.iter().take(settings::limits::RECENT_FOLDER_COUNT).enumerate() {
                 let name =
                     Path::new(folder).file_name().map(|n| n.to_string_lossy().into_owned()).filter(|n| !n.is_empty());
                 // Win32 menus have no per-item tooltip; the full path goes in the
@@ -1285,12 +1333,16 @@ impl App {
                     Some(n) => format!("{}\t{}", n.replace('&', "&&"), folder.replace('&', "&&")),
                     None => folder.replace('&', "&&"),
                 };
-                let t = wide(&label);
-                let _ =
-                    InsertMenuW(menu, pos, MF_BYPOSITION | MF_STRING, (ID_RECENT_BASE + i as u16) as usize, pcwstr(&t));
-                pos += 1;
+                let mut t = wide(&label);
+                insert(&MENUITEMINFOW {
+                    cbSize: size_of::<MENUITEMINFOW>() as u32,
+                    fMask: MIIM_FTYPE | MIIM_ID | MIIM_STRING,
+                    fType: MFT_STRING,
+                    wID: (ID_RECENT_BASE + i as u16) as u32,
+                    dwTypeData: PWSTR(t.as_mut_ptr()),
+                    ..Default::default()
+                });
             }
-            self.state.borrow_mut().recent_items = pos - start;
         }
     }
 
@@ -2127,6 +2179,7 @@ impl App {
         ui.dpi = dpi;
         self.ui.set(ui);
         self.create_fonts();
+        send(ui.tooltip, TTM_SETMAXTIPWIDTH, 0, tooltip_width(dpi));
         unsafe {
             let _ = SetWindowPos(
                 ui.hwnd,
@@ -2316,6 +2369,17 @@ const WM_MOUSELEAVE: u32 = 0x02A3;
 
 type SubclassProc = unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM, usize, usize) -> LRESULT;
 
+fn install_subclass(hwnd: HWND, proc: SubclassProc, what: &str) {
+    if !unsafe { SetWindowSubclass(hwnd, Some(proc), 1, 0) }.as_bool() {
+        log::error("SetWindowSubclass", format!("{what}: {}", windows::core::Error::from_thread()));
+    }
+}
+
+/// The tooltips' wrap width, which tracks the window's DPI like everything else drawn.
+fn tooltip_width(dpi: u32) -> isize {
+    scale(400, dpi) as isize
+}
+
 /// SetWindowSubclass's contract: the subclass goes before its window does. WM_NCDESTROY
 /// is the last message the window gets; DefSubclassProc still forwards it afterwards.
 fn remove_subclass(hwnd: HWND, proc: SubclassProc, id: usize) {
@@ -2440,11 +2504,18 @@ mod tests {
 
     #[test]
     fn every_shortcut_is_in_the_help_list() {
+        use super::ShortcutRow;
         for &(_, _, _, cmd) in super::ACCELERATORS {
-            assert!(super::SHORTCUT_HELP.iter().any(|(id, _, _)| *id == Some(cmd)), "command {cmd} has no help row");
+            assert!(
+                super::SHORTCUT_HELP.iter().any(|row| matches!(row, ShortcutRow::Command(id, _) if *id == cmd)),
+                "command {cmd} has no help row"
+            );
         }
         let text = super::shortcut_help_text();
         assert!(text.starts_with("新規: Ctrl+N\n開く: Ctrl+O"));
+        assert!(text.contains("名前を付けて保存: Ctrl+Shift+S\n"));
+        assert!(text.contains("タスクの切り替え: Ctrl+Enter\n"));
+        assert!(text.contains("ズームイン: Ctrl++\nズームアウト: Ctrl+-\nズームを100%に戻す: Ctrl+0\n"));
         assert_eq!(text.lines().count(), super::SHORTCUT_HELP.len());
     }
 
