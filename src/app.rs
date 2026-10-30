@@ -2451,8 +2451,9 @@ const WM_MOUSELEAVE: u32 = 0x02A3;
 type SubclassProc = unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM, usize, usize) -> LRESULT;
 
 fn install_subclass(hwnd: HWND, proc: SubclassProc, what: &str) {
+    // FALSE is all it reports: no last error is documented, so none is quoted.
     if !unsafe { SetWindowSubclass(hwnd, Some(proc), 1, 0) }.as_bool() {
-        log::error("SetWindowSubclass", format!("{what}: {}", windows::core::Error::from_thread()));
+        log::error("SetWindowSubclass", format!("{what}: could not be installed"));
     }
 }
 

@@ -31,9 +31,13 @@ pub fn send(hwnd: HWND, msg: u32, wparam: usize, lparam: isize) -> isize {
     unsafe { SendMessageW(hwnd, msg, Some(WPARAM(wparam)), Some(LPARAM(lparam))).0 }
 }
 
+/// The window's DPI; 96 (and a log line) for an invalid window, the only way it fails.
 pub fn dpi_of(hwnd: HWND) -> u32 {
     match unsafe { GetDpiForWindow(hwnd) } {
-        0 => 96,
+        0 => {
+            crate::log::error("GetDpiForWindow", "invalid window; assuming 96 DPI");
+            96
+        }
         d => d,
     }
 }
@@ -91,8 +95,10 @@ fn nonclient_fonts(dpi: u32) -> (LOGFONTW, LOGFONTW) {
 /// A created font, or the failure logged (a null HFONT makes the control fall back to
 /// the System font, which is all that can be done about it).
 fn checked(f: HFONT, what: &str) -> HFONT {
+    // CreateFont(Indirect) does not set the thread's last error, so there is no reason
+    // to give beyond which font it was.
     if f.is_invalid() {
-        crate::log::error("CreateFont", format!("{what}: {}", windows::core::Error::from_thread()));
+        crate::log::error("CreateFont", format!("{what}: could not be created"));
     }
     f
 }
@@ -165,8 +171,8 @@ pub fn set_clipboard_text(hwnd: HWND, text: &str) -> windows::core::Result<()> {
         // clipboard is held only as long as the hand-over takes.
         let memory = GlobalAlloc(GMEM_MOVEABLE, units.len() * size_of::<u16>())?;
         let free = |e: windows::core::Error| {
-            if GlobalFree(Some(memory)).is_err() {
-                crate::log::error("GlobalFree", windows::core::Error::from_thread());
+            if let Err(free_error) = GlobalFree(Some(memory)) {
+                crate::log::error("GlobalFree", free_error);
             }
             e
         };
@@ -177,7 +183,7 @@ pub fn set_clipboard_text(hwnd: HWND, text: &str) -> windows::core::Result<()> {
         std::ptr::copy_nonoverlapping(units.as_ptr(), target, units.len());
         // FALSE with no error is the normal "no longer locked" answer.
         let _ = GlobalUnlock(memory);
-        OpenClipboard(Some(hwnd)).map_err(free)?;
+        open_clipboard(hwnd).map_err(free)?;
         // On success the clipboard owns the memory; on failure it is still ours.
         let result = EmptyClipboard()
             .and_then(|()| SetClipboardData(CF_UNICODETEXT.0.into(), Some(HANDLE(memory.0))).map(|_| ()))
@@ -187,6 +193,23 @@ pub fn set_clipboard_text(hwnd: HWND, text: &str) -> windows::core::Result<()> {
         }
         result
     }
+}
+
+/// OpenClipboard fails while any other program has the clipboard open, which clipboard
+/// managers and remote-desktop clients do for a moment after every change. A few short
+/// retries ride that out; the wait is bounded (about 100 ms) since this is the UI thread.
+fn open_clipboard(hwnd: HWND) -> windows::core::Result<()> {
+    let mut last = None;
+    for attempt in 0..5 {
+        if attempt > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        match unsafe { OpenClipboard(Some(hwnd)) } {
+            Ok(()) => return Ok(()),
+            Err(e) => last = Some(e),
+        }
+    }
+    Err(last.unwrap_or_else(windows::core::Error::from_thread))
 }
 
 pub fn loword(v: usize) -> u16 {
