@@ -1,28 +1,49 @@
 //! Match finding for the find/replace dialog, over the editor's UTF-16 text.
 
-fn fold(unit: u16, case_sensitive: bool) -> u16 {
+use std::borrow::Cow;
+
+/// `units` with every character mapped to its simple uppercase, for ordinal ignore-case
+/// comparison. Characters, not code units: a surrogate pair is folded as the one letter
+/// it encodes. A mapping that would change the UTF-16 length (or a lone surrogate) is
+/// left alone, so offsets into the folded text are offsets into `units`.
+fn folded(units: &[u16], case_sensitive: bool) -> Cow<'_, [u16]> {
     if case_sensitive {
-        return unit;
+        return Cow::Borrowed(units);
     }
-    // Ordinal ignore-case: simple one-to-one uppercase mapping per code unit.
-    match char::from_u32(unit as u32) {
-        Some(c) => {
-            let mut up = c.to_uppercase();
-            match (up.next(), up.next()) {
-                (Some(u), None) if (u as u32) <= 0xFFFF => u as u32 as u16,
-                _ => unit,
+    let mut out = Vec::with_capacity(units.len());
+    for c in char::decode_utf16(units.iter().copied()) {
+        match c {
+            Ok(c) => {
+                let mut up = c.to_uppercase();
+                let u = match (up.next(), up.next()) {
+                    (Some(u), None) if u.len_utf16() == c.len_utf16() => u,
+                    _ => c,
+                };
+                out.extend_from_slice(u.encode_utf16(&mut [0; 2]));
             }
+            Err(e) => out.push(e.unpaired_surrogate()),
         }
-        None => unit,
     }
+    Cow::Owned(out)
 }
 
-fn is_word_char(unit: u16) -> bool {
-    char::from_u32(unit as u32).is_some_and(char::is_alphanumeric)
+fn is_word_char(c: Option<char>) -> bool {
+    c.is_some_and(char::is_alphanumeric)
 }
 
-pub fn units_equal(a: &[u16], b: &[u16], case_sensitive: bool) -> bool {
-    a.len() == b.len() && a.iter().zip(b).all(|(&x, &y)| fold(x, case_sensitive) == fold(y, case_sensitive))
+/// The character ending just before `pos` / starting at `pos`, reading a surrogate pair
+/// as one character (a lone surrogate reads as none).
+fn char_before(text: &[u16], pos: usize) -> Option<char> {
+    let from = if pos >= 2 && (0xDC00..0xE000).contains(&text[pos - 1]) { pos - 2 } else { pos.checked_sub(1)? };
+    char::decode_utf16(text[from..pos].iter().copied()).last()?.ok()
+}
+
+fn char_at(text: &[u16], pos: usize) -> Option<char> {
+    char::decode_utf16(text.get(pos..)?.iter().copied().take(2)).next()?.ok()
+}
+
+fn is_whole_word(text: &[u16], start: usize, end: usize) -> bool {
+    !is_word_char(char_before(text, start)) && !is_word_char(char_at(text, end))
 }
 
 /// Start offsets of every non-overlapping match of `query` in `text`.
@@ -31,20 +52,36 @@ pub fn find_all(text: &[u16], query: &[u16], case_sensitive: bool, whole_word: b
     if query.is_empty() || query.len() > text.len() {
         return matches;
     }
+    let (haystack, query) = (folded(text, case_sensitive), folded(query, case_sensitive));
     let mut pos = 0;
     while pos + query.len() <= text.len() {
-        if units_equal(&text[pos..pos + query.len()], query, case_sensitive) {
-            let end = pos + query.len();
-            let whole = (pos == 0 || !is_word_char(text[pos - 1])) && (end >= text.len() || !is_word_char(text[end]));
-            if !whole_word || whole {
-                matches.push(pos);
-                pos = end;
-                continue;
-            }
+        let end = pos + query.len();
+        if haystack[pos..end] == *query && (!whole_word || is_whole_word(text, pos, end)) {
+            matches.push(pos);
+            pos = end;
+        } else {
+            pos += 1;
         }
-        pos += 1;
     }
     matches
+}
+
+/// Whether `text[start..start + len]` is exactly a match `find_all` would report with
+/// these options — what the Replace button replaces, so it honours "whole word" too.
+pub fn is_match_at(
+    text: &[u16],
+    start: usize,
+    len: usize,
+    query: &[u16],
+    case_sensitive: bool,
+    whole_word: bool,
+) -> bool {
+    let end = start + len;
+    len == query.len()
+        && end <= text.len()
+        && !query.is_empty()
+        && *folded(&text[start..end], case_sensitive) == *folded(query, case_sensitive)
+        && (!whole_word || is_whole_word(text, start, end))
 }
 
 /// The first match at or after `from`, wrapping to the first match.
@@ -93,6 +130,30 @@ mod tests {
         assert_eq!(find_all(&t, &w("cat"), true, false), vec![4, 11]);
         assert_eq!(find_all(&t, &w("cat"), false, true), vec![0, 4, 15]);
         assert_eq!(find_all(&w("日本語の日本"), &w("日本"), false, true), Vec::<usize>::new());
+    }
+
+    #[test]
+    fn folds_and_bounds_by_character_not_code_unit() {
+        // Deseret capital/small letter: a case pair outside the BMP.
+        assert_eq!(find_all(&w("x𐐨y"), &w("𐐀"), false, false), vec![1]);
+        assert_eq!(find_all(&w("x𐐨y"), &w("𐐀"), true, false), Vec::<usize>::new());
+        // A letter outside the BMP is part of the word around it.
+        assert_eq!(find_all(&w("𐐨cat"), &w("cat"), false, true), Vec::<usize>::new());
+        assert_eq!(find_all(&w("cat𐐨"), &w("cat"), false, true), Vec::<usize>::new());
+        assert_eq!(find_all(&w("😀cat😀"), &w("cat"), false, true), vec![2]);
+        // Lone surrogates neither panic nor match a letter.
+        assert_eq!(find_all(&[0xD800, b'a' as u16, 0xDC00], &w("A"), false, true), vec![1]);
+    }
+
+    #[test]
+    fn replace_checks_the_selection_like_find_all() {
+        let t = w("category cat");
+        assert!(!is_match_at(&t, 0, 3, &w("cat"), false, true), "part of a word");
+        assert!(is_match_at(&t, 0, 3, &w("cat"), false, false));
+        assert!(is_match_at(&t, 9, 3, &w("CAT"), false, true));
+        assert!(!is_match_at(&t, 9, 3, &w("CAT"), true, true));
+        assert!(!is_match_at(&t, 9, 2, &w("cat"), false, false), "length differs");
+        assert!(!is_match_at(&t, 11, 3, &w("cat"), false, false), "past the end");
     }
 
     #[test]

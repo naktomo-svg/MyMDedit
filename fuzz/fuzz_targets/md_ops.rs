@@ -12,8 +12,15 @@ fn check(text: &[u16], e: &Edit) {
 // panic, and the edit and the selection after it stay inside the text. Heading and line
 // lookups only ever point at line starts inside the text.
 fuzz_target!(|data: &[u8]| {
-    let Some((head, rest)) = data.split_first_chunk::<5>() else { return };
-    let text: Vec<u16> = String::from_utf8_lossy(rest).encode_utf16().collect();
+    let Some((head, rest)) = data.split_first_chunk::<6>() else { return };
+    // The editor's buffer is any u16 sequence (a paste can carry a lone surrogate), so
+    // half the inputs are raw code units; the other half go through UTF-8, which reaches
+    // Markdown syntax far sooner.
+    let text: Vec<u16> = if head[5] & 1 == 1 {
+        rest.chunks_exact(2).map(|b| u16::from_le_bytes([b[0], b[1]])).collect()
+    } else {
+        String::from_utf8_lossy(rest).encode_utf16().collect()
+    };
     let n = text.len();
     let start = usize::from(u16::from_le_bytes([head[0], head[1]])) % (n + 1);
     let len = usize::from(u16::from_le_bytes([head[2], head[3]])) % (n - start + 1);
@@ -32,14 +39,15 @@ fuzz_target!(|data: &[u8]| {
             return;
         }
         12 => {
-            let line = md_ops::line_index_at(&text, start);
-            let line_start = md_ops::line_start_of(&text, line);
-            assert!(is_line_start(line_start), "line {line} starts at {line_start}");
             // The editor's text never holds \n (RichEdit stores lone \r); inside a \r\n pair
             // find_line_start sees the \n as a line of its own, which no count agrees with.
-            if !text.contains(&(b'\n' as u16)) {
-                assert_eq!(line_start, md_ops::find_line_start(&text, start), "line {line} of position {start}");
-            }
+            // So check the text the editor would hold, rather than skip such inputs.
+            let text: Vec<u16> =
+                text.iter().map(|&u| if u == u16::from(b'\n') { u16::from(b'\r') } else { u }).collect();
+            let line = md_ops::line_index_at(&text, start);
+            let line_start = md_ops::line_start_of(&text, line);
+            assert!(md_ops::find_line_start(&text, line_start) == line_start, "line {line} starts at {line_start}");
+            assert_eq!(line_start, md_ops::find_line_start(&text, start), "line {line} of position {start}");
             return;
         }
         0 => md_ops::wrap_selection(&text, start, len, "**", "**", "太字"),

@@ -73,8 +73,15 @@ pub fn parse_copy_link(uri: &str, token: u64) -> Option<usize> {
 
 /// Whether `uri` uses the copy scheme at all, whatever it names.
 pub fn is_copy_link(uri: &str) -> bool {
-    // Compared as bytes for the reason `preview::uses_blocked_scheme` gives.
-    uri.as_bytes().get(..COPY_SCHEME.len()).is_some_and(|p| p.eq_ignore_ascii_case(COPY_SCHEME.as_bytes()))
+    has_scheme(uri, COPY_SCHEME)
+}
+
+/// Whether `uri` starts with `scheme` (`"https:"`), ignoring ASCII case. Compared as
+/// bytes: slicing the &str at the scheme's length can land inside a multi-byte character
+/// and panic — inside a WebView2 callback, where a panic aborts the process and takes
+/// the unsaved document with it.
+pub fn has_scheme(uri: &str, scheme: &str) -> bool {
+    uri.as_bytes().get(..scheme.len()).is_some_and(|p| p.eq_ignore_ascii_case(scheme.as_bytes()))
 }
 
 /// Wraps every code block in a box with a copy button and returns the blocks' text, in
@@ -362,6 +369,7 @@ mod tests {
             assert_eq!(parse_copy_link(bad, 7), None, "{bad}");
         }
         assert!(is_copy_link("mymdedit-copy:x") && !is_copy_link("https://x") && !is_copy_link("日本語"));
+        assert!(has_scheme("HTTPS://x", "https:") && !has_scheme("ht日", "https:") && !has_scheme("http", "https:"));
     }
 
     #[test]

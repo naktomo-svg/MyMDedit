@@ -39,17 +39,27 @@ fn main() {
     // 2026-10-14 audit, F9). This covers every later load by name, including those the
     // system DLLs make on our behalf; static imports are covered by /DEPENDENTLOADFLAG
     // in build.rs.
+    // Without it the next load by name (Msftedit.dll, for the editor) would look in the
+    // exe's folder first: refuse to run rather than run unprotected. It cannot fail on
+    // any Windows this app supports, so this is a guard, not a code path users meet.
     if let Err(e) = unsafe { SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32) } {
         log::error("SetDefaultDllDirectories", &e);
+        fatal(&format!("DLL の読み込み先を System32 に限定できなかったため、安全のため起動を中止しました。\n{e}"));
+        return;
     }
     log::install_panic_hook();
     unsafe {
-        // WebView2 and the shell dialogs both require an STA thread.
-        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok();
-        let _ = InitCommonControlsEx(&INITCOMMONCONTROLSEX {
+        // WebView2 and the shell dialogs both require an STA thread; without one they fail
+        // later with errors that no longer say why.
+        log::if_err("CoInitializeEx", CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok());
+        if !InitCommonControlsEx(&INITCOMMONCONTROLSEX {
             dwSize: size_of::<INITCOMMONCONTROLSEX>() as u32,
             dwICC: ICC_STANDARD_CLASSES | ICC_BAR_CLASSES | ICC_UPDOWN_CLASS | ICC_TAB_CLASSES,
-        });
+        })
+        .as_bool()
+        {
+            log::error("InitCommonControlsEx", "failed");
+        }
     }
 
     // Explorer passes the double-clicked file as the first argument.
@@ -57,14 +67,14 @@ fn main() {
     let launch_file = std::env::args_os().nth(1).map(PathBuf::from);
     if let Err(e) = app::run(launch_file) {
         log::error("startup", &e);
-        unsafe {
-            MessageBoxW(
-                None,
-                &HSTRING::from(format!("MyMDedit を起動できませんでした。\n{e}")),
-                w!("MyMDedit"),
-                MB_OK | MB_ICONERROR,
-            );
-        }
+        fatal(&format!("MyMDedit を起動できませんでした。\n{e}"));
+    }
+}
+
+/// The app cannot run at all: say so in the one UI there is before a window exists.
+fn fatal(message: &str) {
+    unsafe {
+        MessageBoxW(None, &HSTRING::from(message), w!("MyMDedit"), MB_OK | MB_ICONERROR);
     }
 }
 
@@ -134,6 +144,56 @@ mod tests {
         }
         // IMAGE_DLLCHARACTERISTICS_EX_CET_COMPAT, from build.rs.
         assert_ne!(pe.dll_characteristics_ex & 0x01, 0, "CET shadow stack compatibility is off");
+    }
+
+    /// `fuzz/` is its own workspace with its own Cargo.lock, so nothing but this test
+    /// stops it from fuzzing a different comrak (or serde_json) than the app ships.
+    #[test]
+    fn fuzz_resolves_the_same_versions_as_the_app() {
+        let packages = |lock: &str| {
+            let mut v: Vec<(String, String)> = lock
+                .split("[[package]]")
+                .filter_map(|p| {
+                    let field =
+                        |k: &str| p.lines().find_map(|l| l.strip_prefix(k)).map(|s| s.trim_matches('"').to_owned());
+                    Some((field("name = ")?, field("version = ")?))
+                })
+                .collect();
+            v.sort();
+            v
+        };
+        let app = packages(include_str!("../Cargo.lock"));
+        let fuzz = packages(include_str!("../fuzz/Cargo.lock"));
+        let versions = |set: &[(String, String)], name: &str| {
+            set.iter().filter(|(n, _)| n == name).map(|(_, v)| v.clone()).collect::<Vec<_>>()
+        };
+        for (name, _) in &app {
+            let in_fuzz = versions(&fuzz, name);
+            if !in_fuzz.is_empty() {
+                assert_eq!(versions(&app, name), in_fuzz, "{name}: run `cargo update -p {name}` in fuzz/");
+            }
+        }
+    }
+
+    /// The accepted licenses are written twice, once per tool; a license added to one
+    /// only would fail the other tool's run with no hint of where the list lives.
+    #[test]
+    fn license_lists_agree() {
+        fn list<'a>(toml: &'a str, key: &str) -> Vec<&'a str> {
+            let start = toml.find(&format!("{key} = [")).unwrap() + key.len() + 4;
+            let mut v: Vec<&str> = toml[start..start + toml[start..].find(']').unwrap()]
+                .split(',')
+                .map(|s| s.trim().trim_matches('"'))
+                .filter(|s| !s.is_empty())
+                .collect();
+            v.sort();
+            v
+        }
+        assert_eq!(
+            list(include_str!("../about.toml"), "accepted"),
+            list(include_str!("../deny.toml"), "allow"),
+            "about.toml's `accepted` and deny.toml's `allow` differ"
+        );
     }
 
     #[test]

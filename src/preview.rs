@@ -20,7 +20,7 @@
 //! copies on the app's side and always cancels them (`allow_navigation`).
 
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, RECT, WPARAM};
-use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_CONTROL, VK_SHIFT};
+use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_CONTROL, VK_MENU, VK_SHIFT};
 use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_APP};
 use windows::core::{BOOL, HSTRING, Interface, PWSTR, w};
 
@@ -31,9 +31,10 @@ use webview2_com::Microsoft::Web::WebView2::Win32::{
     COREWEBVIEW2_WEB_ERROR_STATUS, COREWEBVIEW2_WEB_RESOURCE_CONTEXT, COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL,
     COREWEBVIEW2_WEB_RESOURCE_CONTEXT_IMAGE, COREWEBVIEW2_WEB_RESOURCE_REQUEST_SOURCE_KINDS_ALL,
     CreateCoreWebView2EnvironmentWithOptions, ICoreWebView2, ICoreWebView2_4, ICoreWebView2_5, ICoreWebView2_18,
-    ICoreWebView2_22, ICoreWebView2Controller, ICoreWebView2Controller2,
+    ICoreWebView2_22, ICoreWebView2AcceleratorKeyPressedEventArgs, ICoreWebView2Controller, ICoreWebView2Controller2,
     ICoreWebView2CreateCoreWebView2ControllerCompletedHandler, ICoreWebView2Environment, ICoreWebView2Environment10,
-    ICoreWebView2EnvironmentOptions, ICoreWebView2NavigationStartingEventArgs, ICoreWebView2Settings4,
+    ICoreWebView2EnvironmentOptions, ICoreWebView2NavigationCompletedEventArgs,
+    ICoreWebView2NavigationStartingEventArgs, ICoreWebView2ProcessFailedEventArgs, ICoreWebView2Settings4,
     ICoreWebView2WebResourceRequestedEventArgs,
 };
 use webview2_com::{
@@ -54,6 +55,10 @@ pub struct Preview {
     webview: Option<ICoreWebView2>,
     /// Set last in initialization, only once every protection is in place.
     ready: bool,
+    /// A protection failed to act (`stop_preview`): no document is loaded again for the
+    /// rest of the session. Unlike `ready`, nothing ever clears it — not a crash restart,
+    /// which would otherwise configure a fresh controller and set `ready` once more.
+    stopped: bool,
     /// Navigations this app started that have not reached NavigationStarting yet — the
     /// only signal the guard trusts. A count, not a bool: a render per keystroke can put
     /// two of our own navigations in flight, and a bool would cancel the second.
@@ -75,6 +80,9 @@ pub struct Preview {
 
 /// Posted to the main window when a WebView2 process dies (wparam: 0 renderer, 1 browser).
 pub const WM_APP_PREVIEW_FAILED: u32 = WM_APP + 3;
+/// Posted to the main window when a stopped preview could not be hidden and must be
+/// closed instead — never from inside the WebView2 handler that found out.
+pub const WM_APP_PREVIEW_CLOSE: u32 = WM_APP + 5;
 const MAX_CRASH_RETRIES: u32 = 3;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -110,6 +118,11 @@ pub fn on_process_failed(app: &App, browser: bool) {
     let process = if browser { CrashedProcess::Browser } else { CrashedProcess::Renderer };
     let response = {
         let mut p = app.preview.borrow_mut();
+        if p.stopped {
+            // Recovery would bring the preview back; it stays stopped.
+            log::error("PreviewProcessFailed", "preview is stopped; not recovering");
+            return;
+        }
         // Whatever was in flight died with the process.
         p.pending_self = 0;
         p.script_busy = false;
@@ -158,10 +171,7 @@ pub fn on_process_failed(app: &App, browser: bool) {
 const BLOCKED_SCHEMES: [&str; 6] = ["http:", "https:", "file:", "ftp:", "ws:", "wss:"];
 
 fn uses_blocked_scheme(uri: &str) -> bool {
-    // Compared as bytes: slicing the &str at a scheme's length can land inside a
-    // multi-byte character and panic — inside a WebView2 callback, where a panic aborts
-    // the process and takes the unsaved document with it.
-    BLOCKED_SCHEMES.iter().any(|s| uri.as_bytes().get(..s.len()).is_some_and(|p| p.eq_ignore_ascii_case(s.as_bytes())))
+    BLOCKED_SCHEMES.iter().any(|s| render::has_scheme(uri, s))
 }
 
 /// The guard, as a pure decision. Both conditions only ever deny; neither can admit a
@@ -181,9 +191,8 @@ fn navigation_allowed(pending_self: i32, uri: &str) -> bool {
 /// network scheme — navigations, prefetches, frames, CSP-exempt fetches — is answered
 /// locally and never sent.
 fn request_allowed(context: COREWEBVIEW2_WEB_RESOURCE_CONTEXT, uri: &str) -> bool {
-    const HTTPS: &[u8] = b"https:";
-    let https = uri.as_bytes().get(..HTTPS.len()).is_some_and(|p| p.eq_ignore_ascii_case(HTTPS));
-    !uses_blocked_scheme(uri) || (context == COREWEBVIEW2_WEB_RESOURCE_CONTEXT_IMAGE && https)
+    !uses_blocked_scheme(uri)
+        || (context == COREWEBVIEW2_WEB_RESOURCE_CONTEXT_IMAGE && render::has_scheme(uri, "https:"))
 }
 
 /// The request filter's decision for one request; every `Err` becomes a denial.
@@ -206,17 +215,22 @@ const STOPPED: &str = "プレビューの安全確認に失敗したため、プ
 
 /// The guard could not enforce a denial. Fail closed: no further document is ever
 /// loaded, and the preview is hidden so whatever got through cannot be seen or used.
+/// Should even hiding fail, the controller is closed, taking the content with it —
+/// from the main window's message, as this runs inside a WebView2 handler.
 fn stop_preview(context: &str, e: &windows::core::Error) {
     let app = app();
     let controller = {
         let mut p = app.preview.borrow_mut();
         p.ready = false;
+        p.stopped = true;
         p.controller.clone()
     };
-    if let Some(c) = controller {
-        unsafe {
-            let _ = c.SetIsVisible(false);
-        }
+    if let Some(c) = controller
+        && let Err(hide) = unsafe { c.SetIsVisible(false) }
+    {
+        log::error("stop_preview SetIsVisible", &hide);
+        let posted = unsafe { PostMessageW(Some(app.main_hwnd()), WM_APP_PREVIEW_CLOSE, WPARAM(0), LPARAM(0)) };
+        log::if_err("stop_preview PostMessage", posted);
     }
     app.report_error(context, STOPPED, Some(e));
 }
@@ -277,7 +291,10 @@ pub fn start(this: &App, parent: HWND) {
         let handler = CreateCoreWebView2ControllerCompletedHandler::create(Box::new(move |result, controller| {
             match (result, controller) {
                 (Ok(()), Some(controller)) => {
-                    if let Err(e) = configure(controller, &env_for_configure) {
+                    if let Err(e) = configure(&controller, &env_for_configure) {
+                        // Never stored, so nothing else would close it: its child window
+                        // would linger over the preview's area.
+                        log::if_err("ConfigureWebView2 Close", unsafe { controller.Close() });
                         app().report_error("ConfigureWebView2", INIT_FAILED, Some(&e));
                     }
                 }
@@ -324,7 +341,7 @@ fn create_controller(
 }
 
 #[allow(unused_unsafe)]
-fn configure(controller: ICoreWebView2Controller, env: &ICoreWebView2Environment) -> windows::core::Result<()> {
+fn configure(controller: &ICoreWebView2Controller, env: &ICoreWebView2Environment) -> windows::core::Result<()> {
     let webview = unsafe { controller.CoreWebView2()? };
     unsafe {
         let settings = webview.Settings()?;
@@ -509,27 +526,9 @@ fn configure(controller: ICoreWebView2Controller, env: &ICoreWebView2Environment
         webview.add_ProcessFailed(
             &ProcessFailedEventHandler::create(Box::new(|_, args| {
                 let Some(args) = args else { return Ok(()) };
-                let mut kind = COREWEBVIEW2_PROCESS_FAILED_KIND::default();
-                unsafe { args.ProcessFailedKind(&mut kind)? };
-                let process = if kind == COREWEBVIEW2_PROCESS_FAILED_KIND_RENDER_PROCESS_EXITED {
-                    CrashedProcess::Renderer
-                } else if kind == COREWEBVIEW2_PROCESS_FAILED_KIND_BROWSER_PROCESS_EXITED {
-                    CrashedProcess::Browser
-                } else {
-                    CrashedProcess::Other
-                };
-                if process == CrashedProcess::Other {
-                    log::error("PreviewProcessFailed", format!("ignored process failure kind {}", kind.0));
-                    return Ok(());
-                }
-                // Handled after this callback returns: recovery closes the controller that
-                // is raising this very event, which must not happen from inside it.
-                let wparam = WPARAM(if process == CrashedProcess::Browser { 1 } else { 0 });
-                unsafe {
-                    if let Err(e) = PostMessageW(Some(app().main_hwnd()), WM_APP_PREVIEW_FAILED, wparam, LPARAM(0)) {
-                        log::error("PreviewProcessFailed PostMessage", &e);
-                    }
-                }
+                // WebView2 drops a handler's Err without a word; a failure here would stop
+                // crash recovery silently, so it is logged instead.
+                log::if_err("PreviewProcessFailed", on_process_failed_event(&args));
                 Ok(())
             })),
             &mut token,
@@ -538,50 +537,7 @@ fn configure(controller: ICoreWebView2Controller, env: &ICoreWebView2Environment
         webview.add_NavigationCompleted(
             &NavigationCompletedEventHandler::create(Box::new(|_, args| {
                 let Some(args) = args else { return Ok(()) };
-                let mut ok = BOOL::default();
-                let mut id = 0u64;
-                let mut status = COREWEBVIEW2_WEB_ERROR_STATUS::default();
-                unsafe {
-                    args.IsSuccess(&mut ok)?;
-                    args.NavigationId(&mut id)?;
-                    args.WebErrorStatus(&mut status)?;
-                }
-                let app = app();
-                if !ok.as_bool() {
-                    // A render superseded by a newer one, and a hostile navigation the
-                    // guard cancelled, both land here as routine failures — only the
-                    // newest render we started is worth telling the user about.
-                    let report = {
-                        let mut p = app.preview.borrow_mut();
-                        if p.pending_self > 0 || id != p.latest_id {
-                            log::error(
-                                "PreviewNavigationCompleted",
-                                format!("superseded or blocked navigation {id}: {}", status.0),
-                            );
-                            false
-                        } else if p.navigation_failure_reported {
-                            log::error("PreviewNavigationCompleted", format!("navigation failed: {}", status.0));
-                            false
-                        } else {
-                            p.navigation_failure_reported = true;
-                            true
-                        }
-                    };
-                    if report {
-                        app.report_error(
-                            "PreviewNavigationCompleted",
-                            &format!("プレビューを表示できませんでした。({}) 編集は引き続き行えます。", status.0),
-                            None,
-                        );
-                    }
-                    return Ok(());
-                }
-                {
-                    let mut p = app.preview.borrow_mut();
-                    p.navigation_failure_reported = false;
-                    p.renderer_crashes = 0;
-                }
-                sync_view(&app);
+                log::if_err("PreviewNavigationCompleted", on_navigation_completed(&args));
                 Ok(())
             })),
             &mut token,
@@ -592,21 +548,7 @@ fn configure(controller: ICoreWebView2Controller, env: &ICoreWebView2Environment
         controller.add_AcceleratorKeyPressed(
             &AcceleratorKeyPressedEventHandler::create(Box::new(|_, args| {
                 let Some(args) = args else { return Ok(()) };
-                let mut kind = COREWEBVIEW2_KEY_EVENT_KIND::default();
-                let mut vk = 0u32;
-                unsafe {
-                    args.KeyEventKind(&mut kind)?;
-                    args.VirtualKey(&mut vk)?;
-                }
-                if kind != COREWEBVIEW2_KEY_EVENT_KIND_KEY_DOWN && kind != COREWEBVIEW2_KEY_EVENT_KIND_SYSTEM_KEY_DOWN {
-                    return Ok(());
-                }
-                let ctrl = unsafe { GetKeyState(VK_CONTROL.0 as i32) } < 0;
-                let shift = unsafe { GetKeyState(VK_SHIFT.0 as i32) } < 0;
-                if let Some(cmd) = crate::app::accelerator_command(vk as u16, ctrl, shift) {
-                    unsafe { args.SetHandled(true)? };
-                    app().post_command(cmd);
-                }
+                log::if_err("PreviewAcceleratorKeyPressed", on_accelerator_key(&args));
                 Ok(())
             })),
             &mut token,
@@ -614,24 +556,122 @@ fn configure(controller: ICoreWebView2Controller, env: &ICoreWebView2Environment
     }
 
     let app = app();
-    let (bounds, background) = {
+    let (bounds, background, stopped) = {
         let p = app.preview.borrow();
-        (p.bounds, p.background)
+        (p.bounds, p.background, p.stopped)
     };
+    if stopped {
+        // Only a restart gets here after a stop, and on_process_failed refuses those;
+        // should another path appear, it still never brings the preview back.
+        return Err(windows::core::Error::new(windows::Win32::Foundation::E_ABORT, "the preview was stopped"));
+    }
     unsafe {
-        let _ = controller.SetBounds(bounds);
-        if let Ok(c2) = controller.cast::<ICoreWebView2Controller2>() {
-            let _ = c2.SetDefaultBackgroundColor(background);
+        log::if_err("ConfigureWebView2 SetBounds", controller.SetBounds(bounds));
+        match controller.cast::<ICoreWebView2Controller2>() {
+            Ok(c2) => log::if_err("ConfigureWebView2 background", c2.SetDefaultBackgroundColor(background)),
+            Err(e) => log::error("ConfigureWebView2 ICoreWebView2Controller2", e),
         }
         controller.SetIsVisible(true)?;
     }
     {
         let mut p = app.preview.borrow_mut();
-        p.controller = Some(controller);
+        p.controller = Some(controller.clone());
         p.webview = Some(webview);
         p.ready = true;
     }
     app.refresh_preview();
+    Ok(())
+}
+
+fn on_process_failed_event(args: &ICoreWebView2ProcessFailedEventArgs) -> windows::core::Result<()> {
+    let mut kind = COREWEBVIEW2_PROCESS_FAILED_KIND::default();
+    unsafe { args.ProcessFailedKind(&mut kind)? };
+    let process = if kind == COREWEBVIEW2_PROCESS_FAILED_KIND_RENDER_PROCESS_EXITED {
+        CrashedProcess::Renderer
+    } else if kind == COREWEBVIEW2_PROCESS_FAILED_KIND_BROWSER_PROCESS_EXITED {
+        CrashedProcess::Browser
+    } else {
+        CrashedProcess::Other
+    };
+    if process == CrashedProcess::Other {
+        log::error("PreviewProcessFailed", format!("ignored process failure kind {}", kind.0));
+        return Ok(());
+    }
+    // Handled after this callback returns: recovery closes the controller that is
+    // raising this very event, which must not happen from inside it.
+    let wparam = WPARAM(if process == CrashedProcess::Browser { 1 } else { 0 });
+    unsafe { PostMessageW(Some(app().main_hwnd()), WM_APP_PREVIEW_FAILED, wparam, LPARAM(0)) }
+}
+
+fn on_navigation_completed(args: &ICoreWebView2NavigationCompletedEventArgs) -> windows::core::Result<()> {
+    let mut ok = BOOL::default();
+    let mut id = 0u64;
+    let mut status = COREWEBVIEW2_WEB_ERROR_STATUS::default();
+    unsafe {
+        args.IsSuccess(&mut ok)?;
+        args.NavigationId(&mut id)?;
+        args.WebErrorStatus(&mut status)?;
+    }
+    let app = app();
+    if !ok.as_bool() {
+        // A render superseded by a newer one, and a hostile navigation the guard
+        // cancelled, both land here as routine failures — only the newest render we
+        // started is worth telling the user about.
+        let report = {
+            let mut p = app.preview.borrow_mut();
+            if p.pending_self > 0 || id != p.latest_id {
+                log::error(
+                    "PreviewNavigationCompleted",
+                    format!("superseded or blocked navigation {id}: {}", status.0),
+                );
+                false
+            } else if p.navigation_failure_reported {
+                log::error("PreviewNavigationCompleted", format!("navigation failed: {}", status.0));
+                false
+            } else {
+                p.navigation_failure_reported = true;
+                true
+            }
+        };
+        if report {
+            app.report_error(
+                "PreviewNavigationCompleted",
+                &format!("プレビューを表示できませんでした。({}) 編集は引き続き行えます。", status.0),
+                None,
+            );
+        }
+        return Ok(());
+    }
+    {
+        let mut p = app.preview.borrow_mut();
+        p.navigation_failure_reported = false;
+        p.renderer_crashes = 0;
+    }
+    sync_view(&app);
+    Ok(())
+}
+
+fn on_accelerator_key(args: &ICoreWebView2AcceleratorKeyPressedEventArgs) -> windows::core::Result<()> {
+    let mut kind = COREWEBVIEW2_KEY_EVENT_KIND::default();
+    let mut vk = 0u32;
+    unsafe {
+        args.KeyEventKind(&mut kind)?;
+        args.VirtualKey(&mut vk)?;
+    }
+    if kind != COREWEBVIEW2_KEY_EVENT_KIND_KEY_DOWN && kind != COREWEBVIEW2_KEY_EVENT_KIND_SYSTEM_KEY_DOWN {
+        return Ok(());
+    }
+    // The accelerator table never matches with Alt held (no entry has FALT), so neither
+    // does this: AltGr is Ctrl+Alt, and AltGr+S must not save.
+    if unsafe { GetKeyState(VK_MENU.0 as i32) } < 0 {
+        return Ok(());
+    }
+    let ctrl = unsafe { GetKeyState(VK_CONTROL.0 as i32) } < 0;
+    let shift = unsafe { GetKeyState(VK_SHIFT.0 as i32) } < 0;
+    if let Some(cmd) = crate::app::accelerator_command(vk as u16, ctrl, shift) {
+        unsafe { args.SetHandled(true)? };
+        app().post_command(cmd);
+    }
     Ok(())
 }
 
@@ -694,7 +734,12 @@ pub fn sync_view(this: &App) {
         p.script_busy = true;
         p.webview.clone()
     };
-    let Some(webview) = webview else { return };
+    let Some(webview) = webview else {
+        // Not reachable while eady implies a webview, but a stuck flag would end zoom
+        // and scroll sync for good.
+        this.preview.borrow_mut().script_busy = false;
+        return;
+    };
     let (zoom, ratio) = this.view_state();
     let script = format!(
         "document.body.style.zoom='{zoom}%';(function(){{var e=document.scrollingElement||document.documentElement;\
@@ -731,7 +776,7 @@ pub fn set_bounds(app: &App, bounds: RECT) {
     };
     if let Some(c) = controller {
         unsafe {
-            let _ = c.SetBounds(bounds);
+            log::if_err("Preview SetBounds", c.SetBounds(bounds));
         }
     }
 }
@@ -750,7 +795,7 @@ pub fn set_background(app: &App, color: COLORREF) {
     };
     if let Some(controller) = controller.and_then(|c| c.cast::<ICoreWebView2Controller2>().ok()) {
         unsafe {
-            let _ = controller.SetDefaultBackgroundColor(c);
+            log::if_err("Preview SetDefaultBackgroundColor", controller.SetDefaultBackgroundColor(c));
         }
     }
 }
@@ -759,7 +804,7 @@ pub fn notify_moved(app: &App) {
     let controller = app.preview.borrow().controller.clone();
     if let Some(c) = controller {
         unsafe {
-            let _ = c.NotifyParentWindowPositionChanged();
+            log::if_err("Preview NotifyParentWindowPositionChanged", c.NotifyParentWindowPositionChanged());
         }
     }
 }
@@ -773,7 +818,7 @@ pub fn close(app: &App) {
     };
     if let Some(c) = controller {
         unsafe {
-            let _ = c.Close();
+            log::if_err("Preview Close", c.Close());
         }
     }
 }
