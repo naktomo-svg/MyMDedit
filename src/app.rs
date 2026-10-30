@@ -630,7 +630,9 @@ impl App {
 
             let find_message = RegisterWindowMessageW(FINDMSGSTRINGW);
             self.find_message.set(find_message);
-            let find = Box::leak(Box::new(FindData { fr: FINDREPLACEW::default(), find: [0; 512], replace: [0; 512] }));
+            // Leaked, and only ever reached through this raw pointer (see show_find).
+            let find =
+                Box::into_raw(Box::new(FindData { fr: FINDREPLACEW::default(), find: [0; 512], replace: [0; 512] }));
             self.find.set(find);
 
             self.ui.set(Ui {
@@ -1886,31 +1888,41 @@ impl App {
             ui.find_dialog = HWND::default();
             self.ui.set(ui);
         }
-        let data = unsafe { &mut *self.find.get() };
+        // Never a reference to FindData: the dialog writes through the pointers handed to
+        // it below for as long as it is open, and a `&mut` they were derived from would be
+        // invalidated (under the aliasing rules) by the next read of the same memory, after
+        // which the dialog's writes are undefined behaviour. Raw pointers from the one
+        // allocation are all of equal standing.
+        let data = self.find.get();
+        const BUF: usize = 512;
         // Seed the search box with a short single-line selection.
         let editor = self.editor();
         let (start, len) = editor.selection();
-        if len > 0 && len < data.find.len() {
+        if len > 0 && len < BUF {
             let text = editor.text();
             let sel = &text[start..start + len];
             if !sel.iter().any(|&c| line_endings::is_break(c)) {
-                data.find.fill(0);
-                data.find[..len].copy_from_slice(sel);
+                let mut seeded = [0u16; BUF];
+                seeded[..len].copy_from_slice(sel);
+                unsafe { (&raw mut (*data).find).write(seeded) };
             }
         }
-        let flags =
-            if data.fr.Flags.0 == 0 { FR_DOWN } else { data.fr.Flags & (FR_DOWN | FR_MATCHCASE | FR_WHOLEWORD) };
-        data.fr = FINDREPLACEW {
-            lStructSize: size_of::<FINDREPLACEW>() as u32,
-            hwndOwner: ui.hwnd,
-            Flags: flags,
-            lpstrFindWhat: PWSTR(data.find.as_mut_ptr()),
-            lpstrReplaceWith: PWSTR(data.replace.as_mut_ptr()),
-            wFindWhatLen: data.find.len() as u16,
-            wReplaceWithLen: data.replace.len() as u16,
-            ..Default::default()
-        };
-        let dialog = unsafe { if replace { ReplaceTextW(&mut data.fr) } else { FindTextW(&mut data.fr) } };
+        let old_flags = unsafe { (*data).fr.Flags };
+        let flags = if old_flags.0 == 0 { FR_DOWN } else { old_flags & (FR_DOWN | FR_MATCHCASE | FR_WHOLEWORD) };
+        let fr = unsafe { &raw mut (*data).fr };
+        unsafe {
+            fr.write(FINDREPLACEW {
+                lStructSize: size_of::<FINDREPLACEW>() as u32,
+                hwndOwner: ui.hwnd,
+                Flags: flags,
+                lpstrFindWhat: PWSTR((&raw mut (*data).find).cast()),
+                lpstrReplaceWith: PWSTR((&raw mut (*data).replace).cast()),
+                wFindWhatLen: BUF as u16,
+                wReplaceWithLen: BUF as u16,
+                ..Default::default()
+            });
+        }
+        let dialog = unsafe { if replace { ReplaceTextW(fr) } else { FindTextW(fr) } };
         if dialog.is_invalid() {
             let code = unsafe { CommDlgExtendedError() };
             // The user asked for this dialog; its absence needs explaining, like the others'.
@@ -1947,12 +1959,14 @@ impl App {
     }
 
     fn on_find_message(&self) {
-        // Copy everything out first: no reference into FindData may outlive this block.
-        // The message boxes below run a modal loop in which show_find can take `&mut`.
+        // Copy everything out first: the message boxes below run a modal loop in which the
+        // dialog (or show_find) can rewrite FindData. Read through the raw pointer, never
+        // a reference (see show_find).
         let (flags, query, replacement): (FINDREPLACE_FLAGS, Vec<u16>, Vec<u16>) = unsafe {
-            let data = &*self.find.get();
+            let data = self.find.get();
+            let (find, replace) = ((&raw const (*data).find).read(), (&raw const (*data).replace).read());
             let cut = |b: &[u16]| b[..b.iter().position(|&c| c == 0).unwrap_or(b.len())].to_vec();
-            (data.fr.Flags, cut(&data.find), cut(&data.replace))
+            ((*data).fr.Flags, cut(&find), cut(&replace))
         };
         if flags.contains(FR_DIALOGTERM) {
             let mut ui = self.ui.get();
