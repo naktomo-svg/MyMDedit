@@ -26,12 +26,13 @@ fuzz_target!(|data: &[u8]| {
     let len = usize::from(u16::from_le_bytes([head[2], head[3]])) % (n - start + 1);
     let op = head[4];
     let is_line_start = |i: usize| i <= n && md_ops::find_line_start(&text, i) == i;
-    let e = match op % 13 {
-        8 | 9 => match md_ops::indent_lines(&text, start, len, op % 13 == 9) {
+    let e = match op % 14 {
+        8 | 9 => match md_ops::indent_lines(&text, start, len, op % 14 == 9) {
             Some(e) => e,
             None => return,
         },
         10 => md_ops::toggle_task(&text, start, len),
+        13 => md_ops::inline_code(&text, start, len),
         11 => {
             for h in md_ops::headings(&text) {
                 assert!(is_line_start(h.line_start) && (1..=6).contains(&h.level), "heading at {}", h.line_start);

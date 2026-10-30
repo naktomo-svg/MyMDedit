@@ -2222,7 +2222,7 @@ impl App {
             ID_BULLET => self.apply_op(|t, s, l| md_ops::prefix_lines(t, s, l, false, |_| "- ".into())),
             ID_NUMBERED => self.apply_op(|t, s, l| md_ops::prefix_lines(t, s, l, false, |i| format!("{}. ", i + 1))),
             ID_LINK => self.apply_op(|t, s, l| md_ops::insert_link(t, s, l, "[", "リンクテキスト", "url")),
-            ID_CODE => self.apply_op(|t, s, l| md_ops::wrap_selection(t, s, l, "`", "`", "コード")),
+            ID_CODE => self.apply_op(md_ops::inline_code),
             ID_QUOTE => self.apply_op(|t, s, l| md_ops::prefix_lines(t, s, l, false, |_| "> ".into())),
             ID_RULE => self.apply_op(|t, s, l| md_ops::insert_block(t, s, l, "---", true)),
             ID_IMAGE => self.apply_op(|t, s, l| md_ops::insert_link(t, s, l, "![", "代替テキスト", "url")),
