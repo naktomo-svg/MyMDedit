@@ -2,19 +2,23 @@
 
 use std::path::{Path, PathBuf};
 
-use windows::Win32::Foundation::{COLORREF, ERROR_CANCELLED, HWND, LPARAM};
+use windows::Win32::Foundation::{COLORREF, ERROR_CANCELLED, HWND, LPARAM, S_OK, WPARAM};
 use windows::Win32::Graphics::Gdi::{DEFAULT_CHARSET, EnumFontFamiliesExW, GetDC, LOGFONTW, ReleaseDC, TEXTMETRICW};
 use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance, CoTaskMemFree};
+use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Controls::Dialogs::{CC_RGBINIT, CHOOSECOLORW, ChooseColorW};
 use windows::Win32::UI::Controls::{
-    TASKDIALOG_BUTTON, TASKDIALOGCONFIG, TDCBF_CANCEL_BUTTON, TDF_ALLOW_DIALOG_CANCELLATION,
-    TDF_POSITION_RELATIVE_TO_WINDOW, TaskDialogIndirect,
+    TASKDIALOG_BUTTON, TASKDIALOG_NOTIFICATIONS, TASKDIALOGCONFIG, TASKDIALOGCONFIG_0, TASKDIALOGCONFIG_1,
+    TD_INFORMATION_ICON, TDCBF_CANCEL_BUTTON, TDCBF_OK_BUTTON, TDF_ALLOW_DIALOG_CANCELLATION, TDF_ENABLE_HYPERLINKS,
+    TDF_POSITION_RELATIVE_TO_WINDOW, TDN_HYPERLINK_CLICKED, TaskDialogIndirect,
 };
 use windows::Win32::UI::Shell::Common::COMDLG_FILTERSPEC;
+use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::Shell::{
     FOLDERID_Documents, FileOpenDialog, FileSaveDialog, IFileDialog, IFileOpenDialog, IFileSaveDialog, IShellItem,
     KF_FLAG_DEFAULT, SHCreateItemFromParsingName, SHGetKnownFolderItem, SIGDN_FILESYSPATH,
 };
+use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 use windows::core::{HRESULT, HSTRING, PCWSTR, w};
 
 use crate::log;
@@ -187,6 +191,91 @@ pub fn confirm_overwrite(owner: HWND, file_name: &str) -> windows::core::Result<
     )
 }
 
+/// The project's page: `repository` in Cargo.toml.
+pub const REPOSITORY_URL: &str = env!("CARGO_PKG_REPOSITORY");
+
+/// The page for the newest release; GitHub redirects it to the latest tag.
+pub fn releases_url() -> String {
+    format!("{REPOSITORY_URL}/releases/latest")
+}
+
+/// Opens an https page of this project in the default browser. Only ever given the
+/// constants above: a URL from a document never gets here.
+pub fn open_url(owner: HWND, url: &str) -> windows::core::Result<()> {
+    debug_assert!(url.starts_with(REPOSITORY_URL));
+    let result = unsafe { ShellExecuteW(Some(owner), w!("open"), &HSTRING::from(url), None, None, SW_SHOWNORMAL) };
+    // Not an HINSTANCE in any real sense: above 32 is success, anything else an error code.
+    if result.0 as usize > 32 { Ok(()) } else { Err(windows::core::Error::from_thread()) }
+}
+
+/// The body of バージョン情報. `webview2` is the installed runtime's version, if any.
+pub fn about_text(version: &str, copyright: &str, webview2: Option<&str>) -> String {
+    let host = REPOSITORY_URL.trim_start_matches("https://");
+    format!(
+        "バージョン {version}\nWindows 向けのシンプルな Markdown エディタ\n\n{copyright}\nMIT License\n\n\
+         WebView2 ランタイム: {}\n\n<a href=\"{REPOSITORY_URL}\">{host}</a>",
+        webview2.unwrap_or("見つかりません")
+    )
+}
+
+/// 「バージョン情報」: the app's icon, `content` from [`about_text`], and its link opening
+/// the project page.
+pub fn show_about(owner: HWND, content: &str) -> windows::core::Result<()> {
+    let content = HSTRING::from(content);
+    let config = TASKDIALOGCONFIG {
+        cbSize: size_of::<TASKDIALOGCONFIG>() as u32,
+        hwndParent: owner,
+        hInstance: unsafe { GetModuleHandleW(None)? }.into(),
+        dwFlags: TDF_ALLOW_DIALOG_CANCELLATION | TDF_POSITION_RELATIVE_TO_WINDOW | TDF_ENABLE_HYPERLINKS,
+        dwCommonButtons: TDCBF_OK_BUTTON,
+        pszWindowTitle: w!("バージョン情報"),
+        // MAKEINTRESOURCE(1): the app icon (res/app.rc), not an address.
+        Anonymous1: TASKDIALOGCONFIG_0 { pszMainIcon: PCWSTR(std::ptr::without_provenance(1)) },
+        pszMainInstruction: w!("MyMDedit"),
+        pszContent: PCWSTR(content.as_ptr()),
+        Anonymous2: TASKDIALOGCONFIG_1 { pszFooterIcon: TD_INFORMATION_ICON },
+        pszFooter: w!("同梱している第三者のソフトウェアのライセンスは THIRD-PARTY-NOTICES.txt にあります。"),
+        pfCallback: Some(about_callback),
+        ..Default::default()
+    };
+    unsafe { TaskDialogIndirect(&config, None, None, None) }
+}
+
+unsafe extern "system" fn about_callback(
+    hwnd: HWND,
+    msg: TASKDIALOG_NOTIFICATIONS,
+    _: WPARAM,
+    lparam: LPARAM,
+    _: isize,
+) -> HRESULT {
+    if msg == TDN_HYPERLINK_CLICKED {
+        // The href as written in about_text; anything else is not followed.
+        let href = unsafe { PCWSTR(lparam.0 as *const u16).to_string() }.unwrap_or_default();
+        if href == REPOSITORY_URL
+            && let Err(e) = open_url(hwnd, &href)
+        {
+            log::error("about open_url", &e);
+        }
+    }
+    S_OK
+}
+
+/// 「ショートカット一覧」: `content` is the list, one line per shortcut.
+pub fn show_shortcuts(owner: HWND, content: &str) -> windows::core::Result<()> {
+    let content = HSTRING::from(content);
+    let config = TASKDIALOGCONFIG {
+        cbSize: size_of::<TASKDIALOGCONFIG>() as u32,
+        hwndParent: owner,
+        dwFlags: TDF_ALLOW_DIALOG_CANCELLATION | TDF_POSITION_RELATIVE_TO_WINDOW,
+        dwCommonButtons: TDCBF_OK_BUTTON,
+        pszWindowTitle: w!("ショートカット一覧"),
+        pszMainInstruction: w!("キーボードショートカット"),
+        pszContent: PCWSTR(content.as_ptr()),
+        ..Default::default()
+    };
+    unsafe { TaskDialogIndirect(&config, None, None, None) }
+}
+
 pub fn parse_hex_color(hex: &str) -> Option<COLORREF> {
     let h = hex.strip_prefix('#')?;
     let full: String = match h.len() {
@@ -287,6 +376,17 @@ pub fn resolve_font<'a>(list: &'a str, installed: &[String], fallback: &'a str) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn about_lists_version_runtime_and_a_link_to_the_project() {
+        let t = about_text("1.2.3", "Copyright (c) 2026 X", Some("141.0.1"));
+        assert!(t.starts_with("バージョン 1.2.3\n"));
+        assert!(t.contains("Copyright (c) 2026 X\nMIT License"));
+        assert!(t.contains("WebView2 ランタイム: 141.0.1"));
+        assert!(t.ends_with(&format!("<a href=\"{REPOSITORY_URL}\">github.com/naktomo-svg/MyMDedit</a>")));
+        assert!(about_text("1", "c", None).contains("WebView2 ランタイム: 見つかりません"));
+        assert_eq!(releases_url(), "https://github.com/naktomo-svg/MyMDedit/releases/latest");
+    }
 
     #[test]
     fn hex_round_trip() {

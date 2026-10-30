@@ -91,6 +91,10 @@ const ID_STRIKE: u16 = 174;
 const ID_CODE_BLOCK: u16 = 175;
 const ID_TASK: u16 = 176;
 const ID_ERROR_CLOSE: u16 = 180;
+const ID_SHORTCUTS: u16 = 190;
+const ID_HELP_GITHUB: u16 = 191;
+const ID_HELP_RELEASES: u16 = 192;
+const ID_ABOUT: u16 = 193;
 const ID_RECENT_BASE: u16 = 200;
 /// One command id per recent-folder slot, derived from the cap so the two can't drift.
 const ID_RECENT_END: u16 = ID_RECENT_BASE + settings::limits::RECENT_FOLDER_COUNT as u16;
@@ -132,6 +136,35 @@ const ACCELERATORS: &[(u16, bool, bool, u16)] = &[
 
 pub fn accelerator_command(vk: u16, ctrl: bool, shift: bool) -> Option<u16> {
     ACCELERATORS.iter().find(|a| a.0 == vk && a.1 == ctrl && a.2 == shift).map(|a| a.3)
+}
+
+/// ヘルプ → ショートカット一覧, as (the accelerator's command, if it is one; what it
+/// does; the keys). Every command in ACCELERATORS has a row (a test checks), so a new
+/// shortcut cannot go unlisted.
+const SHORTCUT_HELP: &[(Option<u16>, &str, &str)] = &[
+    (Some(ID_NEW), "新規", "Ctrl+N"),
+    (Some(ID_OPEN), "開く", "Ctrl+O"),
+    (Some(ID_SAVE), "保存", "Ctrl+S"),
+    (Some(ID_SAVE_AS), "名前を付けて保存", "Ctrl+Shift+S"),
+    (Some(ID_FIND), "検索", "Ctrl+F"),
+    (Some(ID_REPLACE), "置換", "Ctrl+H"),
+    (Some(ID_GOTO_LINE), "行へ移動", "Ctrl+G"),
+    (Some(ID_OUTLINE), "見出しへ移動", "Ctrl+Shift+O"),
+    (Some(ID_TASK), "タスクの切り替え", "Ctrl+Enter"),
+    (Some(ID_ZOOM_IN), "ズームイン", "Ctrl++"),
+    (Some(ID_ZOOM_OUT), "ズームアウト", "Ctrl+-"),
+    (Some(ID_ZOOM_RESET), "ズームを100%に戻す", "Ctrl+0"),
+    (None, "終了", "Alt+F4"),
+    (None, "元に戻す / やり直し", "Ctrl+Z / Ctrl+Y"),
+    (None, "切り取り / コピー / 貼り付け", "Ctrl+X / Ctrl+C / Ctrl+V"),
+    (None, "すべて選択", "Ctrl+A"),
+    (None, "ズーム(エディタ上)", "Ctrl+マウスホイール"),
+    (None, "リストの自動継続", "Enter"),
+    (None, "リストの字下げ / 字下げを戻す", "Tab / Shift+Tab"),
+];
+
+fn shortcut_help_text() -> String {
+    SHORTCUT_HELP.iter().map(|(_, what, keys)| format!("{what}: {keys}")).collect::<Vec<_>>().join("\n")
 }
 
 struct ToolButton {
@@ -690,6 +723,15 @@ impl App {
             let settings = CreatePopupMenu()?;
             add(settings, ID_SETTINGS, "設定を開く...");
             popup("設定", settings);
+
+            let help = CreatePopupMenu()?;
+            add(help, ID_SHORTCUTS, "ショートカット一覧...");
+            sep(help);
+            add(help, ID_HELP_GITHUB, "GitHub のページを開く");
+            add(help, ID_HELP_RELEASES, "最新版を確認");
+            sep(help);
+            add(help, ID_ABOUT, "バージョン情報...");
+            popup("ヘルプ", help);
             Ok(bar)
         }
     }
@@ -1795,6 +1837,33 @@ impl App {
         }
     }
 
+    // ---- help ------------------------------------------------------------------------
+
+    fn show_shortcuts(&self) {
+        if let Err(e) = dialogs::show_shortcuts(self.hwnd(), &shortcut_help_text()) {
+            self.report_error("Shortcuts", "ショートカット一覧を表示できませんでした。", Some(&e));
+        }
+        self.editor().focus();
+    }
+
+    fn show_about(&self) {
+        let text = dialogs::about_text(
+            env!("CARGO_PKG_VERSION"),
+            env!("MYMDEDIT_COPYRIGHT"),
+            preview::runtime_version().as_deref(),
+        );
+        if let Err(e) = dialogs::show_about(self.hwnd(), &text) {
+            self.report_error("About", "バージョン情報を表示できませんでした。", Some(&e));
+        }
+        self.editor().focus();
+    }
+
+    fn open_project_page(&self, url: &str) {
+        if let Err(e) = dialogs::open_url(self.hwnd(), url) {
+            self.report_error("OpenUrl", &format!("ブラウザでページを開けませんでした: {url}"), Some(&e));
+        }
+    }
+
     // ---- find / replace --------------------------------------------------------------
 
     fn show_find(&self, replace: bool) {
@@ -1973,6 +2042,8 @@ impl App {
                 | ID_OUTLINE
                 | ID_HEADING
                 | ID_MORE
+                | ID_SHORTCUTS
+                | ID_ABOUT
         ) || (ID_RECENT_BASE..ID_RECENT_END).contains(&id);
         if modal && self.busy.replace(true) {
             return;
@@ -2019,6 +2090,10 @@ impl App {
             ID_TASK => self.apply_op(md_ops::toggle_task),
             ID_GOTO_LINE => self.goto_line(),
             ID_OUTLINE => self.show_outline(),
+            ID_SHORTCUTS => self.show_shortcuts(),
+            ID_HELP_GITHUB => self.open_project_page(dialogs::REPOSITORY_URL),
+            ID_HELP_RELEASES => self.open_project_page(&dialogs::releases_url()),
+            ID_ABOUT => self.show_about(),
             id if (ID_RECENT_BASE..ID_RECENT_END).contains(&id) => {
                 self.open_from_recent((id - ID_RECENT_BASE) as usize)
             }
@@ -2347,6 +2422,16 @@ mod tests {
         push_banner_message(&mut m, "c");
         push_banner_message(&mut m, "d");
         assert_eq!(m, vec!["b", "c", "d"]);
+    }
+
+    #[test]
+    fn every_shortcut_is_in_the_help_list() {
+        for &(_, _, _, cmd) in super::ACCELERATORS {
+            assert!(super::SHORTCUT_HELP.iter().any(|(id, _, _)| *id == Some(cmd)), "command {cmd} has no help row");
+        }
+        let text = super::shortcut_help_text();
+        assert!(text.starts_with("新規: Ctrl+N\n開く: Ctrl+O"));
+        assert_eq!(text.lines().count(), super::SHORTCUT_HELP.len());
     }
 
     #[test]

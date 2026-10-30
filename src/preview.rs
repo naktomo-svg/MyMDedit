@@ -30,12 +30,12 @@ use webview2_com::Microsoft::Web::WebView2::Win32::{
     COREWEBVIEW2_PROCESS_FAILED_KIND_BROWSER_PROCESS_EXITED, COREWEBVIEW2_PROCESS_FAILED_KIND_RENDER_PROCESS_EXITED,
     COREWEBVIEW2_WEB_ERROR_STATUS, COREWEBVIEW2_WEB_RESOURCE_CONTEXT, COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL,
     COREWEBVIEW2_WEB_RESOURCE_CONTEXT_IMAGE, COREWEBVIEW2_WEB_RESOURCE_REQUEST_SOURCE_KINDS_ALL,
-    CreateCoreWebView2EnvironmentWithOptions, ICoreWebView2, ICoreWebView2_4, ICoreWebView2_5, ICoreWebView2_18,
-    ICoreWebView2_22, ICoreWebView2AcceleratorKeyPressedEventArgs, ICoreWebView2Controller, ICoreWebView2Controller2,
-    ICoreWebView2CreateCoreWebView2ControllerCompletedHandler, ICoreWebView2Environment, ICoreWebView2Environment10,
-    ICoreWebView2EnvironmentOptions, ICoreWebView2NavigationCompletedEventArgs,
-    ICoreWebView2NavigationStartingEventArgs, ICoreWebView2ProcessFailedEventArgs, ICoreWebView2Settings4,
-    ICoreWebView2WebResourceRequestedEventArgs,
+    CreateCoreWebView2EnvironmentWithOptions, GetAvailableCoreWebView2BrowserVersionString, ICoreWebView2,
+    ICoreWebView2_4, ICoreWebView2_5, ICoreWebView2_18, ICoreWebView2_22, ICoreWebView2AcceleratorKeyPressedEventArgs,
+    ICoreWebView2Controller, ICoreWebView2Controller2, ICoreWebView2CreateCoreWebView2ControllerCompletedHandler,
+    ICoreWebView2Environment, ICoreWebView2Environment10, ICoreWebView2EnvironmentOptions,
+    ICoreWebView2NavigationCompletedEventArgs, ICoreWebView2NavigationStartingEventArgs,
+    ICoreWebView2ProcessFailedEventArgs, ICoreWebView2Settings4, ICoreWebView2WebResourceRequestedEventArgs,
 };
 use webview2_com::{
     AcceleratorKeyPressedEventHandler, ClientCertificateRequestedEventHandler, CoreWebView2EnvironmentOptions,
@@ -765,6 +765,19 @@ pub fn sync_view(this: &App) {
     if let Err(e) = unsafe { webview.ExecuteScript(&HSTRING::from(script), &handler) } {
         log::error("ExecuteScript", e);
         this.preview.borrow_mut().script_busy = false;
+    }
+}
+
+/// The installed WebView2 Runtime's version (バージョン情報), or `None` without one.
+pub fn runtime_version() -> Option<String> {
+    let mut version = PWSTR::null();
+    match unsafe { GetAvailableCoreWebView2BrowserVersionString(None, &mut version) } {
+        Ok(()) if !version.is_null() => Some(take_pwstr(version)),
+        Ok(()) => None,
+        Err(e) => {
+            log::error("GetAvailableCoreWebView2BrowserVersionString", &e);
+            None
+        }
     }
 }
 
