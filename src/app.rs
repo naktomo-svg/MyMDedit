@@ -106,6 +106,7 @@ const WM_APP_RENDER: u32 = WM_APP + 2;
 // WM_APP + 3 is preview::WM_APP_PREVIEW_FAILED.
 const WM_APP_CHECK_DISK: u32 = WM_APP + 4;
 // WM_APP + 5 is preview::WM_APP_PREVIEW_CLOSE.
+const WM_APP_DISK_CHECKED: u32 = WM_APP + 6;
 const TIMER_SCROLL_SYNC: usize = 1;
 
 const ZOOM_STEP: i32 = 10;
@@ -383,6 +384,12 @@ pub struct App {
     probe_rx: std::sync::mpsc::Receiver<(String, std::io::Result<()>)>,
     /// A probe result waiting for the current modal dialog to close.
     pending_probe: RefCell<Option<std::io::Result<()>>>,
+    /// The external-change check's results: (file, stamp it was compared with, verdict).
+    /// Delivered the same way as the folder probe's.
+    disk_tx: std::sync::mpsc::Sender<(PathBuf, FileStamp, DiskChange)>,
+    disk_rx: std::sync::mpsc::Receiver<(PathBuf, FileStamp, DiskChange)>,
+    /// A check is running on a worker thread.
+    disk_check_running: Cell<bool>,
 }
 
 thread_local! {
@@ -411,6 +418,7 @@ pub fn run(launch_file: Option<PathBuf>) -> windows::core::Result<()> {
     theme::set_app_dark_mode(dark);
 
     let (probe_tx, probe_rx) = std::sync::mpsc::channel();
+    let (disk_tx, disk_rx) = std::sync::mpsc::channel();
     let app = Rc::new(App {
         ui: Cell::new(Ui::default()),
         state: RefCell::new(State {
@@ -451,6 +459,9 @@ pub fn run(launch_file: Option<PathBuf>) -> windows::core::Result<()> {
         probe_tx,
         probe_rx,
         pending_probe: RefCell::new(None),
+        disk_tx,
+        disk_rx,
+        disk_check_running: Cell::new(false),
     });
     APP.with(|a| *a.borrow_mut() = Some(app.clone()));
 
@@ -1646,8 +1657,43 @@ impl App {
     }
 
     /// The window was activated: has another program changed or removed the open file?
-    /// Runs from a posted message, never inside WM_ACTIVATE, as it may show a dialog.
+    /// Runs from a posted message, never inside WM_ACTIVATE. Looking is left to a worker
+    /// thread, like the recent-folder probe: a file on a network drive that has dropped
+    /// blocks the stat for the SMB timeout, and this runs on every activation.
     fn check_external_change(&self) {
+        if self.disk_check_running.get() {
+            // One at a time. A doorbell may have been lost; pick up a result already there.
+            self.on_disk_checked();
+            return;
+        }
+        let (path, recorded) = {
+            let st = self.state.borrow();
+            (st.file_path.clone(), st.disk_stamp)
+        };
+        let (Some(path), Some(recorded)) = (path, recorded) else { return };
+        self.disk_check_running.set(true);
+        let hwnd = self.hwnd().0 as isize;
+        let tx = self.disk_tx.clone();
+        std::thread::spawn(move || {
+            let change = document::check_disk(&path, recorded);
+            if tx.send((path, recorded, change)).is_err() {
+                return; // The app is gone.
+            }
+            unsafe {
+                if let Err(e) = PostMessageW(Some(HWND(hwnd as *mut _)), WM_APP_DISK_CHECKED, WPARAM(0), LPARAM(0)) {
+                    // The result waits in the channel; the next activation collects it.
+                    log::error("check_external_change PostMessage", &e);
+                }
+            }
+        });
+    }
+
+    /// The worker's verdict on the open file, acted on only if it still concerns the
+    /// document as it is now (another file may have been opened, or this one saved,
+    /// while it looked).
+    fn on_disk_checked(&self) {
+        let Some((checked_path, checked_stamp, change)) = self.disk_rx.try_iter().last() else { return };
+        self.disk_check_running.set(false);
         // Our own modal is up (its closing reactivates the window and checks again).
         if self.busy.replace(true) {
             return;
@@ -1663,8 +1709,11 @@ impl App {
                 st.declined_overwrite,
             )
         };
-        if let (Some(path), Some(recorded)) = (path, recorded) {
-            match document::check_disk(&path, recorded) {
+        if let (Some(path), Some(recorded)) = (path, recorded)
+            && path == checked_path
+            && recorded == checked_stamp
+        {
+            match change {
                 DiskChange::Unchanged => {}
                 DiskChange::Missing if !missing_reported => {
                     self.state.borrow_mut().missing_reported = true;
@@ -2306,6 +2355,10 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
                 }
             }
             unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+        }
+        WM_APP_DISK_CHECKED => {
+            app.on_disk_checked();
+            LRESULT(0)
         }
         WM_APP_CHECK_DISK => {
             app.disk_check_pending.set(false);
