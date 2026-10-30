@@ -735,7 +735,7 @@ pub fn sync_view(this: &App) {
         p.webview.clone()
     };
     let Some(webview) = webview else {
-        // Not reachable while eady implies a webview, but a stuck flag would end zoom
+        // Not reachable while `ready` implies a webview, but a stuck flag would end zoom
         // and scroll sync for good.
         this.preview.borrow_mut().script_busy = false;
         return;
