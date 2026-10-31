@@ -1,5 +1,6 @@
 #![no_main]
 use libfuzzer_sys::fuzz_target;
+use mymdedit_fuzz::heading_level;
 use mymdedit_fuzz::md_ops::{self, Edit};
 
 fn check(text: &[u16], e: &Edit) {
@@ -54,7 +55,7 @@ fuzz_target!(|data: &[u8]| {
         0 => md_ops::wrap_selection(&text, start, len, "**", "**", "太字"),
         1 => md_ops::insert_link(&text, start, len, "[", "テキスト", "https://"),
         2 => md_ops::prefix_lines(&text, start, len, false, |i| format!("{}. ", i + 1)),
-        3 => md_ops::set_heading(&text, start, usize::from(op / 8 % 7)),
+        3 => md_ops::set_heading(&text, start, heading_level(head[5])),
         4 => md_ops::insert_block(&text, start, len, "---", true),
         5 => md_ops::code_block(&text, start, len),
         6 => match md_ops::on_enter(&text, start, len) {

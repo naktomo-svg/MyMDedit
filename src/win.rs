@@ -1,6 +1,6 @@
 //! Small Win32 helpers shared by the windows of this app.
 
-use windows::Win32::Foundation::{COLORREF, GlobalFree, HANDLE, HWND, LPARAM, RECT, WPARAM};
+use windows::Win32::Foundation::{COLORREF, GlobalFree, HANDLE, HWND, LPARAM, RECT, SetLastError, WIN32_ERROR, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     CLEARTYPE_QUALITY, CreateFontIndirectW, CreateFontW, DEFAULT_CHARSET, DeleteObject, FW_BOLD, FW_NORMAL, HFONT,
     HGDIOBJ, LOGFONTW, OUT_DEFAULT_PRECIS,
@@ -59,7 +59,11 @@ pub fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
+/// A pointer to `buf` for a Win32 call: `buf` must end in a NUL (as `wide` makes it) and
+/// outlive the call. The pointer carries no lifetime, so keep the buffer in a named
+/// variable — `pcwstr(&wide(s))` would dangle by the time the call reads it.
 pub fn pcwstr(buf: &[u16]) -> PCWSTR {
+    debug_assert_eq!(buf.last(), Some(&0), "pcwstr needs a NUL-terminated buffer");
     PCWSTR(buf.as_ptr())
 }
 
@@ -89,12 +93,23 @@ pub fn scale(dip: i32, dpi: u32) -> i32 {
     ((n + n.signum() * 48) / 96) as i32
 }
 
+/// A control's text. Empty when it cannot be read — a failure told apart from an empty
+/// control and logged. Lossy: the callers read numbers and font names from their own
+/// dialog's edit boxes, where a lone surrogate is as invalid as any other wrong input.
 pub fn window_text(hwnd: HWND) -> String {
     unsafe {
+        // Both calls answer 0 for an empty control too; only the last error tells.
+        SetLastError(WIN32_ERROR(0));
         let len = GetWindowTextLengthW(hwnd);
-        let mut buf = vec![0u16; len as usize + 1];
-        let n = GetWindowTextW(hwnd, &mut buf);
-        String::from_utf16_lossy(&buf[..n as usize])
+        let mut buf = vec![0u16; len.max(0) as usize + 1];
+        let n = if len > 0 { GetWindowTextW(hwnd, &mut buf) } else { 0 };
+        if n == 0 {
+            let e = windows::core::Error::from_thread();
+            if e.code().is_err() {
+                crate::log::error("window_text", &e);
+            }
+        }
+        String::from_utf16_lossy(&buf[..(n.max(0) as usize).min(buf.len())])
     }
 }
 
@@ -124,7 +139,15 @@ fn nonclient_fonts(dpi: u32) -> (LOGFONTW, LOGFONTW) {
         Ok(()) => (m.lfMessageFont, m.lfMenuFont),
         Err(e) => {
             crate::log::error("SystemParametersInfoForDpi", &e);
-            let mut lf = LOGFONTW { lfHeight: -scale(12, dpi), lfWeight: FW_NORMAL.0 as i32, ..Default::default() };
+            // The same character set and quality `font` asks for; zero would be
+            // ANSI_CHARSET, leaving Japanese to font linking on this path alone.
+            let mut lf = LOGFONTW {
+                lfHeight: -scale(12, dpi),
+                lfWeight: FW_NORMAL.0 as i32,
+                lfCharSet: DEFAULT_CHARSET,
+                lfQuality: CLEARTYPE_QUALITY,
+                ..Default::default()
+            };
             let face: Vec<u16> = "Segoe UI".encode_utf16().collect();
             lf.lfFaceName[..face.len()].copy_from_slice(&face);
             (lf, lf)
@@ -183,9 +206,10 @@ pub fn font(face: &str, px: i32, bold: bool) -> HFONT {
 }
 
 pub fn delete_font(f: HFONT) {
-    // Fails only for a font still selected into a DC: a leak worth a trace.
+    // Fails for a font still selected into a DC (a leak) or a handle that is no longer a
+    // font (deleted twice): either is worth a trace, and the log cannot tell which.
     if !f.is_invalid() && !unsafe { DeleteObject(HGDIOBJ(f.0)) }.as_bool() {
-        crate::log::error("DeleteObject", "font still in use; leaked");
+        crate::log::error("DeleteObject", "font still selected into a DC (leaked) or already deleted");
     }
 }
 
@@ -207,8 +231,10 @@ pub fn set_clipboard_text(hwnd: HWND, text: &str) -> windows::core::Result<()> {
     let units = wide(text);
     unsafe {
         // Everything that can fail for lack of memory happens before the clipboard is
-        // opened and emptied: a failed copy must leave what the user had there, and the
-        // clipboard is held only as long as the hand-over takes.
+        // opened and emptied, so such a failure leaves what the user had there; and the
+        // clipboard is held only as long as the hand-over takes. The one exception is
+        // SetClipboardData failing after EmptyClipboard: taking ownership requires the
+        // emptying, so the clipboard is then left empty (the error says the copy failed).
         let memory = GlobalAlloc(GMEM_MOVEABLE, units.len() * size_of::<u16>())?;
         let free = |e: windows::core::Error| {
             if let Err(free_error) = GlobalFree(Some(memory)) {
@@ -262,6 +288,20 @@ pub fn hiword(v: usize) -> u16 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    #[should_panic(expected = "NUL-terminated")]
+    fn pcwstr_refuses_a_buffer_without_its_nul() {
+        let units: Vec<u16> = "abc".encode_utf16().collect();
+        super::pcwstr(&units);
+    }
+
+    #[test]
+    fn window_text_of_a_window_that_is_gone_is_empty() {
+        // Not a window at all: GetWindowText fails, which reads as empty (and is logged).
+        let gone = windows::Win32::Foundation::HWND(0x7FFF_0000 as *mut _);
+        assert_eq!(super::window_text(gone), "");
+    }
+
     #[test]
     fn groups_thousands() {
         assert_eq!(super::group_thousands(0), "0");
