@@ -190,27 +190,21 @@ pub struct SettingsStore {
     writable: bool,
     /// Something the user should be told at startup about how the settings were loaded.
     load_warning: Option<String>,
-    /// What the last backup held: a file still broken the same way is not copied again
-    /// on every write.
-    last_backup_at: Option<(Vec<u8>, PathBuf)>,
 }
 
 impl SettingsStore {
     /// Loads from `%APPDATA%\MyMDedit\settings.json`. Never fails: anything unreadable
     /// degrades to defaults — but never silently, and never by later overwriting a file
-    /// that held more than what was loaded.
+    /// that held more than what was loaded. The one deliberate exception is keys this
+    /// version does not know: they are ignored and gone after the next save
+    /// (docs/spec.md, 設定の読み込み).
     pub fn load() -> Self {
         Self::open(std::env::var_os("APPDATA").map(|d| PathBuf::from(d).join("MyMDedit").join("settings.json")))
     }
 
     pub fn open(path: Option<PathBuf>) -> Self {
-        let mut store = Self {
-            path: path.clone(),
-            current: AppSettings::default(),
-            writable: true,
-            load_warning: None,
-            last_backup_at: None,
-        };
+        let mut store =
+            Self { path: path.clone(), current: AppSettings::default(), writable: true, load_warning: None };
         if let Some(path) = path {
             store.read(&path);
         }
@@ -248,7 +242,7 @@ impl SettingsStore {
         self.current = settings;
         if let Some(problem) = problem {
             // The next save will drop whatever could not be read, so keep the original.
-            self.load_warning = Some(match self.back_up(path) {
+            self.load_warning = Some(match back_up(path) {
                 Ok(backup) => format!("{problem}元のファイルは {} に保存してあります。", backup.display()),
                 Err(e) => {
                     log::error("SettingsStore.load backup", &e);
@@ -300,7 +294,7 @@ impl SettingsStore {
             Ok(None) => self.current.clone(),
             Ok(Some(Parsed::Clean(s))) => s,
             // What could be read is newer than our view; the rest is about to be dropped.
-            Ok(Some(Parsed::Partial(s, _))) => match self.back_up(&path) {
+            Ok(Some(Parsed::Partial(s, _))) => match back_up(&path) {
                 Ok(_) => s,
                 Err(e) => {
                     self.current = apply(self.current.clone());
@@ -311,7 +305,7 @@ impl SettingsStore {
             // replaced it is safe.
             Ok(Some(Parsed::Unreadable(reason))) => {
                 log::error("SettingsStore.update parse", &reason);
-                if let Err(e) = self.back_up(&path) {
+                if let Err(e) = back_up(&path) {
                     self.current = apply(self.current.clone());
                     return Err(e);
                 }
@@ -332,35 +326,99 @@ impl SettingsStore {
     }
 }
 
+const BACKUP_PREFIX: &str = "settings.broken-";
+
 /// Copies a settings file that is about to lose fields to `settings.broken-<time>.json`
-/// beside it.
-impl SettingsStore {
-    /// Backs the file up unless it holds exactly what was backed up last time; the path
-    /// of the copy that has it either way.
-    fn back_up(&mut self, path: &Path) -> std::io::Result<PathBuf> {
-        let bytes = std::fs::read(path)?;
-        if let Some((done, at)) = &self.last_backup_at
-            && *done == bytes
-        {
-            return Ok(at.clone());
+/// beside it, unless a backup there already holds exactly this file; the path of the copy
+/// that has it either way. Checking the backups on disk (not a memory of the last one)
+/// is what keeps a file left broken from gaining a new backup on every launch.
+///
+/// Streams rather than reads: the file may be far over `limits::MAX_FILE_BYTES` (that is
+/// one way to land here), and reading it whole could exhaust memory, which aborts the
+/// process with no crash log, on every launch.
+fn back_up(path: &Path) -> std::io::Result<PathBuf> {
+    use std::io::Seek;
+    let mut source = document::open_disk_file(path)?;
+    let len = source.metadata()?.len();
+    if let Some(at) = existing_backup(path, &mut source, len) {
+        return Ok(at);
+    }
+    source.rewind()?;
+    write_backup(path, &mut source)
+}
+
+/// A backup beside `path` with the same contents as `source`, if there is one. Errors
+/// only cost a duplicate backup, so they are logged and skipped.
+fn existing_backup(path: &Path, source: &mut std::fs::File, len: u64) -> Option<PathBuf> {
+    use std::io::Seek;
+    let entries = std::fs::read_dir(path.parent()?).inspect_err(|e| log::error("settings backup scan", e)).ok()?;
+    for entry in entries.filter_map(Result::ok) {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !name.starts_with(BACKUP_PREFIX) || !name.ends_with(".json") {
+            continue;
         }
-        let at = write_backup(path, &bytes)?;
-        self.last_backup_at = Some((bytes, at.clone()));
-        Ok(at)
+        if !entry.metadata().is_ok_and(|m| m.is_file() && m.len() == len) {
+            continue;
+        }
+        let same = (|| {
+            source.rewind()?;
+            same_contents(source, &mut document::open_disk_file(&entry.path())?)
+        })();
+        match same {
+            Ok(true) => return Some(entry.path()),
+            Ok(false) => {}
+            Err(e) => log::error("settings backup compare", &e),
+        }
+    }
+    None
+}
+
+fn same_contents(a: &mut impl std::io::Read, b: &mut impl std::io::Read) -> std::io::Result<bool> {
+    let (mut x, mut y) = (vec![0u8; 64 * 1024], vec![0u8; 64 * 1024]);
+    loop {
+        let (n, m) = (fill(a, &mut x)?, fill(b, &mut y)?);
+        if x[..n] != y[..m] {
+            return Ok(false);
+        }
+        if n == 0 {
+            return Ok(true);
+        }
     }
 }
 
+/// Reads until `buf` is full or the input ends; how much was read.
+fn fill(r: &mut impl std::io::Read, buf: &mut [u8]) -> std::io::Result<usize> {
+    let mut n = 0;
+    while n < buf.len() {
+        match r.read(&mut buf[n..]) {
+            Ok(0) => break,
+            Ok(k) => n += k,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(n)
+}
+
 /// A name already taken (two backups within one second) gets a counter instead of
-/// overwriting the earlier backup.
-fn write_backup(path: &Path, bytes: &[u8]) -> std::io::Result<PathBuf> {
+/// overwriting the earlier backup. A copy that fails midway is removed: a truncated
+/// backup would claim to be the original.
+fn write_backup(path: &Path, source: &mut std::fs::File) -> std::io::Result<PathBuf> {
     let secs = unix_seconds();
     for n in 1..100 {
         let name =
-            if n == 1 { format!("settings.broken-{secs}.json") } else { format!("settings.broken-{secs}-{n}.json") };
+            if n == 1 { format!("{BACKUP_PREFIX}{secs}.json") } else { format!("{BACKUP_PREFIX}{secs}-{n}.json") };
         let backup = path.with_file_name(name);
         match std::fs::File::create_new(&backup) {
             Ok(mut f) => {
-                std::io::Write::write_all(&mut f, bytes)?;
+                if let Err(e) = std::io::copy(source, &mut f) {
+                    drop(f);
+                    if let Err(e) = std::fs::remove_file(&backup) {
+                        log::error("settings backup cleanup", &e);
+                    }
+                    return Err(e);
+                }
                 return Ok(backup);
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
@@ -625,17 +683,53 @@ mod tests {
     fn backups_within_one_second_do_not_overwrite_each_other() {
         let dir = test_dir("backup-names");
         let path = dir.join("settings.json");
-        let mut store = SettingsStore::open(None);
         std::fs::write(&path, "first").unwrap();
-        let a = store.back_up(&path).unwrap();
+        let a = back_up(&path).unwrap();
         // The same broken content again is not copied twice...
-        assert_eq!(store.back_up(&path).unwrap(), a);
-        // ...but different content gets its own backup, even within the same second.
+        assert_eq!(back_up(&path).unwrap(), a);
+        // ...but different content gets its own backup, even within the same second
+        // (and even at the same length).
+        std::fs::write(&path, "fifth").unwrap();
+        let c = back_up(&path).unwrap();
+        assert_ne!(a, c);
+        assert_eq!(std::fs::read_to_string(&c).unwrap(), "fifth");
         std::fs::write(&path, "second").unwrap();
-        let b = store.back_up(&path).unwrap();
+        let b = back_up(&path).unwrap();
         assert_ne!(a, b);
         assert_eq!(std::fs::read_to_string(&a).unwrap(), "first");
         assert_eq!(std::fs::read_to_string(&b).unwrap(), "second");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_file_left_broken_is_not_backed_up_again_on_every_launch() {
+        let dir = test_dir("relaunch");
+        let path = dir.join("settings.json");
+        std::fs::write(&path, "{\"theme\": \"Dark\",}").unwrap();
+        let first = SettingsStore::open(Some(path.clone())).take_load_warning().unwrap();
+        // The next launch (a new store, nothing remembered in memory) finds the same file.
+        let second = SettingsStore::open(Some(path.clone())).take_load_warning().unwrap();
+        assert_eq!(backups(&dir).len(), 1);
+        assert_eq!(first, second, "the warning points at the backup that already exists");
+        // A file broken differently still gets its own backup.
+        std::fs::write(&path, "{\"theme\": \"Light\",}").unwrap();
+        SettingsStore::open(Some(path.clone()));
+        assert_eq!(backups(&dir).len(), 2);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn an_oversized_file_is_backed_up_whole() {
+        let dir = test_dir("oversized-backup");
+        let path = dir.join("settings.json");
+        let mut big = vec![b' '; limits::MAX_FILE_BYTES as usize * 3];
+        big.extend_from_slice(b"tail");
+        std::fs::write(&path, &big).unwrap();
+        SettingsStore::open(Some(path.clone()));
+        SettingsStore::open(Some(path.clone()));
+        let names = backups(&dir);
+        assert_eq!(names.len(), 1);
+        assert!(std::fs::read(dir.join(&names[0])).unwrap() == big);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
