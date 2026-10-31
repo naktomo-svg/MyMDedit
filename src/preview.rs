@@ -21,7 +21,7 @@
 
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, RECT, WPARAM};
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_CONTROL, VK_MENU, VK_SHIFT};
-use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_APP};
+use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
 use windows::core::{BOOL, HSTRING, Interface, PWSTR, w};
 
 use webview2_com::Microsoft::Web::WebView2::Win32::{
@@ -50,6 +50,7 @@ use webview2_com::{
 use crate::app::{App, app};
 use crate::log;
 use crate::render;
+use crate::win::{WM_APP_PREVIEW_CLOSE, WM_APP_PREVIEW_FAILED};
 
 #[derive(Default)]
 pub struct Preview {
@@ -84,11 +85,6 @@ pub struct Preview {
     renderer_crashes: u32,
 }
 
-/// Posted to the main window when a WebView2 process dies (wparam: 0 renderer, 1 browser).
-pub const WM_APP_PREVIEW_FAILED: u32 = WM_APP + 3;
-/// Posted to the main window when a stopped preview could not be hidden and must be
-/// closed instead — never from inside the WebView2 handler that found out.
-pub const WM_APP_PREVIEW_CLOSE: u32 = WM_APP + 5;
 const MAX_CRASH_RETRIES: u32 = 3;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

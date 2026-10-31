@@ -67,6 +67,14 @@ fn copy_link(token: u64, index: usize) -> String {
 pub fn parse_copy_link(uri: &str, token: u64) -> Option<usize> {
     let rest = uri.get(COPY_SCHEME.len()..).filter(|_| is_copy_link(uri))?;
     let (t, index) = rest.split_once('/')?;
+    // Only the exact form `copy_link` writes: `from_str_radix` and `parse` also take a
+    // leading `+`.
+    let digits = |s: &str, hex: bool| {
+        !s.is_empty() && s.bytes().all(|b| if hex { b.is_ascii_hexdigit() } else { b.is_ascii_digit() })
+    };
+    if !digits(t, true) || !digits(index, false) {
+        return None;
+    }
     (u64::from_str_radix(t, 16).ok()? == token).then_some(())?;
     index.parse().ok()
 }
@@ -364,8 +372,15 @@ mod tests {
         assert_eq!(parse_copy_link(&copy_link(7, 3), 7), Some(3));
         assert_eq!(parse_copy_link("MYMDEDIT-COPY:0000000000000007/3", 7), Some(3));
         assert_eq!(parse_copy_link(&copy_link(8, 3), 7), None);
-        for bad in ["mymdedit-copy:", "mymdedit-copy:7", "mymdedit-copy:7/x", "mymdedit-copy:日本/1", "mymdedit-cop"]
-        {
+        for bad in [
+            "mymdedit-copy:",
+            "mymdedit-copy:7",
+            "mymdedit-copy:7/x",
+            "mymdedit-copy:日本/1",
+            "mymdedit-cop",
+            "mymdedit-copy:+7/3",
+            "mymdedit-copy:7/+3",
+        ] {
             assert_eq!(parse_copy_link(bad, 7), None, "{bad}");
         }
         assert!(is_copy_link("mymdedit-copy:x") && !is_copy_link("https://x") && !is_copy_link("日本語"));

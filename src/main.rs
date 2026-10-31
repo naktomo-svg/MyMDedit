@@ -180,6 +180,25 @@ mod tests {
         }
     }
 
+    /// The app's window messages are numbered by one enum in win.rs, which keeps them
+    /// distinct; an offset from WM_APP written anywhere else could collide unnoticed.
+    #[test]
+    fn app_messages_are_only_numbered_in_win_rs() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().is_none_or(|e| e != "rs") || path.ends_with("win.rs") {
+                continue;
+            }
+            let code = std::fs::read_to_string(&path).unwrap();
+            assert!(
+                !code.contains(&["WM_APP", " +"].concat()) && !code.contains(&["WM_APP", "+"].concat()),
+                "{} numbers its own WM_APP message: add it to win::AppMessage instead",
+                path.display()
+            );
+        }
+    }
+
     /// The accepted licenses are written twice, once per tool; a license added to one
     /// only would fail the other tool's run with no hint of where the list lives.
     #[test]

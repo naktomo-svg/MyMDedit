@@ -53,17 +53,47 @@ pub fn find_all(text: &[u16], query: &[u16], case_sensitive: bool, whole_word: b
         return matches;
     }
     let (haystack, query) = (folded(text, case_sensitive), folded(query, case_sensitive));
-    let mut pos = 0;
-    while pos + query.len() <= text.len() {
-        let end = pos + query.len();
-        if haystack[pos..end] == *query && (!whole_word || is_whole_word(text, pos, end)) {
-            matches.push(pos);
-            pos = end;
-        } else {
-            pos += 1;
+    // Knuth–Morris–Pratt: linear in the text whatever the query. Comparing at every start
+    // offset is O(text × query), which a run of one letter and a long query that almost
+    // matches it turns into a visible freeze on the UI thread.
+    let fail = failure_table(&query);
+    let m = query.len();
+    let mut k = 0; // How much of the query matches the text just before `i`.
+    for (i, &c) in haystack.iter().enumerate() {
+        while k > 0 && query[k] != c {
+            k = fail[k - 1];
+        }
+        if query[k] == c {
+            k += 1;
+        }
+        if k == m {
+            let (start, end) = (i + 1 - m, i + 1);
+            if !whole_word || is_whole_word(text, start, end) {
+                matches.push(start);
+                k = 0; // Matches do not overlap.
+            } else {
+                k = fail[m - 1]; // Not a match after all: a later, overlapping one may be.
+            }
         }
     }
     matches
+}
+
+/// For each prefix of `query`, the length of its longest proper prefix that is also its
+/// suffix: where the match resumes after a mismatch.
+fn failure_table(query: &[u16]) -> Vec<usize> {
+    let mut fail = vec![0; query.len()];
+    let mut k = 0;
+    for i in 1..query.len() {
+        while k > 0 && query[i] != query[k] {
+            k = fail[k - 1];
+        }
+        if query[i] == query[k] {
+            k += 1;
+        }
+        fail[i] = k;
+    }
+    fail
 }
 
 /// Whether `text[start..start + len]` is exactly a match `find_all` would report with
@@ -130,6 +160,48 @@ mod tests {
         assert_eq!(find_all(&t, &w("cat"), true, false), vec![4, 11]);
         assert_eq!(find_all(&t, &w("cat"), false, true), vec![0, 4, 15]);
         assert_eq!(find_all(&w("日本語の日本"), &w("日本"), false, true), Vec::<usize>::new());
+    }
+
+    /// The scan that `find_all` replaced, kept as the definition of what it must return.
+    fn every_offset(text: &[u16], query: &[u16], case: bool, word: bool) -> Vec<usize> {
+        let (h, q) = (folded(text, case), folded(query, case));
+        let (mut out, mut pos) = (Vec::new(), 0);
+        while !q.is_empty() && pos + q.len() <= h.len() {
+            let end = pos + q.len();
+            if h[pos..end] == *q && (!word || is_whole_word(text, pos, end)) {
+                out.push(pos);
+                pos = end;
+            } else {
+                pos += 1;
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn agrees_with_scanning_every_offset() {
+        // Self-overlapping queries, and whole-word candidates that fail and leave room for
+        // an overlapping one: where a skip-ahead search goes wrong.
+        let texts = ["aaaa", "aaab aab ab", "abab abab", "ab ab-abab", "aAbBaAb a", "xaxaxax xax"];
+        let queries = ["a", "aa", "aab", "ab", "abab", "bab", "xax", "aAb"];
+        for t in texts {
+            for q in queries {
+                for (case, word) in [(false, false), (true, false), (false, true), (true, true)] {
+                    let (t, q) = (w(t), w(q));
+                    assert_eq!(find_all(&t, &q, case, word), every_offset(&t, &q, case, word), "{t:?} {q:?}");
+                }
+            }
+        }
+        assert_eq!(find_all(&w("aaaa"), &w("aa"), true, false), vec![0, 2]);
+    }
+
+    #[test]
+    fn a_long_near_miss_query_stays_linear() {
+        // O(text × query) would be 10^10 comparisons here; linear finishes at once.
+        let text = vec![b'a' as u16; 1_000_000];
+        let mut query = vec![b'a' as u16; 9_999];
+        query.push(b'b' as u16);
+        assert!(find_all(&text, &query, true, false).is_empty());
     }
 
     #[test]

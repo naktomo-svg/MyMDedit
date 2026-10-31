@@ -15,6 +15,46 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows::core::PCWSTR;
 
+/// The app's own window messages, all posted to the main window. Numbered by one enum so
+/// that two cannot share a value: the compiler rejects duplicate discriminants, where two
+/// hand-written `WM_APP + n` in different modules would silently run each other's
+/// handler. `main.rs`'s tests fail on a `WM_APP +` written anywhere else.
+#[repr(u32)]
+enum AppMessage {
+    FolderProbed = 1,
+    Render,
+    PreviewFailed,
+    CheckDisk,
+    PreviewClose,
+    DiskChecked,
+}
+
+const fn app_message(m: AppMessage) -> u32 {
+    windows::Win32::UI::WindowsAndMessaging::WM_APP + m as u32
+}
+
+/// A recent folder's existence check finished (the result waits in a channel).
+pub const WM_APP_FOLDER_PROBED: u32 = app_message(AppMessage::FolderProbed);
+/// Re-render the preview (coalesces edits).
+pub const WM_APP_RENDER: u32 = app_message(AppMessage::Render);
+/// A WebView2 process died (wparam: 0 renderer, 1 browser).
+pub const WM_APP_PREVIEW_FAILED: u32 = app_message(AppMessage::PreviewFailed);
+/// The window was activated: look for changes to the open file.
+pub const WM_APP_CHECK_DISK: u32 = app_message(AppMessage::CheckDisk);
+/// A stopped preview could not be hidden and must be closed instead — never from inside
+/// the WebView2 handler that found out.
+pub const WM_APP_PREVIEW_CLOSE: u32 = app_message(AppMessage::PreviewClose);
+/// The open file's disk check finished (the result waits in a channel).
+pub const WM_APP_DISK_CHECKED: u32 = app_message(AppMessage::DiskChecked);
+
+/// 64 bits from the system's cryptographic RNG, for values that must not be guessed.
+pub fn secure_random_u64() -> windows::core::Result<u64> {
+    use windows::Win32::Security::Cryptography::{BCRYPT_USE_SYSTEM_PREFERRED_RNG, BCryptGenRandom};
+    let mut bytes = [0u8; 8];
+    unsafe { BCryptGenRandom(None, &mut bytes, BCRYPT_USE_SYSTEM_PREFERRED_RNG) }.ok()?;
+    Ok(u64::from_ne_bytes(bytes))
+}
+
 pub fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }

@@ -7,7 +7,7 @@ use windows::Win32::Foundation::{COLORREF, ERROR_CANCELLED, HWND, LPARAM, S_OK, 
 use windows::Win32::Graphics::Gdi::{DEFAULT_CHARSET, EnumFontFamiliesExW, GetDC, LOGFONTW, ReleaseDC, TEXTMETRICW};
 use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance, CoTaskMemFree};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::UI::Controls::Dialogs::{CC_RGBINIT, CHOOSECOLORW, ChooseColorW};
+use windows::Win32::UI::Controls::Dialogs::{CC_RGBINIT, CHOOSECOLORW, ChooseColorW, CommDlgExtendedError};
 use windows::Win32::UI::Controls::{
     TASKDIALOG_BUTTON, TASKDIALOG_NOTIFICATIONS, TASKDIALOGCONFIG, TASKDIALOGCONFIG_0, TASKDIALOGCONFIG_1,
     TD_INFORMATION_ICON, TDCBF_CANCEL_BUTTON, TDCBF_OK_BUTTON, TDF_ALLOW_DIALOG_CANCELLATION, TDF_ENABLE_HYPERLINKS,
@@ -309,6 +309,10 @@ pub fn show_shortcuts(owner: HWND, content: &str) -> windows::core::Result<()> {
 }
 
 pub fn parse_hex_color(hex: &str) -> Option<COLORREF> {
+    // Checked first: `from_str_radix` also takes a leading `+` (`#+12345`).
+    if !crate::settings::is_hex_color(hex) {
+        return None;
+    }
     let h = hex.strip_prefix('#')?;
     let full: String = match h.len() {
         3 => h.chars().flat_map(|c| [c, c]).collect(),
@@ -352,7 +356,13 @@ pub fn custom_colors_to_save(slots: &CustomColors) -> Vec<String> {
 /// The classic Windows 「色の設定」 dialog (basic colors + 16 custom colors).
 /// `custom` is updated in place whatever the outcome — the native dialog keeps custom
 /// color edits even when cancelled. Returns the chosen color, or `None` on cancel.
-pub fn choose_color(owner: HWND, initial: COLORREF, custom: &mut CustomColors) -> Option<COLORREF> {
+/// `Ok(None)` when the user cancelled; `Err` when the dialog could not be shown, which
+/// the bare BOOL would otherwise pass off as a cancel.
+pub fn choose_color(
+    owner: HWND,
+    initial: COLORREF,
+    custom: &mut CustomColors,
+) -> windows::core::Result<Option<COLORREF>> {
     let mut cc = CHOOSECOLORW {
         lStructSize: size_of::<CHOOSECOLORW>() as u32,
         hwndOwner: owner,
@@ -361,7 +371,16 @@ pub fn choose_color(owner: HWND, initial: COLORREF, custom: &mut CustomColors) -
         Flags: CC_RGBINIT,
         ..Default::default()
     };
-    unsafe { ChooseColorW(&mut cc).as_bool().then_some(cc.rgbResult) }
+    if unsafe { ChooseColorW(&mut cc) }.as_bool() {
+        return Ok(Some(cc.rgbResult));
+    }
+    match unsafe { CommDlgExtendedError() }.0 {
+        0 => Ok(None),
+        code => Err(windows::core::Error::new(
+            windows::Win32::Foundation::E_FAIL,
+            format!("ChooseColorW: CommDlgExtendedError={code:#x}"),
+        )),
+    }
 }
 
 unsafe extern "system" fn font_proc(lf: *const LOGFONTW, _tm: *const TEXTMETRICW, _type: u32, lparam: LPARAM) -> i32 {
@@ -383,9 +402,18 @@ pub fn installed_fonts() -> Vec<String> {
     let mut names: Vec<String> = Vec::new();
     unsafe {
         let hdc = GetDC(None);
+        if hdc.is_invalid() {
+            log::error("installed_fonts", "GetDC failed");
+            return names;
+        }
         let lf = LOGFONTW { lfCharSet: DEFAULT_CHARSET, ..Default::default() };
         EnumFontFamiliesExW(hdc, &lf, Some(font_proc), LPARAM(&mut names as *mut _ as isize), 0);
         ReleaseDC(None, hdc);
+    }
+    // There is always at least one font installed: empty means the enumeration failed,
+    // which shows up as the icon font falling back and a two-entry font list.
+    if names.is_empty() {
+        log::error("installed_fonts", "EnumFontFamiliesExW found no fonts");
     }
     names.sort_by_key(|n| n.to_lowercase());
     names.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
@@ -427,6 +455,8 @@ mod tests {
         assert_eq!(format_hex_color(c), "#1E2F3A");
         assert_eq!(format_hex_color(parse_hex_color("#abc").unwrap()), "#AABBCC");
         assert!(parse_hex_color("red").is_none());
+        assert!(parse_hex_color("#+12345").is_none());
+        assert!(parse_hex_color("#+12").is_none());
     }
 
     #[test]

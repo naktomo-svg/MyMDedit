@@ -526,6 +526,18 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     // Persisted the moment the color dialog closes, whatever the outcome
                     // of this dialog — matching the native dialog keeping its palette.
                     (state.on_custom_colors)(custom_colors_to_save(&custom));
+                    let chosen = match chosen {
+                        Ok(c) => c,
+                        Err(e) => {
+                            log::error("choose_color", &e);
+                            let text = wide("色の選択画面を開けませんでした。");
+                            let caption = wide("MyMDedit");
+                            unsafe {
+                                MessageBoxW(Some(hwnd), pcwstr(&text), pcwstr(&caption), MB_OK | MB_ICONERROR);
+                            }
+                            None
+                        }
+                    };
                     if let Some(c) = chosen {
                         state.bg_color.set(c);
                         unsafe {

@@ -47,7 +47,10 @@ use crate::search;
 use crate::settings::{self, AppSettings, SettingsStore, Theme};
 use crate::settings_dialog;
 use crate::theme::{self, Palette, fill};
-use crate::win::{self, group_thousands, hiword, loword, pcwstr, scale, send, wide};
+use crate::win::{
+    self, WM_APP_CHECK_DISK, WM_APP_DISK_CHECKED, WM_APP_FOLDER_PROBED, WM_APP_PREVIEW_CLOSE, WM_APP_PREVIEW_FAILED,
+    WM_APP_RENDER, group_thousands, hiword, loword, pcwstr, scale, send, wide,
+};
 
 const SAMPLE_CONTENT: &str = "# Hello, Markdown!\n\nここに Markdown を入力すると、右側にプレビューが表示されます。\n\n- リスト項目 1\n- リスト項目 2\n\n```csharp\nConsole.WriteLine(\"Hello, world!\");\n```";
 const UNTITLED: &str = "無題.md";
@@ -101,13 +104,19 @@ const ID_RECENT_BASE: u16 = 200;
 const ID_RECENT_END: u16 = ID_RECENT_BASE + settings::limits::RECENT_FOLDER_COUNT as u16;
 const ID_EDITOR: usize = 300;
 
-const WM_APP_FOLDER_PROBED: u32 = WM_APP + 1;
-const WM_APP_RENDER: u32 = WM_APP + 2;
-// WM_APP + 3 is preview::WM_APP_PREVIEW_FAILED.
-const WM_APP_CHECK_DISK: u32 = WM_APP + 4;
-// WM_APP + 5 is preview::WM_APP_PREVIEW_CLOSE.
-const WM_APP_DISK_CHECKED: u32 = WM_APP + 6;
 const TIMER_SCROLL_SYNC: usize = 1;
+
+/// Starts a worker thread. `std::thread::spawn` panics when the OS cannot create one, and
+/// every caller here runs inside a window procedure, where a panic aborts the process and
+/// takes the unsaved document with it; this hands the failure back (already logged).
+/// clippy.toml disallows `std::thread::spawn` so that nothing bypasses it.
+fn spawn_worker(name: &str, f: impl FnOnce() + Send + 'static) -> std::io::Result<()> {
+    std::thread::Builder::new()
+        .name(name.to_owned())
+        .spawn(f)
+        .map(|_| ())
+        .inspect_err(|e| log::error(&format!("spawn {name}"), e))
+}
 
 const ZOOM_STEP: i32 = 10;
 const ZOOM_MIN: i32 = 50;
@@ -373,6 +382,8 @@ pub struct App {
     hovered: Cell<HWND>,
     /// A render request is queued (see `request_render`).
     render_pending: Cell<bool>,
+    /// The scroll-sync timer is running (it is stopped while the window is minimized).
+    scroll_timer_on: Cell<bool>,
     /// Ctrl+wheel movement not yet worth a whole zoom step.
     wheel_accum: Cell<i32>,
     find: Cell<*mut FindData>,
@@ -382,14 +393,20 @@ pub struct App {
     /// the UI thread a pointer to free.
     probe_tx: std::sync::mpsc::Sender<(String, std::io::Result<()>)>,
     probe_rx: std::sync::mpsc::Receiver<(String, std::io::Result<()>)>,
-    /// A probe result waiting for the current modal dialog to close.
-    pending_probe: RefCell<Option<std::io::Result<()>>>,
+    /// A probe result waiting for the current modal dialog to close, with the folder it
+    /// is about (the folder being probed may have changed by the time it is delivered).
+    pending_probe: RefCell<Option<(String, std::io::Result<()>)>>,
     /// The external-change check's results: (file, stamp it was compared with, verdict).
     /// Delivered the same way as the folder probe's.
     disk_tx: std::sync::mpsc::Sender<(PathBuf, FileStamp, DiskChange)>,
     disk_rx: std::sync::mpsc::Receiver<(PathBuf, FileStamp, DiskChange)>,
     /// A check is running on a worker thread.
     disk_check_running: Cell<bool>,
+    /// A check finished while a modal of ours was up, and its result was dropped: check
+    /// again once that modal is gone. Not every modal deactivates the main window (a
+    /// popup menu, a message box owned by the find dialog), so the activation that
+    /// follows cannot be relied on to do it.
+    disk_recheck: Cell<bool>,
 }
 
 thread_local! {
@@ -454,6 +471,7 @@ pub fn run(launch_file: Option<PathBuf>) -> windows::core::Result<()> {
         hovered: Cell::new(HWND::default()),
         wheel_accum: Cell::new(0),
         render_pending: Cell::new(false),
+        scroll_timer_on: Cell::new(false),
         find: Cell::new(std::ptr::null_mut()),
         find_message: Cell::new(0),
         probe_tx,
@@ -462,6 +480,7 @@ pub fn run(launch_file: Option<PathBuf>) -> windows::core::Result<()> {
         disk_tx,
         disk_rx,
         disk_check_running: Cell::new(false),
+        disk_recheck: Cell::new(false),
     });
     APP.with(|a| *a.borrow_mut() = Some(app.clone()));
 
@@ -484,7 +503,8 @@ pub fn run(launch_file: Option<PathBuf>) -> windows::core::Result<()> {
     unsafe {
         let _ = ShowWindow(ui.hwnd, SW_SHOWDEFAULT);
         let _ = SetFocus(Some(ui.editor));
-        SetTimer(Some(ui.hwnd), TIMER_SCROLL_SYNC, 50, None);
+        // Started minimized, WM_SIZE has already come and gone: ask the window itself.
+        app.set_scroll_timer(!IsIconic(ui.hwnd).as_bool());
 
         let mut msg = MSG::default();
         loop {
@@ -1137,7 +1157,11 @@ impl App {
         let markdown = String::from_utf16_lossy(&text);
         // A fresh token per render: the document cannot learn it, so it cannot forge a
         // copy button, and a click on a page already replaced names nothing.
-        let copy_token = document::random_u64();
+        // Must be unguessable to the document (render::to_html_document): the system RNG,
+        // falling back to the keyed hash only if that fails.
+        let copy_token = win::secure_random_u64()
+            .inspect_err(|e| log::error("secure_random_u64", e))
+            .unwrap_or_else(|_| document::random_u64());
         let rendered = render::to_html_document(&markdown, self.state.borrow().settings.current(), copy_token);
         {
             let mut st = self.state.borrow_mut();
@@ -1199,6 +1223,24 @@ impl App {
     fn zoom_by(&self, delta: i32) {
         let z = self.state.borrow().zoom;
         self.set_zoom(z + delta);
+    }
+
+    /// Runs the scroll-sync timer only while there is something on screen to follow: a
+    /// minimized window would otherwise still wake the CPU 20 times a second.
+    fn set_scroll_timer(&self, on: bool) {
+        if self.scroll_timer_on.replace(on) == on {
+            return;
+        }
+        unsafe {
+            if on {
+                if SetTimer(Some(self.hwnd()), TIMER_SCROLL_SYNC, 50, None) == 0 {
+                    log::error("SetTimer", windows::core::Error::from_thread());
+                    self.scroll_timer_on.set(false);
+                }
+            } else if let Err(e) = KillTimer(Some(self.hwnd()), TIMER_SCROLL_SYNC) {
+                log::error("KillTimer", &e);
+            }
+        }
     }
 
     fn poll_scroll(&self) {
@@ -1368,7 +1410,7 @@ impl App {
             // The same folder again. A doorbell may have been lost; pick up a result that
             // is already there.
             if self.collect_probe_result() {
-                self.deliver_pending_probe();
+                self.deliver_deferred();
             } else {
                 // Still checking (an unreachable network drive takes a while).
                 unsafe {
@@ -1382,7 +1424,8 @@ impl App {
         self.state.borrow_mut().probing_folder = Some(folder.clone());
         let hwnd = self.hwnd().0 as isize;
         let tx = self.probe_tx.clone();
-        std::thread::spawn(move || {
+        let shown = folder.clone();
+        let spawned = spawn_worker("FolderProbe", move || {
             // Listing must actually be attempted: one entry is enough. An empty folder
             // is a perfectly good folder; only the error matters.
             let result = std::fs::read_dir(&folder).and_then(|mut it| it.next().transpose().map(|_| ()));
@@ -1396,6 +1439,10 @@ impl App {
                 }
             }
         });
+        if let Err(e) = spawned {
+            self.state.borrow_mut().probing_folder = None;
+            self.report_error("OpenFromFolder", &format!("このフォルダを確認できませんでした: {shown}"), Some(&e));
+        }
     }
 
     /// Moves the result for the folder being probed now from the channel to
@@ -1406,7 +1453,7 @@ impl App {
         let mut found = false;
         while let Ok((folder, result)) = self.probe_rx.try_recv() {
             if probing.as_deref() == Some(folder.as_str()) {
-                *self.pending_probe.borrow_mut() = Some(result);
+                *self.pending_probe.borrow_mut() = Some((folder, result));
                 found = true;
             } else {
                 log::error("FolderProbe", format!("dropped the result for {folder}: another folder was clicked since"));
@@ -1415,26 +1462,40 @@ impl App {
         found
     }
 
-    /// Handles a waiting probe result unless a modal dialog is up; then it is retried when
-    /// that dialog's command finishes (see `command`). The result opens a discard prompt
-    /// and a file picker, which must never stack on another modal.
-    fn deliver_pending_probe(&self) {
+    /// Handles what waited for a modal dialog to close, unless one is up; then it is
+    /// retried when that dialog's command finishes (see `command`): a waiting probe
+    /// result (it opens a discard prompt and a file picker, which must never stack on
+    /// another modal) and a disk check whose result was dropped.
+    fn deliver_deferred(&self) {
         // Once closing is decided the window may already be destroyed (終了 runs
         // DestroyWindow inside its command): a prompt owned by it must not appear.
         if self.close_confirmed.get() || self.busy.replace(true) {
             return;
         }
-        let result = self.pending_probe.borrow_mut().take();
-        if let Some(result) = result {
-            self.on_folder_probed(result);
+        let pending = self.pending_probe.borrow_mut().take();
+        if let Some((folder, result)) = pending {
+            self.on_folder_probed(&folder, result);
         }
         self.busy.set(false);
+        if self.disk_recheck.take() {
+            self.check_external_change();
+        }
     }
 
     /// Step 2: the probe's verdict. Only "not found" drops the entry; access denied or
-    /// a disconnected drive are likely temporary and the entry is the way back.
-    fn on_folder_probed(&self, result: std::io::Result<()>) {
-        let Some(folder) = self.state.borrow_mut().probing_folder.take() else {
+    /// a disconnected drive are likely temporary and the entry is the way back. A verdict
+    /// on a folder that is no longer the one being probed is stale and dropped.
+    fn on_folder_probed(&self, probed: &str, result: std::io::Result<()>) {
+        let folder = {
+            let mut st = self.state.borrow_mut();
+            if st.probing_folder.as_deref() != Some(probed) {
+                drop(st);
+                log::error("FolderProbe", format!("dropped a stale result for {probed}"));
+                return;
+            }
+            st.probing_folder.take()
+        };
+        let Some(folder) = folder else {
             return;
         };
         match result {
@@ -1674,7 +1735,7 @@ impl App {
         self.disk_check_running.set(true);
         let hwnd = self.hwnd().0 as isize;
         let tx = self.disk_tx.clone();
-        std::thread::spawn(move || {
+        let spawned = spawn_worker("DiskCheck", move || {
             let change = document::check_disk(&path, recorded);
             if tx.send((path, recorded, change)).is_err() {
                 return; // The app is gone.
@@ -1686,6 +1747,10 @@ impl App {
                 }
             }
         });
+        if spawned.is_err() {
+            // Already logged; the next activation tries again.
+            self.disk_check_running.set(false);
+        }
     }
 
     /// The worker's verdict on the open file, acted on only if it still concerns the
@@ -1694,8 +1759,10 @@ impl App {
     fn on_disk_checked(&self) {
         let Some((checked_path, checked_stamp, change)) = self.disk_rx.try_iter().last() else { return };
         self.disk_check_running.set(false);
-        // Our own modal is up (its closing reactivates the window and checks again).
+        // Our own modal is up: the result may be stale by the time it closes, so check
+        // again then (`deliver_deferred`).
         if self.busy.replace(true) {
+            self.disk_recheck.set(true);
             return;
         }
         let (path, recorded, name, dirty, missing_reported, declined) = {
@@ -1745,7 +1812,7 @@ impl App {
             }
         }
         self.busy.set(false);
-        self.deliver_pending_probe();
+        self.deliver_deferred();
     }
 
     fn exit(&self) {
@@ -1783,7 +1850,7 @@ impl App {
             self.release_shutdown_block();
         } else {
             // The session continues: hand over anything that waited for this prompt.
-            self.deliver_pending_probe();
+            self.deliver_deferred();
         }
         ok
     }
@@ -1810,7 +1877,7 @@ impl App {
                 let _ = DestroyWindow(self.hwnd());
             }
         } else {
-            self.deliver_pending_probe();
+            self.deliver_deferred();
         }
     }
 
@@ -1818,8 +1885,7 @@ impl App {
 
     fn apply_op(&self, op: impl FnOnce(&[u16], usize, usize) -> Edit) {
         let editor = self.editor();
-        let text = editor.text();
-        let (start, len) = editor.selection();
+        let (text, start, len) = editor.text_and_selection();
         let edit = op(&text, start, len);
         editor.apply(&edit);
         editor.focus();
@@ -1828,8 +1894,7 @@ impl App {
     /// Enter in the editor: list continuation. Returns true when it consumed the key.
     fn on_editor_enter(&self) -> bool {
         let editor = self.editor();
-        let (start, len) = editor.selection();
-        let text = editor.text();
+        let (text, start, len) = editor.text_and_selection();
         match md_ops::on_enter(&text, start, len) {
             Some(edit) => {
                 editor.apply(&edit);
@@ -1844,8 +1909,7 @@ impl App {
     /// key; outside a list the key keeps inserting a tab.
     fn on_editor_tab(&self, outdent: bool) -> bool {
         let editor = self.editor();
-        let (start, len) = editor.selection();
-        let text = editor.text();
+        let (text, start, len) = editor.text_and_selection();
         let Some(edit) = md_ops::indent_lines(&text, start, len, outdent) else {
             return false;
         };
@@ -1898,8 +1962,7 @@ impl App {
     /// 行へ移動: asks for a line number and puts the caret at that line's start.
     fn goto_line(&self) {
         let editor = self.editor();
-        let text = editor.text();
-        let (start, _) = editor.selection();
+        let (text, start, _) = editor.text_and_selection();
         let current = md_ops::line_index_at(&text, start) + 1;
         let palette = self.state.borrow().palette;
         match goto_dialog::show(self.hwnd(), current, line_endings::count_lines(&text), palette) {
@@ -2024,9 +2087,8 @@ impl App {
         const BUF: usize = 512;
         // Seed the search box with a short single-line selection.
         let editor = self.editor();
-        let (start, len) = editor.selection();
+        let (text, start, len) = editor.text_and_selection();
         if len > 0 && len < BUF {
-            let text = editor.text();
             let sel = &text[start..start + len];
             if !sel.iter().any(|&c| line_endings::is_break(c)) {
                 let mut seeded = [0u16; BUF];
@@ -2113,7 +2175,7 @@ impl App {
         }
         self.find_or_replace(flags, query, replacement);
         self.busy.set(false);
-        self.deliver_pending_probe();
+        self.deliver_deferred();
     }
 
     fn find_or_replace(&self, flags: FINDREPLACE_FLAGS, query: Vec<u16>, replacement: Vec<u16>) {
@@ -2141,19 +2203,15 @@ impl App {
         }
 
         if flags.contains(FR_REPLACE) {
-            let (start, len) = editor.selection();
-            if len > 0 {
-                let text = editor.text();
-                if search::is_match_at(&text, start, len, &query, case, whole) {
-                    editor.replace_selection(&replacement);
-                    editor.set_selection(start + replacement.len(), 0);
-                }
+            let (text, start, len) = editor.text_and_selection();
+            if len > 0 && search::is_match_at(&text, start, len, &query, case, whole) {
+                editor.replace_selection(&replacement);
+                editor.set_selection(start + replacement.len(), 0);
             }
         }
 
-        let text = editor.text();
+        let (text, start, len) = editor.text_and_selection();
         let matches = search::find_all(&text, &query, case, whole);
-        let (start, len) = editor.selection();
         let found = if flags.contains(FR_FINDNEXT) && !flags.contains(FR_DOWN) {
             search::previous(&matches, start)
         } else {
@@ -2248,7 +2306,7 @@ impl App {
         }
         if modal {
             self.busy.set(false);
-            self.deliver_pending_probe();
+            self.deliver_deferred();
         }
     }
 
@@ -2325,6 +2383,7 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
         }
         WM_ERASEBKGND => LRESULT(1),
         WM_SIZE => {
+            app.set_scroll_timer(wparam.0 as u32 != SIZE_MINIMIZED);
             app.layout();
             LRESULT(0)
         }
@@ -2369,11 +2428,11 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
             app.poll_scroll();
             LRESULT(0)
         }
-        preview::WM_APP_PREVIEW_FAILED => {
+        WM_APP_PREVIEW_FAILED => {
             preview::on_process_failed(&app, wparam.0 == 1);
             LRESULT(0)
         }
-        preview::WM_APP_PREVIEW_CLOSE => {
+        WM_APP_PREVIEW_CLOSE => {
             preview::close(&app);
             LRESULT(0)
         }
@@ -2384,7 +2443,7 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
         }
         WM_APP_FOLDER_PROBED => {
             if app.collect_probe_result() {
-                app.deliver_pending_probe();
+                app.deliver_deferred();
             }
             LRESULT(0)
         }

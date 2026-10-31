@@ -432,6 +432,8 @@ fn move_file(from: &Path, to: &Path, overwrite: bool) -> io::Result<()> {
         .map_err(|e| io::Error::from_raw_os_error(e.code().0 & 0xFFFF))
 }
 
+/// Unpredictable enough to keep temp-file names from colliding, nothing more: a value
+/// that must not be guessed comes from `win::secure_random_u64`.
 pub fn random_u64() -> u64 {
     use std::hash::{BuildHasher, Hasher};
     let mut h = std::collections::hash_map::RandomState::new().build_hasher();

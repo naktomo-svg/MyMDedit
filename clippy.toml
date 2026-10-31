@@ -1,0 +1,3 @@
+disallowed-methods = [
+    { path = "std::thread::spawn", reason = "panics when no thread can be created, and inside a window procedure that aborts the process; use app::spawn_worker" },
+]

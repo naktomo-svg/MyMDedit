@@ -105,11 +105,17 @@ impl Editor {
         self.set_selection(0, 0);
     }
 
-    /// (start, length) in UTF-16 units.
-    pub fn selection(&self) -> (usize, usize) {
+    /// The whole text and the selection as (start, length) in UTF-16 units, the selection
+    /// kept inside the text actually returned. There is deliberately no way to get the
+    /// selection alone: callers slice the text with it, and a selection measured against
+    /// a separately taken length could overrun the text if the two ever disagreed —
+    /// a panic inside a window procedure, which aborts the process.
+    pub fn text_and_selection(&self) -> (Vec<u16>, usize, usize) {
+        let text = self.text();
         let mut cr = CHARRANGE::default();
         send(self.0, EM_EXGETSEL, 0, &mut cr as *mut _ as isize);
-        clamp_selection(cr.cpMin, cr.cpMax, self.len())
+        let (start, len) = clamp_selection(cr.cpMin, cr.cpMax, text.len());
+        (text, start, len)
     }
 
     pub fn set_selection(&self, start: usize, len: usize) {
