@@ -21,7 +21,7 @@
 
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, RECT, WPARAM};
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_CONTROL, VK_MENU, VK_SHIFT};
-use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_APP};
+use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
 use windows::core::{BOOL, HSTRING, Interface, PWSTR, w};
 
 use webview2_com::Microsoft::Web::WebView2::Win32::{
@@ -50,6 +50,7 @@ use webview2_com::{
 use crate::app::{App, app};
 use crate::log;
 use crate::render;
+use crate::win::{WM_APP_PREVIEW_CLOSE, WM_APP_PREVIEW_FAILED};
 
 #[derive(Default)]
 pub struct Preview {
@@ -69,6 +70,10 @@ pub struct Preview {
     /// only signal the guard trusts. A count, not a bool: a render per keystroke can put
     /// two of our own navigations in flight, and a bool would cancel the second.
     pending_self: i32,
+    /// When `pending_self` was last raised. A count still raised long after that was
+    /// never consumed (see `PENDING_EXPIRY`) and is dropped rather than left to admit
+    /// whatever navigates next.
+    pending_since: Option<std::time::Instant>,
     /// Id of the newest navigation we started and the guard let through.
     latest_id: u64,
     update_failure_reported: bool,
@@ -82,13 +87,48 @@ pub struct Preview {
     /// Renderer crashes since the last successful render; capped so a document that
     /// kills the renderer is not re-rendered forever.
     renderer_crashes: u32,
+    /// The renderer-crash give-up has been reported; cleared by a successful render, so
+    /// a document that keeps killing the renderer raises the banner once, not per edit.
+    renderer_crash_reported: bool,
 }
 
-/// Posted to the main window when a WebView2 process dies (wparam: 0 renderer, 1 browser).
-pub const WM_APP_PREVIEW_FAILED: u32 = WM_APP + 3;
-/// Posted to the main window when a stopped preview could not be hidden and must be
-/// closed instead — never from inside the WebView2 handler that found out.
-pub const WM_APP_PREVIEW_CLOSE: u32 = WM_APP + 5;
+impl Preview {
+    /// Forgets everything in flight: it died with the process or the controller. One
+    /// place, so a new in-flight flag cannot be reset on one path and left set on the
+    /// other (a stale `script_busy` stops zoom and scroll sync for good).
+    fn reset_in_flight(&mut self) {
+        self.pending_self = 0;
+        self.pending_since = None;
+        self.script_busy = false;
+        self.script_again = false;
+    }
+
+    /// `pending_self`, after dropping a count that has outlived `PENDING_EXPIRY`. Only
+    /// ever lowers it, so it can only make the guard deny more.
+    fn pending_now(&mut self) -> i32 {
+        if pending_expired(self.pending_self, self.pending_since, std::time::Instant::now()) {
+            log::error("PreviewGuard", format!("dropped {} navigation permission(s) never used", self.pending_self));
+            self.pending_self = 0;
+            self.pending_since = None;
+        }
+        self.pending_self
+    }
+}
+
+/// How long a navigation we started may take to reach NavigationStarting. WebView2 is
+/// not documented to raise NavigationStarting for every NavigateToString (one superseded
+/// by the next may never get there); a count left raised by such a one would admit the
+/// document's own next navigation. Generous, because expiring too early cancels one of
+/// our own renders (the next edit renders again): NavigationStarting normally follows
+/// within milliseconds.
+const PENDING_EXPIRY: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Whether a raised count is stale. Expiry never resets the counter early when a new
+/// navigation was issued: `since` is the time of the newest one.
+fn pending_expired(pending: i32, since: Option<std::time::Instant>, now: std::time::Instant) -> bool {
+    pending > 0 && since.is_some_and(|t| now.saturating_duration_since(t) > PENDING_EXPIRY)
+}
+
 const MAX_CRASH_RETRIES: u32 = 3;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -130,9 +170,7 @@ pub fn on_process_failed(app: &App, browser: bool) {
             return;
         }
         // Whatever was in flight died with the process.
-        p.pending_self = 0;
-        p.script_busy = false;
-        p.script_again = false;
+        p.reset_in_flight();
         let response = crash_response(process, p.renderer_crashes, p.restarts);
         match process {
             CrashedProcess::Renderer => p.renderer_crashes += 1,
@@ -159,12 +197,18 @@ pub fn on_process_failed(app: &App, browser: bool) {
             );
         }
         // Not re-rendered automatically; the next edit tries again, and a successful
-        // render resets the count.
-        CrashResponse::GiveUp => app.report_error(
-            "PreviewProcessFailed",
-            "この文書を表示するとプレビューの処理が停止するため、自動での再表示をやめました。編集と保存は引き続き行えます。",
-            None,
-        ),
+        // render resets the count. Reported once per streak: every edit lands here again.
+        CrashResponse::GiveUp => {
+            if std::mem::replace(&mut app.preview.borrow_mut().renderer_crash_reported, true) {
+                log::error("PreviewProcessFailed", "render process exited again; still not re-rendering");
+            } else {
+                app.report_error(
+                    "PreviewProcessFailed",
+                    "この文書を表示するとプレビューの処理が停止するため、自動での再表示をやめました。編集と保存は引き続き行えます。",
+                    None,
+                );
+            }
+        }
         CrashResponse::Ignore => {}
     }
 }
@@ -260,7 +304,7 @@ fn allow_navigation(args: &ICoreWebView2NavigationStartingEventArgs) -> windows:
         return Ok(false);
     }
     let mut p = app.preview.borrow_mut();
-    if !navigation_allowed(p.pending_self, &uri) {
+    if !navigation_allowed(p.pending_now(), &uri) {
         log::error("PreviewNavigationBlocked", format!("blocked navigation to {}", describe_uri(&uri)));
         return Ok(false);
     }
@@ -296,6 +340,15 @@ fn describe_uri(uri: &str) -> String {
     }
 }
 
+/// Why a creation callback brought no object: its error, or — when it reported success
+/// anyway — that, rather than a bare `Ok(())` in the log.
+fn init_failure(result: windows::core::Result<()>, what: &str) -> String {
+    match result {
+        Err(e) => e.to_string(),
+        Ok(()) => format!("reported success but returned no {what}"),
+    }
+}
+
 const INIT_FAILED: &str = "プレビューを初期化できませんでした。WebView2 ランタイムがインストールされているか確認してください。編集は引き続き行えます。";
 
 pub fn start(this: &App, parent: HWND) {
@@ -312,7 +365,7 @@ pub fn start(this: &App, parent: HWND) {
         let env = match (result, env) {
             (Ok(()), Some(env)) => env,
             (r, _) => {
-                app().report_error("CreateCoreWebView2Environment", INIT_FAILED, Some(&format!("{r:?}")));
+                app().report_error("CreateCoreWebView2Environment", INIT_FAILED, Some(&init_failure(r, "environment")));
                 return Ok(());
             }
         };
@@ -333,7 +386,11 @@ pub fn start(this: &App, parent: HWND) {
                         }
                     }
                 }
-                (r, _) => app().report_error("CreateCoreWebView2Controller", INIT_FAILED, Some(&format!("{r:?}"))),
+                (r, _) => app().report_error(
+                    "CreateCoreWebView2Controller",
+                    INIT_FAILED,
+                    Some(&init_failure(r, "controller")),
+                ),
             }
             Ok(())
         }));
@@ -667,7 +724,7 @@ fn on_navigation_completed(args: &ICoreWebView2NavigationCompletedEventArgs) -> 
         // started is worth telling the user about.
         let report = {
             let mut p = app.preview.borrow_mut();
-            if p.pending_self > 0 || id != p.latest_id {
+            if p.pending_now() > 0 || id != p.latest_id {
                 log::error(
                     "PreviewNavigationCompleted",
                     format!("superseded or blocked navigation {id}: {}", status.0),
@@ -694,6 +751,7 @@ fn on_navigation_completed(args: &ICoreWebView2NavigationCompletedEventArgs) -> 
         let mut p = app.preview.borrow_mut();
         p.navigation_failure_reported = false;
         p.renderer_crashes = 0;
+        p.renderer_crash_reported = false;
     }
     sync_view(&app);
     Ok(())
@@ -737,7 +795,11 @@ pub fn navigate(app: &App, html: &str) {
     let Some(webview) = webview else { return };
 
     // Counted immediately before the call; the guard consumes it.
-    app.preview.borrow_mut().pending_self += 1;
+    {
+        let mut p = app.preview.borrow_mut();
+        p.pending_self += 1;
+        p.pending_since = Some(std::time::Instant::now());
+    }
     let result = unsafe { webview.NavigateToString(&HSTRING::from(html)) };
     let mut p = app.preview.borrow_mut();
     match result {
@@ -875,11 +937,8 @@ pub fn close(app: &App) {
         let mut p = app.preview.borrow_mut();
         p.ready = false;
         p.webview = None;
-        // Whatever was in flight goes with the controller; left set, a later start
-        // would find zoom/scroll sync waiting forever on a script that never completes.
-        p.pending_self = 0;
-        p.script_busy = false;
-        p.script_again = false;
+        // Whatever was in flight goes with the controller.
+        p.reset_in_flight();
         p.controller.take()
     };
     if let Some(c) = controller {
@@ -912,6 +971,24 @@ mod tests {
         assert!(navigation_allowed(1, "data:text/html;base64,AA"));
         assert!(!navigation_allowed(0, "data:text/html;base64,AA")); // not ours
         assert!(!navigation_allowed(1, "https://evil/")); // scheme we never produce
+    }
+
+    #[test]
+    fn an_unused_navigation_permission_expires_and_only_ever_denies() {
+        let t0 = std::time::Instant::now();
+        let later = |s| t0 + std::time::Duration::from_secs(s);
+        // Fresh: kept, so our own render in flight still gets through.
+        assert!(!pending_expired(1, Some(t0), later(1)));
+        // Never used, long after the newest navigation we issued: dropped.
+        assert!(pending_expired(2, Some(t0), later(11)));
+        // Nothing raised: nothing to drop (and expiry can never raise it).
+        assert!(!pending_expired(0, Some(t0), later(11)));
+        assert!(!pending_expired(1, None, later(11)));
+        let mut p = Preview { pending_self: 1, pending_since: Some(t0 - PENDING_EXPIRY * 2), ..Default::default() };
+        assert_eq!(p.pending_now(), 0);
+        assert!(!navigation_allowed(p.pending_now(), "data:text/html;base64,AA"));
+        let mut p = Preview { pending_self: 1, pending_since: Some(std::time::Instant::now()), ..Default::default() };
+        assert_eq!(p.pending_now(), 1);
     }
 
     #[test]

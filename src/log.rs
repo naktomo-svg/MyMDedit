@@ -44,8 +44,13 @@ fn append_line_capped(path: &Path, line: &str, max_bytes: u64) -> std::io::Resul
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    if std::fs::metadata(path).is_ok_and(|m| m.len() >= max_bytes) {
-        std::fs::rename(path, path.with_extension("old.log"))?;
+    // Rotating is housekeeping; the line is the point. A rotation that fails (the old log
+    // held open by another program, two instances panicking at once) must not cost the
+    // line, so the log just runs over its cap this time.
+    if std::fs::metadata(path).is_ok_and(|m| m.len() >= max_bytes)
+        && let Err(e) = std::fs::rename(path, path.with_extension("old.log"))
+    {
+        error("crash.log rotate", e);
     }
     let mut f = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
     writeln!(f, "{line}")
@@ -89,6 +94,19 @@ mod tests {
         assert_eq!(std::fs::read_to_string(path.with_extension("old.log")).unwrap(), "one\ntwo\n");
         super::append_line_capped(&path, "four", 4).unwrap();
         assert_eq!(std::fs::read_to_string(path.with_extension("old.log")).unwrap(), "three\n");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_line_is_written_even_when_the_log_cannot_be_rotated() {
+        let dir = std::env::temp_dir().join(format!("mymdedit-log-rotate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("crash.log");
+        super::append_line(&path, "one").unwrap();
+        // A directory where crash.old.log should go: the rename cannot succeed.
+        std::fs::create_dir_all(path.with_extension("old.log")).unwrap();
+        super::append_line_capped(&path, "panic line", 4).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "one\npanic line\n");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

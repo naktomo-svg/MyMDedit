@@ -156,6 +156,13 @@ pub fn reference_is_match_at(
         && (!whole_word || (!word_at(&text[..start], true) && !word_at(&text[end..], false)))
 }
 
+/// The heading level the md_ops target passes to `set_heading`, from the byte whose bit 0
+/// already picks how the text is read. Taken from a byte the operation choice does not
+/// use: derived from the operation byte, only levels 0, 2, 3 and 5 could ever come up.
+pub fn heading_level(byte: u8) -> usize {
+    usize::from(byte >> 1) % 7
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -186,5 +193,16 @@ mod tests {
         assert!(reference_is_match_at(&w("category"), 0, 3, &w("CAT"), false, false));
         assert!(!reference_is_match_at(&w("cat"), 0, 2, &w("cat"), false, false), "length differs");
         assert!(!reference_is_match_at(&w("cat"), 2, 3, &w("cat"), false, false), "past the end");
+    }
+
+    // Every level (and the 0 that removes a heading) must be reachable with either way of
+    // reading the text, or part of set_heading is never fuzzed at all.
+    #[test]
+    fn every_heading_level_is_reachable() {
+        for text_mode in 0..2u8 {
+            let levels: std::collections::BTreeSet<usize> =
+                (0..=255u8).filter(|b| b & 1 == text_mode).map(heading_level).collect();
+            assert_eq!(levels, (0..=6).collect(), "text mode {text_mode}");
+        }
     }
 }

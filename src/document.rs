@@ -221,15 +221,7 @@ pub const MAX_DOCUMENT_BYTES: u64 = 64 * 1024 * 1024;
 /// it is read (or be meaningless, as for a device or a pipe).
 pub fn read_at_most(path: &Path, max: u64) -> io::Result<Vec<u8>> {
     use std::io::Read;
-    let file = fs::File::open(path)?;
-    // Checked on the opened handle, not the path: CreateFile happily opens CON, NUL, COM
-    // ports and (remote) named pipes, and reading one can block until its writer goes away.
-    if unsafe { GetFileType(HANDLE(file.as_raw_handle())) } != FILE_TYPE_DISK {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "通常のファイルではないため開けません（デバイスやパイプは開けません）。",
-        ));
-    }
+    let file = open_disk_file(path)?;
     let mut bytes = Vec::new();
     file.take(max + 1).read_to_end(&mut bytes)?;
     if bytes.len() as u64 > max {
@@ -242,6 +234,21 @@ pub fn read_at_most(path: &Path, max: u64) -> io::Result<Vec<u8>> {
         ));
     }
     Ok(bytes)
+}
+
+/// Opens `path` for reading, refusing anything that is not a file on disk. Every read of a
+/// path the app did not create itself goes through this.
+pub fn open_disk_file(path: &Path) -> io::Result<fs::File> {
+    let file = fs::File::open(path)?;
+    // Checked on the opened handle, not the path: CreateFile happily opens CON, NUL, COM
+    // ports and (remote) named pipes, and reading one can block until its writer goes away.
+    if unsafe { GetFileType(HANDLE(file.as_raw_handle())) } != FILE_TYPE_DISK {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "通常のファイルではないため開けません（デバイスやパイプは開けません）。",
+        ));
+    }
+    Ok(file)
 }
 
 /// What a file looked like on disk at one moment, to notice another program changing it.
@@ -280,6 +287,11 @@ pub fn check_disk(path: &Path, recorded: FileStamp) -> DiskChange {
 }
 
 pub fn read(path: &Path) -> Result<OpenedDocument, ReadError> {
+    // Every document enters the app here, so this is where its path becomes absolute. A
+    // relative one (`MyMDedit.exe docs\a.md`) would otherwise be kept as is: recorded as a
+    // recent folder that means something else from another working directory, and saved
+    // relative to whatever the working directory is at save time.
+    let path = &std::path::absolute(path).map_err(ReadError::Io)?;
     // Taken before reading: a change that lands mid-read then still shows up later as a
     // difference, rather than being folded into the stamp unseen.
     // Without one, the external-change check and the overwrite check before saving are
@@ -420,6 +432,8 @@ fn move_file(from: &Path, to: &Path, overwrite: bool) -> io::Result<()> {
         .map_err(|e| io::Error::from_raw_os_error(e.code().0 & 0xFFFF))
 }
 
+/// Unpredictable enough to keep temp-file names from colliding, nothing more: a value
+/// that must not be guessed comes from `win::secure_random_u64`.
 pub fn random_u64() -> u64 {
     use std::hash::{BuildHasher, Hasher};
     let mut h = std::collections::hash_map::RandomState::new().build_hasher();
@@ -532,6 +546,17 @@ mod tests {
         fs::remove_file(&path).unwrap();
         assert_eq!(check_disk(&path, now), DiskChange::Missing);
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_relative_path_is_read_as_absolute() {
+        // Relative to the working directory, which `cargo test` sets to the crate root.
+        let rel = PathBuf::from("target").join(format!("mymdedit-rel-{:x}.md", random_u64()));
+        fs::write(&rel, "x").unwrap();
+        let doc = read(&rel).unwrap();
+        assert!(doc.path.is_absolute(), "{}", doc.path.display());
+        assert_eq!(doc.path, std::env::current_dir().unwrap().join(&rel));
+        fs::remove_file(&rel).unwrap();
     }
 
     #[test]
