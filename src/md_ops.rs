@@ -6,7 +6,7 @@
 //! Positions are UTF-16 code units, which is what the editor's selection uses, and the
 //! line breaks written are lone `\r`, which is what the editor stores.
 
-use crate::line_endings::is_break;
+use crate::line_endings::{is_break, skip_break};
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct Edit {
@@ -52,16 +52,9 @@ pub fn line_start_of(text: &[u16], n: usize) -> usize {
         if end >= text.len() {
             break;
         }
-        start = skip_line_break(text, end);
+        start = skip_break(text, end);
     }
     start
-}
-
-fn skip_line_break(text: &[u16], at: usize) -> usize {
-    if at >= text.len() {
-        return at;
-    }
-    if text[at] == b'\r' as u16 && text.get(at + 1) == Some(&(b'\n' as u16)) { at + 2 } else { at + 1 }
 }
 
 /// Bold / italic / strikethrough / inline code: wrap the selection (keeping the original
@@ -169,7 +162,7 @@ fn line_block(text: &[u16], start: usize, len: usize, single_line_only: bool) ->
     if len > 0 {
         let first_line_end = find_line_end(text, block_start);
         if first_line_end <= start {
-            block_start = skip_line_break(text, first_line_end);
+            block_start = skip_break(text, first_line_end);
         }
     }
 
@@ -183,7 +176,7 @@ fn line_block(text: &[u16], start: usize, len: usize, single_line_only: bool) ->
             if line_end >= text.len() {
                 break;
             }
-            let next = skip_line_break(text, line_end);
+            let next = skip_break(text, line_end);
             if next >= selection_end {
                 break;
             }
@@ -200,7 +193,7 @@ fn lines_in(text: &[u16], block_start: usize, block_end: usize) -> impl Iterator
     std::iter::from_fn(move || {
         let i = next?;
         let line_end = find_line_end(text, i).min(block_end);
-        next = (line_end < block_end).then(|| skip_line_break(text, line_end));
+        next = (line_end < block_end).then(|| skip_break(text, line_end));
         Some((i, line_end))
     })
 }
@@ -440,7 +433,45 @@ pub fn headings(text: &[u16]) -> Vec<Heading> {
         if line_end >= text.len() {
             break;
         }
-        i = skip_line_break(text, line_end);
+        i = skip_break(text, line_end);
+    }
+    out
+}
+
+/// The most headings the 見出しへ移動 menu lists. A popup menu stops accepting items
+/// somewhere past a thousand (1168 measured on build 26300), and the ones after that
+/// would silently be missing; past this cap the menu says how many it left out instead.
+pub const OUTLINE_MENU_MAX: usize = 1000;
+
+/// One line of the 見出しへ移動 menu: the heading it moves to (an index into
+/// `headings`), or `None` for a line that cannot be chosen.
+#[derive(Debug, PartialEq, Eq)]
+pub struct OutlineEntry {
+    pub heading: Option<usize>,
+    pub label: String,
+}
+
+/// The 見出しへ移動 menu's lines for `headings`, at most `max` of them headings.
+pub fn outline_entries(headings: &[Heading], max: usize) -> Vec<OutlineEntry> {
+    if headings.is_empty() {
+        return vec![OutlineEntry { heading: None, label: "見出しがありません".to_string() }];
+    }
+    let mut out: Vec<OutlineEntry> = headings
+        .iter()
+        .take(max)
+        .enumerate()
+        .map(|(i, h)| {
+            let title = if h.title.is_empty() { "(空の見出し)" } else { &h.title };
+            // `&` would become a mnemonic and a tab would start the shortcut column.
+            let title = title.replace('&', "&&").replace('\t', " ");
+            OutlineEntry { heading: Some(i), label: format!("{}{title}", "\u{3000}".repeat(h.level - 1)) }
+        })
+        .collect();
+    if headings.len() > max {
+        let rest = headings.len() - max;
+        out.push(OutlineEntry {
+            heading: None, label: format!("…ほか {rest} 件(行へ移動を使ってください)")
+        });
     }
     out
 }
@@ -750,5 +781,23 @@ mod tests {
         let t = "- [ ] ";
         let e = on_enter(&w(t), 6, 0).unwrap();
         assert_eq!(apply(t, &e).0, "\r");
+    }
+
+    #[test]
+    fn outline_entries_label_and_cap_the_menu() {
+        let h = |level, title: &str| Heading { level, line_start: 0, title: title.to_string() };
+        let none = outline_entries(&[], OUTLINE_MENU_MAX);
+        assert_eq!(none, vec![OutlineEntry { heading: None, label: "見出しがありません".to_string() }]);
+
+        let e = outline_entries(&[h(1, "A&B"), h(3, ""), h(2, "x\ty")], OUTLINE_MENU_MAX);
+        let labels: Vec<_> = e.iter().map(|e| (e.heading, e.label.as_str())).collect();
+        assert_eq!(labels, [(Some(0), "A&&B"), (Some(1), "\u{3000}\u{3000}(空の見出し)"), (Some(2), "\u{3000}x y")]);
+
+        // Past the cap: the first `max` headings, then a line saying how many are left out.
+        let many: Vec<_> = (0..5).map(|i| h(1, &i.to_string())).collect();
+        let e = outline_entries(&many, 3);
+        assert_eq!(e.iter().map(|e| e.heading).collect::<Vec<_>>(), [Some(0), Some(1), Some(2), None]);
+        assert_eq!(e[3].label, "…ほか 2 件(行へ移動を使ってください)");
+        assert_eq!(outline_entries(&many, 5).len(), 5, "exactly at the cap: nothing left out");
     }
 }

@@ -1,9 +1,10 @@
 //! Persisted settings, and the one owner of their current value.
 //!
-//! [`SettingsStore`] is the only holder of the current [`AppSettings`]; partial updates
-//! are written as `AppSettings { field: v, ..store.current().clone() }` so fields not
-//! named are carried over rather than reset. Neither loading nor saving panics or
-//! propagates: a failed load degrades to defaults, a failed save returns the logged `Err`.
+//! [`SettingsStore`] is the only holder of the current [`AppSettings`]; a change is
+//! written as `store.update(|s| s.field = v)`, which re-reads the file and applies only
+//! that change, so fields not named — including another instance's changes to them — are
+//! carried over rather than reset. Neither loading nor saving panics or propagates: a
+//! failed load degrades to defaults, a failed save returns the logged `Err`.
 
 use std::path::{Path, PathBuf};
 
@@ -267,8 +268,10 @@ impl SettingsStore {
     /// the changed (and sanitized) value even when nothing is written, so the screen and
     /// `current` agree. A file that is now partly or wholly unreadable is backed up first,
     /// as at startup; one that cannot be read at all, or backed up, is left alone. The
-    /// error is the reason nothing was written, already logged.
-    pub fn update(&mut self, change: impl FnOnce(&mut AppSettings)) -> std::io::Result<()> {
+    /// error is the reason nothing was written, already logged. `Ok(Some(notice))` means
+    /// written, but only after backing up a file that had gone bad: what could not be read
+    /// from it is gone from the settings, and `notice` tells the user where the original is.
+    pub fn update(&mut self, change: impl FnOnce(&mut AppSettings)) -> std::io::Result<Option<String>> {
         let result = self.write_with(change);
         if let Err(e) = &result {
             log::error("SettingsStore.update", e);
@@ -276,7 +279,7 @@ impl SettingsStore {
         result
     }
 
-    fn write_with(&mut self, change: impl FnOnce(&mut AppSettings)) -> std::io::Result<()> {
+    fn write_with(&mut self, change: impl FnOnce(&mut AppSettings)) -> std::io::Result<Option<String>> {
         let apply = |mut base: AppSettings| {
             change(&mut base);
             base.sanitized()
@@ -290,12 +293,20 @@ impl SettingsStore {
             return Err(std::io::Error::other("skipped: the settings file could not be read at startup"));
         }
         let _lock = SettingsLock::acquire();
+        let mut notice = None;
         let base = match read_disk(&path) {
             Ok(None) => self.current.clone(),
             Ok(Some(Parsed::Clean(s))) => s,
             // What could be read is newer than our view; the rest is about to be dropped.
-            Ok(Some(Parsed::Partial(s, _))) => match back_up(&path) {
-                Ok(_) => s,
+            Ok(Some(Parsed::Partial(s, fields))) => match back_up(&path) {
+                Ok(backup) => {
+                    notice = Some(format!(
+                        "設定ファイルの一部の項目（{}）を読み込めなかったため、既定値に戻しました。元のファイルは {} に保存してあります。",
+                        fields.join(", "),
+                        backup.display()
+                    ));
+                    s
+                }
                 Err(e) => {
                     self.current = apply(self.current.clone());
                     return Err(e);
@@ -305,9 +316,17 @@ impl SettingsStore {
             // replaced it is safe.
             Ok(Some(Parsed::Unreadable(reason))) => {
                 log::error("SettingsStore.update parse", &reason);
-                if let Err(e) = back_up(&path) {
-                    self.current = apply(self.current.clone());
-                    return Err(e);
+                match back_up(&path) {
+                    Ok(backup) => {
+                        notice = Some(format!(
+                            "設定ファイルを読み込めなくなっていたため、いま画面にある設定で書き直しました。元のファイルは {} に保存してあります。",
+                            backup.display()
+                        ))
+                    }
+                    Err(e) => {
+                        self.current = apply(self.current.clone());
+                        return Err(e);
+                    }
                 }
                 self.current.clone()
             }
@@ -322,7 +341,8 @@ impl SettingsStore {
             std::fs::create_dir_all(dir)?;
         }
         let json = serde_json::to_string_pretty(&self.current).map_err(std::io::Error::other)?;
-        document::save_atomic(&path, &json, &SETTINGS_FILE_FORMAT)
+        document::save_atomic(&path, &json, &SETTINGS_FILE_FORMAT)?;
+        Ok(notice)
     }
 }
 
@@ -403,7 +423,9 @@ fn fill(r: &mut impl std::io::Read, buf: &mut [u8]) -> std::io::Result<usize> {
 
 /// A name already taken (two backups within one second) gets a counter instead of
 /// overwriting the earlier backup. A copy that fails midway is removed: a truncated
-/// backup would claim to be the original.
+/// backup would claim to be the original. The copy is flushed to disk before it counts:
+/// the caller replaces the original next, and after a power cut an unflushed backup
+/// could be empty while the original is already gone.
 fn write_backup(path: &Path, source: &mut std::fs::File) -> std::io::Result<PathBuf> {
     let secs = unix_seconds();
     for n in 1..100 {
@@ -412,7 +434,7 @@ fn write_backup(path: &Path, source: &mut std::fs::File) -> std::io::Result<Path
         let backup = path.with_file_name(name);
         match std::fs::File::create_new(&backup) {
             Ok(mut f) => {
-                if let Err(e) = std::io::copy(source, &mut f) {
+                if let Err(e) = std::io::copy(source, &mut f).and_then(|_| f.sync_all()) {
                     drop(f);
                     if let Err(e) = std::fs::remove_file(&backup) {
                         log::error("settings backup cleanup", &e);
@@ -657,11 +679,16 @@ mod tests {
         let mut store = SettingsStore::open(Some(path.clone()));
         // Hand-edited (or written by another version) after startup.
         std::fs::write(&path, r#"{"theme": "dark", "editor_font_size": 20}"#).unwrap();
-        assert!(store.update(|s| s.recent_folders = vec!["C:\\x".into()]).is_ok());
+        let notice = store.update(|s| s.recent_folders = vec!["C:\\x".into()]).unwrap();
         let reloaded = SettingsStore::open(Some(path.clone()));
         assert_eq!(reloaded.current().editor_font_size, 20.0);
         assert_eq!(reloaded.current().recent_folders, vec!["C:\\x"]);
         assert_eq!(backups(&dir).len(), 1);
+        // The user hears that a field went back to its default, and where the original is.
+        let notice = notice.expect("a backup is reported");
+        assert!(notice.contains("theme") && notice.contains(&backups(&dir)[0]), "{notice}");
+        // Written clean now: the next change has nothing to report.
+        assert_eq!(store.update(|s| s.theme = Theme::Dark).unwrap(), None);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -671,9 +698,10 @@ mod tests {
         let path = dir.join("settings.json");
         let mut store = SettingsStore::open(Some(path.clone()));
         std::fs::write(&path, "{\"theme\": \"Dark\",}").unwrap();
-        assert!(store.update(|s| s.theme = Theme::Light).is_ok());
+        let notice = store.update(|s| s.theme = Theme::Light).unwrap();
         let names = backups(&dir);
         assert_eq!(names.len(), 1);
+        assert!(notice.is_some_and(|n| n.contains(&names[0])));
         assert_eq!(std::fs::read_to_string(dir.join(&names[0])).unwrap(), "{\"theme\": \"Dark\",}");
         assert_eq!(SettingsStore::open(Some(path)).current().theme, Theme::Light);
         std::fs::remove_dir_all(&dir).unwrap();

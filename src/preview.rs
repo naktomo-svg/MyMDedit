@@ -69,7 +69,9 @@ pub struct Preview {
     /// Navigations this app started that have not reached NavigationStarting yet — the
     /// only signal the guard trusts. A count, not a bool: a render per keystroke can put
     /// two of our own navigations in flight, and a bool would cancel the second.
-    pending_self: i32,
+    /// Unsigned and only lowered through `take_back_permission`/the guard: below zero, it
+    /// would cancel our own next render (a blank preview) and never expire.
+    pending_self: u32,
     /// When `pending_self` was last raised. A count still raised long after that was
     /// never consumed (see `PENDING_EXPIRY`) and is dropped rather than left to admit
     /// whatever navigates next.
@@ -105,13 +107,19 @@ impl Preview {
 
     /// `pending_self`, after dropping a count that has outlived `PENDING_EXPIRY`. Only
     /// ever lowers it, so it can only make the guard deny more.
-    fn pending_now(&mut self) -> i32 {
+    fn pending_now(&mut self) -> u32 {
         if pending_expired(self.pending_self, self.pending_since, std::time::Instant::now()) {
             log::error("PreviewGuard", format!("dropped {} navigation permission(s) never used", self.pending_self));
             self.pending_self = 0;
             self.pending_since = None;
         }
         self.pending_self
+    }
+
+    /// A navigation we counted will never reach the guard (NavigateToString failed).
+    /// Never below zero: a reset in between may already have dropped the count.
+    fn take_back_permission(&mut self) {
+        self.pending_self = self.pending_self.saturating_sub(1);
     }
 }
 
@@ -125,7 +133,7 @@ const PENDING_EXPIRY: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Whether a raised count is stale. Expiry never resets the counter early when a new
 /// navigation was issued: `since` is the time of the newest one.
-fn pending_expired(pending: i32, since: Option<std::time::Instant>, now: std::time::Instant) -> bool {
+fn pending_expired(pending: u32, since: Option<std::time::Instant>, now: std::time::Instant) -> bool {
     pending > 0 && since.is_some_and(|t| now.saturating_duration_since(t) > PENDING_EXPIRY)
 }
 
@@ -160,13 +168,22 @@ fn crash_response(process: CrashedProcess, renderer_crashes: u32, browser_restar
 
 /// Recovers from a dead process, on the main window's own message (never inside the
 /// WebView2 callback that reported it).
-pub fn on_process_failed(app: &App, browser: bool) {
+pub fn on_process_failed(app: &App, browser: bool, generation: u32) {
     let process = if browser { CrashedProcess::Browser } else { CrashedProcess::Renderer };
     let response = {
         let mut p = app.preview.borrow_mut();
         if p.stopped {
             // Recovery would bring the preview back; it stays stopped.
             log::error("PreviewProcessFailed", "preview is stopped; not recovering");
+            return;
+        }
+        // About a controller already replaced (a duplicated notice, or one that arrived
+        // after a restart): counting it would use up a retry and start yet another browser.
+        if generation != p.generation {
+            log::error(
+                "PreviewProcessFailed",
+                format!("ignored a notice from start {generation} (now {})", p.generation),
+            );
             return;
         }
         // Whatever was in flight died with the process.
@@ -231,7 +248,7 @@ fn uses_blocked_scheme(uri: &str) -> bool {
 /// started through its APIs — NavigateToString included — as user initiated, so gating
 /// on it would cancel every render as soon as a runtime behaves as documented: the
 /// blank-preview failure MyWinApp already had once.
-fn navigation_allowed(pending_self: i32, uri: &str) -> bool {
+fn navigation_allowed(pending_self: u32, uri: &str) -> bool {
     pending_self > 0 && !uses_blocked_scheme(uri)
 }
 
@@ -314,10 +331,16 @@ fn allow_navigation(args: &ICoreWebView2NavigationStartingEventArgs) -> windows:
 }
 
 /// A guard's own action (cancel, handled) failed: what it was meant to stop may get
-/// through, so the preview stops.
-fn enforce(context: &str, result: windows::core::Result<()>) {
-    if let Err(e) = result {
-        stop_preview(context, &e);
+/// through, so the preview stops. Whether it took effect, so the caller logs "blocked"
+/// only for what was (the failure is logged by `stop_preview`).
+#[must_use]
+fn enforce(context: &str, result: windows::core::Result<()>) -> bool {
+    match result {
+        Ok(()) => true,
+        Err(e) => {
+            stop_preview(context, &e);
+            false
+        }
     }
 }
 
@@ -377,12 +400,16 @@ pub fn start(this: &App, parent: HWND) {
                         // Never stored, so nothing else would close it: its child window
                         // would linger over the preview's area.
                         log::if_err("ConfigureWebView2 Close", unsafe { controller.Close() });
-                        if e.code() == windows::Win32::Foundation::E_ABORT {
-                            // Superseded or stopped on purpose: nothing failed that the user
-                            // has not already been told about.
-                            log::error("ConfigureWebView2", &e);
-                        } else {
-                            app().report_error("ConfigureWebView2", INIT_FAILED, Some(&e));
+                        match e {
+                            // On purpose: nothing failed that the user has not already
+                            // been told about.
+                            ConfigureError::Superseded => {
+                                log::error("ConfigureWebView2", "superseded by a newer start")
+                            }
+                            ConfigureError::Stopped => log::error("ConfigureWebView2", "the preview was stopped"),
+                            ConfigureError::WebView(e) => {
+                                app().report_error("ConfigureWebView2", INIT_FAILED, Some(&e))
+                            }
                         }
                     }
                 }
@@ -433,11 +460,44 @@ fn create_controller(
 }
 
 #[allow(unused_unsafe)]
+/// Why `configure` did not install a controller. Its own decisions to stop are not
+/// errors from WebView2: a dedicated type, rather than an HRESULT such as E_ABORT that
+/// a WebView2 call could also return, keeps a real failure from passing for one.
+#[derive(Debug)]
+enum ConfigureError {
+    /// A newer `start` is under way.
+    Superseded,
+    /// The preview was stopped (`stop_preview`) and stays stopped.
+    Stopped,
+    WebView(windows::core::Error),
+}
+
+impl From<windows::core::Error> for ConfigureError {
+    fn from(e: windows::core::Error) -> Self {
+        ConfigureError::WebView(e)
+    }
+}
+
 fn configure(
     controller: &ICoreWebView2Controller,
     env: &ICoreWebView2Environment,
     generation: u32,
-) -> windows::core::Result<()> {
+) -> Result<(), ConfigureError> {
+    let webview = install_protections(controller, env, generation)?;
+    show(controller, webview, generation)
+}
+
+/// Every setting and handler the preview's security rests on, before anything is shown.
+// Each handler keeps its own `unsafe` around the calls it makes: a closure runs long after
+// the enclosing block, so that is where its FFI calls are, whatever rustc decides about
+// nesting (it started flagging them when `configure` got its own error type, though
+// nothing about them changed).
+#[allow(unused_unsafe)]
+fn install_protections(
+    controller: &ICoreWebView2Controller,
+    env: &ICoreWebView2Environment,
+    generation: u32,
+) -> windows::core::Result<ICoreWebView2> {
     let webview = unsafe { controller.CoreWebView2()? };
     unsafe {
         let settings = webview.Settings()?;
@@ -528,9 +588,10 @@ fn configure(
         webview.add_FrameNavigationStarting(
             &NavigationStartingEventHandler::create(Box::new(|_, args| {
                 let Some(args) = args else { return Ok(()) };
-                enforce("PreviewFrameNavigationGuard", unsafe { args.SetCancel(true) });
-                let uri = event_uri(|uri| unsafe { args.Uri(uri) });
-                log::error("PreviewFrameNavigationBlocked", format!("blocked frame navigation to {uri}"));
+                if enforce("PreviewFrameNavigationGuard", unsafe { args.SetCancel(true) }) {
+                    let uri = event_uri(|uri| unsafe { args.Uri(uri) });
+                    log::error("PreviewFrameNavigationBlocked", format!("blocked frame navigation to {uri}"));
+                }
                 Ok(())
             })),
             &mut token,
@@ -543,8 +604,10 @@ fn configure(
         webview.cast::<ICoreWebView2_4>()?.add_DownloadStarting(
             &DownloadStartingEventHandler::create(Box::new(|_, args| {
                 let Some(args) = args else { return Ok(()) };
-                enforce("PreviewDownloadGuard", unsafe { args.SetCancel(true).and_then(|()| args.SetHandled(true)) });
-                log::error("PreviewDownloadBlocked", "blocked a download");
+                if enforce("PreviewDownloadGuard", unsafe { args.SetCancel(true).and_then(|()| args.SetHandled(true)) })
+                {
+                    log::error("PreviewDownloadBlocked", "blocked a download");
+                }
                 Ok(())
             })),
             &mut token,
@@ -557,8 +620,9 @@ fn configure(
         webview.cast::<ICoreWebView2_5>()?.add_ClientCertificateRequested(
             &ClientCertificateRequestedEventHandler::create(Box::new(|_, args| {
                 let Some(args) = args else { return Ok(()) };
-                enforce("PreviewClientCertificateGuard", unsafe { args.SetCancel(true) });
-                log::error("PreviewClientCertificateBlocked", "refused a client certificate request");
+                if enforce("PreviewClientCertificateGuard", unsafe { args.SetCancel(true) }) {
+                    log::error("PreviewClientCertificateBlocked", "refused a client certificate request");
+                }
                 Ok(())
             })),
             &mut token,
@@ -570,9 +634,10 @@ fn configure(
         webview.add_NewWindowRequested(
             &NewWindowRequestedEventHandler::create(Box::new(|_, args| {
                 let Some(args) = args else { return Ok(()) };
-                enforce("PreviewNewWindowGuard", unsafe { args.SetHandled(true) });
-                let uri = event_uri(|uri| unsafe { args.Uri(uri) });
-                log::error("PreviewNewWindowBlocked", format!("blocked new window for {uri}"));
+                if enforce("PreviewNewWindowGuard", unsafe { args.SetHandled(true) }) {
+                    let uri = event_uri(|uri| unsafe { args.Uri(uri) });
+                    log::error("PreviewNewWindowBlocked", format!("blocked new window for {uri}"));
+                }
                 Ok(())
             })),
             &mut token,
@@ -584,8 +649,9 @@ fn configure(
             wv18.add_LaunchingExternalUriScheme(
                 &LaunchingExternalUriSchemeEventHandler::create(Box::new(|_, args| {
                     let Some(args) = args else { return Ok(()) };
-                    enforce("PreviewExternalSchemeGuard", unsafe { args.SetCancel(true) });
-                    log::error("PreviewExternalSchemeBlocked", "blocked an external URI scheme launch");
+                    if enforce("PreviewExternalSchemeGuard", unsafe { args.SetCancel(true) }) {
+                        log::error("PreviewExternalSchemeBlocked", "blocked an external URI scheme launch");
+                    }
                     Ok(())
                 })),
                 &mut token,
@@ -605,9 +671,10 @@ fn configure(
             wv10.add_BasicAuthenticationRequested(
                 &BasicAuthenticationRequestedEventHandler::create(Box::new(|_, args| {
                     let Some(args) = args else { return Ok(()) };
-                    enforce("PreviewBasicAuthenticationGuard", unsafe { args.SetCancel(true) });
-                    let uri = event_uri(|uri| unsafe { args.Uri(uri) });
-                    log::error("PreviewBasicAuthenticationBlocked", format!("refused authentication for {uri}"));
+                    if enforce("PreviewBasicAuthenticationGuard", unsafe { args.SetCancel(true) }) {
+                        let uri = event_uri(|uri| unsafe { args.Uri(uri) });
+                        log::error("PreviewBasicAuthenticationBlocked", format!("refused authentication for {uri}"));
+                    }
                     Ok(())
                 })),
                 &mut token,
@@ -620,11 +687,11 @@ fn configure(
         }
 
         webview.add_ProcessFailed(
-            &ProcessFailedEventHandler::create(Box::new(|_, args| {
+            &ProcessFailedEventHandler::create(Box::new(move |_, args| {
                 let Some(args) = args else { return Ok(()) };
                 // WebView2 drops a handler's Err without a word; a failure here would stop
                 // crash recovery silently, so it is logged instead.
-                log::if_err("PreviewProcessFailed", on_process_failed_event(&args));
+                log::if_err("PreviewProcessFailed", on_process_failed_event(&args, generation));
                 Ok(())
             })),
             &mut token,
@@ -650,7 +717,12 @@ fn configure(
             &mut token,
         )?;
     }
+    Ok(webview)
+}
 
+/// Shows a fully protected controller and makes it the preview's — unless the preview
+/// was stopped or a newer start superseded this one meanwhile.
+fn show(controller: &ICoreWebView2Controller, webview: ICoreWebView2, generation: u32) -> Result<(), ConfigureError> {
     let app = app();
     let (bounds, background, stopped, current) = {
         let p = app.preview.borrow();
@@ -659,11 +731,11 @@ fn configure(
     if stopped {
         // Only a restart gets here after a stop, and on_process_failed refuses those;
         // should another path appear, it still never brings the preview back.
-        return Err(windows::core::Error::new(windows::Win32::Foundation::E_ABORT, "the preview was stopped"));
+        return Err(ConfigureError::Stopped);
     }
     if generation != current {
         // A newer start is under way; this controller is closed by the caller.
-        return Err(windows::core::Error::new(windows::Win32::Foundation::E_ABORT, "superseded by a newer start"));
+        return Err(ConfigureError::Superseded);
     }
     unsafe {
         log::if_err("ConfigureWebView2 SetBounds", controller.SetBounds(bounds));
@@ -688,7 +760,9 @@ fn configure(
     Ok(())
 }
 
-fn on_process_failed_event(args: &ICoreWebView2ProcessFailedEventArgs) -> windows::core::Result<()> {
+/// `generation` is the `start` whose controller raised the event: carried with the notice,
+/// so one about a controller already replaced cannot count as a crash of the current one.
+fn on_process_failed_event(args: &ICoreWebView2ProcessFailedEventArgs, generation: u32) -> windows::core::Result<()> {
     let mut kind = COREWEBVIEW2_PROCESS_FAILED_KIND::default();
     unsafe { args.ProcessFailedKind(&mut kind)? };
     let process = if kind == COREWEBVIEW2_PROCESS_FAILED_KIND_RENDER_PROCESS_EXITED {
@@ -705,7 +779,7 @@ fn on_process_failed_event(args: &ICoreWebView2ProcessFailedEventArgs) -> window
     // Handled after this callback returns: recovery closes the controller that is
     // raising this very event, which must not happen from inside it.
     let wparam = WPARAM(if process == CrashedProcess::Browser { 1 } else { 0 });
-    unsafe { PostMessageW(Some(app().main_hwnd()), WM_APP_PREVIEW_FAILED, wparam, LPARAM(0)) }
+    unsafe { PostMessageW(Some(app().main_hwnd()), WM_APP_PREVIEW_FAILED, wparam, LPARAM(generation as isize)) }
 }
 
 fn on_navigation_completed(args: &ICoreWebView2NavigationCompletedEventArgs) -> windows::core::Result<()> {
@@ -797,7 +871,7 @@ pub fn navigate(app: &App, html: &str) {
     // Counted immediately before the call; the guard consumes it.
     {
         let mut p = app.preview.borrow_mut();
-        p.pending_self += 1;
+        p.pending_self = p.pending_self.saturating_add(1);
         p.pending_since = Some(std::time::Instant::now());
     }
     let result = unsafe { webview.NavigateToString(&HSTRING::from(html)) };
@@ -807,7 +881,7 @@ pub fn navigate(app: &App, html: &str) {
         Err(e) => {
             // No navigation will start, so nothing would consume the count — leaving it
             // raised would hand the permission to whatever navigates next.
-            p.pending_self -= 1;
+            p.take_back_permission();
             // NavigateToString rejects strings over ~2MB. Report once per failing
             // streak: this runs per keystroke.
             if p.update_failure_reported {
@@ -989,6 +1063,19 @@ mod tests {
         assert!(!navigation_allowed(p.pending_now(), "data:text/html;base64,AA"));
         let mut p = Preview { pending_self: 1, pending_since: Some(std::time::Instant::now()), ..Default::default() };
         assert_eq!(p.pending_now(), 1);
+    }
+
+    #[test]
+    fn taking_back_a_permission_never_goes_below_zero() {
+        // A reset (a crash) between counting a navigation and its NavigateToString failing:
+        // below zero, the next render of ours would be cancelled.
+        let mut p = Preview { pending_self: 1, ..Default::default() };
+        p.reset_in_flight();
+        p.take_back_permission();
+        assert_eq!(p.pending_self, 0);
+        p.pending_self = 2;
+        p.take_back_permission();
+        assert_eq!(p.pending_self, 1);
     }
 
     #[test]

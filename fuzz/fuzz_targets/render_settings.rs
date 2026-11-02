@@ -1,7 +1,7 @@
 #![no_main]
 use libfuzzer_sys::fuzz_target;
 use mymdedit_fuzz::settings::{AppSettings, Parsed, parse_settings};
-use mymdedit_fuzz::{css_blocks, is_contained_font_family, is_strict_hex_color, render};
+use mymdedit_fuzz::{css_blocks, is_contained_font_family, is_strict_hex_color, only_the_color_rule_differs, render};
 
 /// What any settings may do to the page's CSS: stay inside `<style>`, never end it, and
 /// add exactly the one rule an accepted background color is, verbatim, and nothing else.
@@ -18,11 +18,14 @@ fn check(settings: &AppSettings, input: &str) {
     let color = settings.preview_background_color.as_deref();
     let accepted = color.is_some_and(is_strict_hex_color);
     let without = AppSettings { preview_background_color: None, ..settings.clone() };
-    let base = css_blocks(&render::to_html_document("x", &without, 0).html);
+    let base_html = render::to_html_document("x", &without, 0).html;
+    let base = css_blocks(&base_html);
     assert_eq!(css_blocks(&html), base + usize::from(accepted), "CSS rule count: {input:?}");
-    if let Some(c) = color.filter(|_| accepted) {
-        assert!(html.contains(&format!("background: {c} !important;")), "accepted color not as written: {input:?}");
-    }
+    let accepted = color.filter(|_| accepted);
+    assert!(
+        only_the_color_rule_differs(&html, &base_html, accepted),
+        "the color changed more than its rule: {input:?}"
+    );
 }
 
 // Hostile settings.json values, two ways: the preview's font and background exactly as

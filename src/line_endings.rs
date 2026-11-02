@@ -69,18 +69,20 @@ pub fn is_break(unit: u16) -> bool {
 pub fn count_lines(text: &[u16]) -> usize {
     let mut lines = 1;
     let mut i = 0;
-    while i < text.len() {
-        if text[i] == b'\r' as u16 {
-            lines += 1;
-            if text.get(i + 1) == Some(&(b'\n' as u16)) {
-                i += 1;
-            }
-        } else if text[i] == b'\n' as u16 {
-            lines += 1;
-        }
-        i += 1;
+    while let Some(at) = text[i..].iter().position(|&c| is_break(c)) {
+        lines += 1;
+        i = skip_break(text, i + at);
     }
     lines
+}
+
+/// Where the line after the break at `at` starts: past `\r\n` as one break, past any
+/// other break unit as one. `at` itself when it is the end of `text`.
+pub fn skip_break(text: &[u16], at: usize) -> usize {
+    if at >= text.len() {
+        return at;
+    }
+    if text[at] == b'\r' as u16 && text.get(at + 1) == Some(&(b'\n' as u16)) { at + 2 } else { at + 1 }
 }
 
 #[cfg(test)]
@@ -89,6 +91,18 @@ mod tests {
 
     fn w(s: &str) -> Vec<u16> {
         s.encode_utf16().collect()
+    }
+
+    #[test]
+    fn a_break_is_skipped_the_way_lines_are_counted() {
+        let t = w("a\r\nb\rc\nd\n\re");
+        assert_eq!(count_lines(&t), 6);
+        assert_eq!(skip_break(&t, 1), 3, "CRLF is one break");
+        assert_eq!(skip_break(&t, 4), 5);
+        assert_eq!(skip_break(&t, 6), 7);
+        assert_eq!(skip_break(&t, 8), 9, "LF then CR is two breaks");
+        assert_eq!(skip_break(&t, 9), 10);
+        assert_eq!(skip_break(&t, t.len()), t.len());
     }
 
     #[test]

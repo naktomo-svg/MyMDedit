@@ -103,6 +103,8 @@ const ID_RECENT_BASE: u16 = 200;
 /// One command id per recent-folder slot, derived from the cap so the two can't drift.
 const ID_RECENT_END: u16 = ID_RECENT_BASE + settings::limits::RECENT_FOLDER_COUNT as u16;
 const ID_EDITOR: usize = 300;
+// The recent-folder ids grow with RECENT_FOLDER_COUNT; they must stay clear of the editor's.
+const _: () = assert!((ID_RECENT_END as usize) <= ID_EDITOR, "recent-folder ids run into ID_EDITOR");
 
 const TIMER_SCROLL_SYNC: usize = 1;
 
@@ -357,12 +359,72 @@ pub struct State {
     declined_overwrite: Option<FileStamp>,
 }
 
+impl State {
+    /// The document is now `path` (`None`: untitled) in `format`, as on disk at `stamp`.
+    /// Everything that described the previous document goes with it.
+    fn set_document(&mut self, path: Option<PathBuf>, format: DocumentFormat, stamp: Option<FileStamp>) {
+        self.file_name = path
+            .as_deref()
+            .and_then(Path::file_name)
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| UNTITLED.into());
+        self.file_path = path;
+        self.format = format;
+        self.set_disk_stamp(stamp);
+    }
+
+    /// What is on disk is now known to be ours (read or just written): what was said
+    /// about the earlier version — gone, or declined to overwrite — no longer applies.
+    fn set_disk_stamp(&mut self, stamp: Option<FileStamp>) {
+        self.disk_stamp = stamp;
+        self.missing_reported = false;
+        self.declined_overwrite = None;
+    }
+}
+
 /// Find/replace dialog data. Leaked once: the modeless common dialog keeps pointers
 /// into it for as long as it is open.
 struct FindData {
     fr: FINDREPLACEW,
     find: [u16; 512],
     replace: [u16; 512],
+}
+
+/// `App::busy` held from `App::try_busy` until dropped, so no early return or `?` can
+/// leave it set — a stuck `busy` refuses every later modal command and every close.
+struct Busy<'a>(&'a Cell<bool>);
+
+impl<'a> Busy<'a> {
+    /// `None` when `flag` is already held.
+    fn try_take(flag: &'a Cell<bool>) -> Option<Self> {
+        // Not `then_some`: that would build (and drop) a guard even when already held,
+        // and dropping it would clear the other holder's flag.
+        if flag.replace(true) { None } else { Some(Busy(flag)) }
+    }
+}
+
+impl Drop for Busy<'_> {
+    fn drop(&mut self) {
+        self.0.set(false);
+    }
+}
+
+/// `App::suppress_dirty` set until dropped, then put back as it was (so it nests).
+struct SuppressDirty<'a> {
+    flag: &'a Cell<bool>,
+    before: bool,
+}
+
+impl<'a> SuppressDirty<'a> {
+    fn set(flag: &'a Cell<bool>) -> Self {
+        SuppressDirty { flag, before: flag.replace(true) }
+    }
+}
+
+impl Drop for SuppressDirty<'_> {
+    fn drop(&mut self) {
+        self.flag.set(self.before);
+    }
 }
 
 pub struct App {
@@ -713,6 +775,8 @@ impl App {
                 fonts: Fonts::default(),
             });
             self.create_fonts();
+            // `reapply_display` minus the render: there is no preview yet, and the first
+            // render follows the document's load.
             self.apply_theme();
             self.apply_editor_font();
             self.layout();
@@ -756,11 +820,11 @@ impl App {
                 log::if_err("AppendMenuW", AppendMenuW(menu, MF_STRING, id as usize, pcwstr(&t)));
             };
             let sep = |menu: HMENU| {
-                let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
+                log::if_err("AppendMenuW separator", AppendMenuW(menu, MF_SEPARATOR, 0, None));
             };
             let popup = |title: &str, sub: HMENU| {
                 let t = menu_label(title);
-                let _ = AppendMenuW(bar, MF_POPUP, sub.0 as usize, pcwstr(&t));
+                log::if_err("AppendMenuW popup", AppendMenuW(bar, MF_POPUP, sub.0 as usize, pcwstr(&t)));
             };
 
             let file = CreatePopupMenu()?;
@@ -829,6 +893,15 @@ impl App {
 
     // ---- theme, fonts, layout -----------------------------------------------------
 
+    /// After any change to how things look (theme, fonts, colors): every part follows.
+    /// `apply_theme` alone would change the palette but leave the editor's text color
+    /// (set by `apply_editor_font`) and the preview (`rerender`) on the old one.
+    fn reapply_display(&self) {
+        self.apply_theme();
+        self.apply_editor_font();
+        self.rerender();
+    }
+
     fn apply_theme(&self) {
         let ui = self.ui.get();
         let dark = is_dark(self.state.borrow().settings.current().theme);
@@ -862,13 +935,18 @@ impl App {
                 st.palette.editor_text,
             )
         };
-        self.suppress_dirty.set(true);
+        let _suppress = self.suppress_dirty();
         self.editor().set_font(&face, size, color);
-        self.suppress_dirty.set(false);
     }
 
     fn layout(&self) {
         let ui = self.ui.get();
+        // A minimized client area is 0x0: laid out, the panes would get negative sizes
+        // (handed to WebView2 as such). Restoring sends WM_SIZE, which lays out then.
+        // Checked here, not in WM_SIZE, because an error banner lays out too.
+        if unsafe { IsIconic(ui.hwnd) }.as_bool() {
+            return;
+        }
         let s = |v: i32| scale(v, ui.dpi);
         let mut client = RECT::default();
         unsafe {
@@ -1200,14 +1278,24 @@ impl App {
         (st.zoom, st.scroll_ratio)
     }
 
+    /// Takes the modal re-entrancy guard; `None` when a modal of ours is already up.
+    fn try_busy(&self) -> Option<Busy<'_>> {
+        Busy::try_take(&self.busy)
+    }
+
+    /// Changes the editor makes until the guard drops are the app's own, not the user's.
+    fn suppress_dirty(&self) -> SuppressDirty<'_> {
+        SuppressDirty::set(&self.suppress_dirty)
+    }
+
     /// Replaces the document's text (after the caller has confirmed discarding).
     fn load_content(&self, content: &str) {
-        self.suppress_dirty.set(true);
+        let suppress = self.suppress_dirty();
         self.editor().set_text(content);
         // EN_CHANGE from set_text has already asked for this; it coalesces, so asking again
         // only covers the case where no notification came.
         self.request_render();
-        self.suppress_dirty.set(false);
+        drop(suppress);
         self.state.borrow_mut().dirty = false;
         self.update_title();
     }
@@ -1267,21 +1355,27 @@ impl App {
     /// The write re-reads the file, so it can bring in another instance's changes (a
     /// theme switched over there). Whatever now differs on screen is re-applied here, so
     /// the window, the editor and the preview never show a mix of old and new settings.
+    ///
+    /// `change` runs while `state` is mutably borrowed (inside `SettingsStore::update`):
+    /// it may only assign to the settings it is given, never call into `App`, Win32 or
+    /// WebView2 — anything that can re-enter a window procedure panics there.
     fn persist_settings(&self, change: impl FnOnce(&mut AppSettings)) {
         let before = self.current_settings();
         let result = self.state.borrow_mut().settings.update(change);
-        if let Err(e) = result {
-            self.report_error(
+        match result {
+            Ok(None) => {}
+            // Saved, but over a file that had gone bad since startup: as at startup, the
+            // user hears what was lost and where the original went.
+            Ok(Some(notice)) => self.report_error("SettingsStore.save backup", &notice, None),
+            Err(e) => self.report_error(
                 "SettingsStore.save",
                 "設定を保存できませんでした。この変更は次回の起動時には元に戻ります。",
                 Some(&e),
-            );
+            ),
         }
         let after = self.current_settings();
         if settings::display_differs(&before, &after) {
-            self.apply_theme();
-            self.apply_editor_font();
-            self.rerender();
+            self.reapply_display();
         }
         // The recent-folder items are looked up by position in the current list, so the
         // menu is rebuilt whenever that list changes — including when the write brought in
@@ -1469,14 +1563,15 @@ impl App {
     fn deliver_deferred(&self) {
         // Once closing is decided the window may already be destroyed (終了 runs
         // DestroyWindow inside its command): a prompt owned by it must not appear.
-        if self.close_confirmed.get() || self.busy.replace(true) {
+        if self.close_confirmed.get() {
             return;
         }
+        let Some(busy) = self.try_busy() else { return };
         let pending = self.pending_probe.borrow_mut().take();
         if let Some((folder, result)) = pending {
             self.on_folder_probed(&folder, result);
         }
-        self.busy.set(false);
+        drop(busy);
         if self.disk_recheck.take() {
             self.check_external_change();
         }
@@ -1571,13 +1666,7 @@ impl App {
         if !self.confirm_discard(false) {
             return;
         }
-        {
-            let mut st = self.state.borrow_mut();
-            st.file_path = None;
-            st.format = DocumentFormat::default();
-            st.file_name = UNTITLED.into();
-            st.disk_stamp = None;
-        }
+        self.state.borrow_mut().set_document(None, DocumentFormat::default(), None);
         self.load_content(SAMPLE_CONTENT);
     }
 
@@ -1612,16 +1701,7 @@ impl App {
     /// Every read funnels through here, so the path, the on-disk format and the text
     /// can never describe different files.
     fn apply_opened(&self, doc: OpenedDocument) {
-        {
-            let mut st = self.state.borrow_mut();
-            st.file_name =
-                doc.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| UNTITLED.into());
-            st.file_path = Some(doc.path.clone());
-            st.format = doc.format;
-            st.disk_stamp = doc.stamp;
-            st.missing_reported = false;
-            st.declined_overwrite = None;
-        }
+        self.state.borrow_mut().set_document(Some(doc.path.clone()), doc.format, doc.stamp);
         self.load_content(&doc.content);
         self.record_recent_folder(&doc.path);
     }
@@ -1712,9 +1792,7 @@ impl App {
         let stamp = document::stamp(path).inspect_err(|e| log::error("record_saved stamp", e)).ok();
         let mut st = self.state.borrow_mut();
         st.dirty = false;
-        st.disk_stamp = stamp;
-        st.missing_reported = false;
-        st.declined_overwrite = None;
+        st.set_disk_stamp(stamp);
     }
 
     /// The window was activated: has another program changed or removed the open file?
@@ -1761,10 +1839,10 @@ impl App {
         self.disk_check_running.set(false);
         // Our own modal is up: the result may be stale by the time it closes, so check
         // again then (`deliver_deferred`).
-        if self.busy.replace(true) {
+        let Some(busy) = self.try_busy() else {
             self.disk_recheck.set(true);
             return;
-        }
+        };
         let (path, recorded, name, dirty, missing_reported, declined) = {
             let st = self.state.borrow();
             (
@@ -1811,7 +1889,7 @@ impl App {
                 }
             }
         }
-        self.busy.set(false);
+        drop(busy);
         self.deliver_deferred();
     }
 
@@ -1839,13 +1917,11 @@ impl App {
         }
         // Another modal dialog is already up: don't stack a prompt on it. The block
         // reason stays, so the user sees why and can choose there.
-        if self.busy.replace(true) {
-            return false;
-        }
+        let Some(busy) = self.try_busy() else { return false };
         // An undisplayable prompt blocks rather than discards: the shutdown screen still
         // lets the user end the session deliberately.
         let ok = self.confirm_discard(false);
-        self.busy.set(false);
+        drop(busy);
         if ok {
             self.release_shutdown_block();
         } else {
@@ -1864,13 +1940,11 @@ impl App {
     fn on_close_request(&self) {
         // A modal dialog of ours is up (its own loop delivered this, e.g. from the taskbar).
         // Closing under it would stack a second prompt; the user can close once it's gone.
-        if self.busy.replace(true) {
-            return;
-        }
+        let Some(busy) = self.try_busy() else { return };
         // The prompt below is itself a modal: while it is up, a second WM_CLOSE or a
         // folder-probe result must wait like they do for any other modal.
         let close = self.close_confirmed.get() || self.confirm_discard(true);
-        self.busy.set(false);
+        drop(busy);
         if close {
             self.close_confirmed.set(true);
             unsafe {
@@ -1926,19 +2000,14 @@ impl App {
         let editor = self.editor();
         let text = editor.text();
         let headings = md_ops::headings(&text);
+        let entries = md_ops::outline_entries(&headings, md_ops::OUTLINE_MENU_MAX);
+        // A heading's menu id is its index + 1: TrackPopupMenu returns 0 for "none chosen".
+        let items = entries.iter().map(|e| match e.heading {
+            Some(i) => (MF_STRING, i + 1, e.label.as_str()),
+            None => (MF_STRING | MF_GRAYED, 0, e.label.as_str()),
+        });
+        let Some(menu) = self.popup_menu(items) else { return };
         let cmd = unsafe {
-            let Ok(menu) = CreatePopupMenu() else { return };
-            if headings.is_empty() {
-                let t = wide("見出しがありません");
-                let _ = AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, pcwstr(&t));
-            }
-            for (i, h) in headings.iter().enumerate() {
-                let title = if h.title.is_empty() { "(空の見出し)" } else { &h.title };
-                // `&` would become a mnemonic and a tab would start the shortcut column.
-                let title = title.replace('&', "&&").replace('\t', " ");
-                let t = wide(&format!("{}{title}", "\u{3000}".repeat(h.level - 1)));
-                let _ = AppendMenuW(menu, MF_STRING, i + 1, pcwstr(&t));
-            }
             let mut origin = POINT::default();
             let _ = windows::Win32::Graphics::Gdi::ClientToScreen(editor.hwnd(), &mut origin);
             let cmd = TrackPopupMenu(
@@ -1977,6 +2046,23 @@ impl App {
         editor.focus();
     }
 
+    /// A popup menu of (flags, id, label). A menu that cannot be created is reported —
+    /// the click would otherwise do nothing — and an item that cannot be added is recorded.
+    fn popup_menu<'a>(&self, items: impl IntoIterator<Item = (MENU_ITEM_FLAGS, usize, &'a str)>) -> Option<HMENU> {
+        let menu = match unsafe { CreatePopupMenu() } {
+            Ok(m) => m,
+            Err(e) => {
+                self.report_error("CreatePopupMenu", "メニューを表示できませんでした。", Some(&e));
+                return None;
+            }
+        };
+        for (flags, id, label) in items {
+            let t = wide(label);
+            log::if_err("AppendMenuW", unsafe { AppendMenuW(menu, flags, id, pcwstr(&t)) });
+        }
+        Some(menu)
+    }
+
     fn show_dropdown(&self, button_id: u16) {
         let ui = self.ui.get();
         let Some(index) = TOOL_BUTTONS.iter().position(|b| b.id == button_id) else {
@@ -1996,12 +2082,10 @@ impl App {
                 (ID_TASK, "タスクリスト\t- [ ] タスク"),
             ]
         };
+        let Some(menu) = self.popup_menu(items.iter().map(|(id, text)| (MF_STRING, *id as usize, *text))) else {
+            return;
+        };
         unsafe {
-            let Ok(menu) = CreatePopupMenu() else { return };
-            for (id, text) in items {
-                let t = wide(text);
-                let _ = AppendMenuW(menu, MF_STRING, *id as usize, pcwstr(&t));
-            }
             let mut rc = RECT::default();
             let _ = GetWindowRect(button, &mut rc);
             let cmd = TrackPopupMenu(
@@ -2135,10 +2219,7 @@ impl App {
     fn find_message_box(&self, text: &str) {
         let owner = self.ui.get().find_dialog;
         let owner = if owner.is_invalid() { self.hwnd() } else { owner };
-        let t = wide(text);
-        unsafe {
-            MessageBoxW(Some(owner), pcwstr(&t), w!("MyMDedit"), MB_OK | MB_ICONINFORMATION);
-        }
+        win::message_box(Some(owner), text, MB_OK | MB_ICONINFORMATION);
     }
 
     fn select_and_reveal(&self, start: usize, len: usize) {
@@ -2167,14 +2248,14 @@ impl App {
         // does not disable it. Acting now would change the text under that modal (行へ移動
         // has already counted the lines; the reload prompt has already read `dirty`).
         // Its message boxes are modals too, so it takes `busy` like any modal command.
-        if self.busy.replace(true) {
+        let Some(busy) = self.try_busy() else {
             unsafe {
                 let _ = MessageBeep(MB_OK);
             }
             return;
-        }
+        };
         self.find_or_replace(flags, query, replacement);
-        self.busy.set(false);
+        drop(busy);
         self.deliver_deferred();
     }
 
@@ -2247,9 +2328,13 @@ impl App {
                 | ID_HELP_GITHUB
                 | ID_HELP_RELEASES
         ) || (ID_RECENT_BASE..ID_RECENT_END).contains(&id);
-        if modal && self.busy.replace(true) {
-            return;
-        }
+        let busy = match modal {
+            true => match self.try_busy() {
+                Some(b) => Some(b),
+                None => return,
+            },
+            false => None,
+        };
         let editor = self.editor();
         match id {
             ID_NEW => self.new_document(),
@@ -2304,8 +2389,8 @@ impl App {
         if matches!(id, ID_UNDO | ID_REDO | ID_CUT | ID_COPY | ID_PASTE | ID_SELECT_ALL | ID_ERROR_CLOSE) {
             editor.focus();
         }
-        if modal {
-            self.busy.set(false);
+        if let Some(busy) = busy {
+            drop(busy);
             self.deliver_deferred();
         }
     }
@@ -2429,7 +2514,8 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
             LRESULT(0)
         }
         WM_APP_PREVIEW_FAILED => {
-            preview::on_process_failed(&app, wparam.0 == 1);
+            // lparam: the preview generation the notice is about (`preview::on_process_failed_event`).
+            preview::on_process_failed(&app, wparam.0 == 1, lparam.0 as u32);
             LRESULT(0)
         }
         WM_APP_PREVIEW_CLOSE => {
@@ -2455,9 +2541,7 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
                 String::new()
             };
             if area == "ImmersiveColorSet" && app.current_settings().theme == Theme::System {
-                app.apply_theme();
-                app.apply_editor_font();
-                app.rerender();
+                app.reapply_display();
             }
             unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
         }
@@ -2630,7 +2714,8 @@ unsafe extern "system" fn button_proc(
 
 #[cfg(test)]
 mod tests {
-    use super::push_banner_message;
+    use super::{Busy, SuppressDirty, push_banner_message};
+    use std::cell::Cell;
 
     #[test]
     fn banner_keeps_recent_messages() {
@@ -2667,5 +2752,35 @@ mod tests {
         assert_eq!(super::wheel_steps(0, 240), (2, 0));
         assert_eq!(super::wheel_steps(40, -60), (0, -60)); // direction change drops the remainder
         assert_eq!(super::wheel_steps(-90, -40), (-1, -10));
+    }
+
+    #[test]
+    fn busy_is_held_once_and_released_however_the_holder_leaves() {
+        let flag = Cell::new(false);
+        let held = Busy::try_take(&flag).expect("free");
+        assert!(Busy::try_take(&flag).is_none(), "a second modal is refused");
+        assert!(flag.get(), "refusing must not release the first holder's guard");
+        drop(held);
+        assert!(!flag.get());
+        // An early return (here, `?`) releases it too.
+        let early = || -> Option<()> {
+            let _busy = Busy::try_take(&flag)?;
+            None?
+        };
+        assert_eq!(early(), None);
+        assert!(!flag.get());
+    }
+
+    #[test]
+    fn suppress_dirty_nests() {
+        let flag = Cell::new(false);
+        let outer = SuppressDirty::set(&flag);
+        {
+            let _inner = SuppressDirty::set(&flag);
+            assert!(flag.get());
+        }
+        assert!(flag.get(), "the inner guard leaves the outer one in force");
+        drop(outer);
+        assert!(!flag.get());
     }
 }

@@ -173,10 +173,7 @@ pub fn show(
         let ex = WS_EX_DLGMODALFRAME | WS_EX_CONTROLPARENT;
         crate::log::if_err("AdjustWindowRectExForDpi", AdjustWindowRectExForDpi(&mut outer, style, false, ex, dpi));
         let (w, h) = (outer.right - outer.left, outer.bottom - outer.top);
-        let mut owner_rect = RECT::default();
-        crate::log::if_err("GetWindowRect", GetWindowRect(owner, &mut owner_rect));
-        let x = owner_rect.left + ((owner_rect.right - owner_rect.left) - w) / 2;
-        let y = owner_rect.top + ((owner_rect.bottom - owner_rect.top) - h) / 2;
+        let (x, y) = crate::win::centered_over(owner, w, h);
 
         CreateWindowExW(
             ex,
@@ -530,11 +527,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         Ok(c) => c,
                         Err(e) => {
                             log::error("choose_color", &e);
-                            let text = wide("色の選択画面を開けませんでした。");
-                            let caption = wide("MyMDedit");
-                            unsafe {
-                                MessageBoxW(Some(hwnd), pcwstr(&text), pcwstr(&caption), MB_OK | MB_ICONERROR);
-                            }
+                            crate::win::message_box(
+                                Some(hwnd),
+                                "色の選択画面を開けませんでした。",
+                                MB_OK | MB_ICONERROR,
+                            );
                             None
                         }
                     };

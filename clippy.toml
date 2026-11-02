@@ -1,3 +1,4 @@
 disallowed-methods = [
     { path = "std::thread::spawn", reason = "panics when no thread can be created, and inside a window procedure that aborts the process; use app::spawn_worker" },
+    { path = "std::thread::Scope::spawn", reason = "panics when no thread can be created, like std::thread::spawn; use std::thread::Builder::spawn_scoped" },
 ]

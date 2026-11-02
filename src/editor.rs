@@ -63,8 +63,12 @@ impl Editor {
                 None,
             )?;
             let editor = Editor(hwnd);
-            // Must be set while the control is empty.
-            send(hwnd, EM_SETTEXTMODE, (TM_PLAINTEXT.0 | TM_MULTILEVELUNDO.0) as usize, 0);
+            // Must be set while the control is empty. Everything here assumes plain text
+            // (lone `\r` breaks, no formatting runs), so a refusal is recorded.
+            if send(hwnd, EM_SETTEXTMODE, (TM_PLAINTEXT.0 | TM_MULTILEVELUNDO.0) as usize, 0) != 0 {
+                crate::log::error("EM_SETTEXTMODE", "RichEdit refused plain-text mode");
+                debug_assert!(false, "EM_SETTEXTMODE failed on an empty control");
+            }
             // The default limit is 32K characters.
             send(hwnd, EM_EXLIMITTEXT, 0, 0x7FFF_FFFE);
             send(hwnd, EM_SETEVENTMASK, 0, ENM_CHANGE as isize);
