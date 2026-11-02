@@ -178,9 +178,13 @@ mod tests {
     }
 
     /// The app's window messages are numbered by one enum in win.rs, which keeps them
-    /// distinct; an offset from WM_APP written anywhere else could collide unnoticed.
+    /// distinct; a message numbered off the app or user range anywhere else could collide
+    /// unnoticed, however it is written (`base + n`, `base | n`, a const built from it).
+    /// So outside win.rs, the bases may not appear in code at all — only the `WM_APP_*`
+    /// names win.rs exports.
     #[test]
     fn app_messages_are_only_numbered_in_win_rs() {
+        let bases = [["WM_", "APP"].concat(), ["WM_", "USER"].concat()];
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         for entry in std::fs::read_dir(&dir).unwrap() {
             let path = entry.unwrap().path();
@@ -188,12 +192,30 @@ mod tests {
                 continue;
             }
             let code = std::fs::read_to_string(&path).unwrap();
-            assert!(
-                !code.contains(&["WM_APP", " +"].concat()) && !code.contains(&["WM_APP", "+"].concat()),
-                "{} numbers its own WM_APP message: add it to win::AppMessage instead",
-                path.display()
-            );
+            for (n, line) in code.lines().enumerate() {
+                if line.trim_start().starts_with("//") {
+                    continue;
+                }
+                for base in &bases {
+                    assert!(
+                        !contains_word(line, base),
+                        "{}:{}: numbers its own window message: add it to win::AppMessage instead",
+                        path.display(),
+                        n + 1
+                    );
+                }
+            }
         }
+        let app = &bases[0];
+        assert!(contains_word(&format!("x = {app} + 1;"), app) && contains_word(&format!("({app})"), app));
+        assert!(!contains_word(&format!("{app}_RENDER"), app) && !contains_word(&format!("MY_{app}"), app));
+    }
+
+    /// `word` in `line` as a whole identifier.
+    fn contains_word(line: &str, word: &str) -> bool {
+        let ident = |c: Option<char>| c.is_some_and(|c| c.is_alphanumeric() || c == '_');
+        line.match_indices(word)
+            .any(|(i, _)| !ident(line[..i].chars().last()) && !ident(line[i + word.len()..].chars().next()))
     }
 
     /// Calls whose failure leaves the user looking at nothing — a menu missing items, a

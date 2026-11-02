@@ -141,10 +141,14 @@ pub fn reference_is_match_at(
             })
             .collect()
     };
+    // The character next to the match, read as a lossy decode of the whole side would read
+    // it (a lone surrogate is U+FFFD, not a letter), from at most the two units beside the
+    // match: decoding the whole side per match made dense whole-word runs quadratic.
     let word_at = |units: &[u16], last: bool| {
-        let s = String::from_utf16_lossy(units);
-        let c = if last { s.chars().next_back() } else { s.chars().next() };
-        c.is_some_and(char::is_alphanumeric)
+        let near = if last { &units[units.len().saturating_sub(2)..] } else { &units[..units.len().min(2)] };
+        let mut chars = char::decode_utf16(near.iter().copied());
+        let c = if last { chars.last() } else { chars.next() };
+        c.is_some_and(|c| c.is_ok_and(char::is_alphanumeric))
     };
     let end = start + len;
     !query.is_empty()
@@ -154,6 +158,20 @@ pub fn reference_is_match_at(
         && String::from_utf16(&text[start..end]).is_ok()
         && upper(&text[start..end]) == upper(query)
         && (!whole_word || (!word_at(&text[..start], true) && !word_at(&text[end..], false)))
+}
+
+/// Whether the preview background color changed the page by exactly its one rule, as
+/// written (`accepted`), or not at all (`None`): the page rendered with it is the page
+/// rendered without it, plus that rule. Counting rules alone would miss a value that
+/// slipped a declaration (`#fff; display: none`) into an existing one.
+pub fn only_the_color_rule_differs(html: &str, without_color: &str, accepted: Option<&str>) -> bool {
+    match accepted {
+        Some(c) => {
+            let rule = format!("\nbody {{ background: {c} !important; }}");
+            html.contains(&rule) && html.replacen(&rule, "", 1) == without_color
+        }
+        None => html == without_color,
+    }
 }
 
 /// The heading level the md_ops target passes to `set_heading`, from the byte whose bit 0
@@ -193,6 +211,60 @@ mod tests {
         assert!(reference_is_match_at(&w("category"), 0, 3, &w("CAT"), false, false));
         assert!(!reference_is_match_at(&w("cat"), 0, 2, &w("cat"), false, false), "length differs");
         assert!(!reference_is_match_at(&w("cat"), 2, 3, &w("cat"), false, false), "past the end");
+
+        // The color check: exactly one rule, as written, or nothing.
+        let page = |c: Option<&str>| {
+            let s = settings::AppSettings { preview_background_color: c.map(str::to_string), ..Default::default() };
+            render::to_html_document("x", &s, 0).html
+        };
+        let base = page(None);
+        assert!(only_the_color_rule_differs(&page(Some("#123456")), &base, Some("#123456")));
+        assert!(only_the_color_rule_differs(&page(Some("red")), &base, None), "rejected: page unchanged");
+        // A declaration smuggled into an existing rule: the rule count is the same, the
+        // page is not.
+        let smuggled = base.replacen("font-size:", "display: none; font-size:", 1);
+        assert_ne!(smuggled, base);
+        assert_eq!(css_blocks(&smuggled), css_blocks(&base), "invisible to counting rules");
+        assert!(!only_the_color_rule_differs(&smuggled, &base, None));
+        let rule_and_more = format!("{}x", page(Some("#123456")));
+        assert!(!only_the_color_rule_differs(&rule_and_more, &base, Some("#123456")));
+    }
+
+    /// `reference_is_match_at`'s word test reads at most two units beside the match; it
+    /// must say what decoding the whole side lossily said.
+    #[test]
+    fn the_neighbouring_character_is_read_like_a_lossy_decode() {
+        let units: [&[u16]; 8] = [
+            &[],
+            &[0x61],
+            &[0xD801, 0xDC28], // 𐐨, a letter outside the BMP
+            &[0x20, 0xD801, 0xDC28],
+            &[0xDC28],                 // lone low surrogate
+            &[0xD801],                 // lone high surrogate
+            &[0xD801, 0xD801, 0xDC28], // a lone high one, then a pair
+            &[0xD801, 0xDC28, 0xDC28], // a pair, then a lone low one
+        ];
+        let lossy = |u: &[u16], last: bool| {
+            let s = String::from_utf16_lossy(u);
+            let c = if last { s.chars().next_back() } else { s.chars().next() };
+            c.is_some_and(char::is_alphanumeric)
+        };
+        let w = |s: &str| s.encode_utf16().collect::<Vec<u16>>();
+        for side in units {
+            // The match "x" with `side` before it, then after it.
+            let before = [side, &w("x")].concat();
+            let after = [&w("x")[..], side].concat();
+            assert_eq!(
+                reference_is_match_at(&before, side.len(), 1, &w("x"), true, true),
+                !lossy(side, true),
+                "before: {side:x?}"
+            );
+            assert_eq!(
+                reference_is_match_at(&after, 0, 1, &w("x"), true, true),
+                !lossy(side, false),
+                "after: {side:x?}"
+            );
+        }
     }
 
     // Every level (and the 0 that removes a heading) must be reachable with either way of

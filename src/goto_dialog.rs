@@ -111,10 +111,7 @@ pub fn show(
         let mut outer = RECT { left: 0, top: 0, right: s(client_w), bottom: s(client_h) };
         crate::log::if_err("AdjustWindowRectExForDpi", AdjustWindowRectExForDpi(&mut outer, style, false, ex, dpi));
         let (w, h) = (outer.right - outer.left, outer.bottom - outer.top);
-        let mut owner_rect = RECT::default();
-        crate::log::if_err("GetWindowRect", GetWindowRect(owner, &mut owner_rect));
-        let x = owner_rect.left + ((owner_rect.right - owner_rect.left) - w) / 2;
-        let y = owner_rect.top + ((owner_rect.bottom - owner_rect.top) - h) / 2;
+        let (x, y) = crate::win::centered_over(owner, w, h);
 
         CreateWindowExW(
             ex,

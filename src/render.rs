@@ -117,7 +117,7 @@ fn add_copy_buttons<'a>(arena: &'a Arena<'a>, root: &'a AstNode<'a>, token: u64)
 /// Windows program pastes correctly, and without the line break that ends the block.
 fn clipboard_text(literal: &str) -> String {
     let body = literal.strip_suffix("\r\n").or_else(|| literal.strip_suffix(['\n', '\r'])).unwrap_or(literal);
-    body.replace("\r\n", "\n").replace('\r', "\n").replace('\n', "\r\n")
+    crate::line_endings::normalize(body, crate::line_endings::LineEnding::Crlf)
 }
 
 /// Elements whose only effect in the preview is to fetch or connect. Security: the

@@ -2,8 +2,9 @@
 
 use windows::Win32::Foundation::{COLORREF, GlobalFree, HANDLE, HWND, LPARAM, RECT, SetLastError, WIN32_ERROR, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    CLEARTYPE_QUALITY, CreateFontIndirectW, CreateFontW, DEFAULT_CHARSET, DeleteObject, FW_BOLD, FW_NORMAL, HFONT,
-    HGDIOBJ, LOGFONTW, OUT_DEFAULT_PRECIS,
+    CLEARTYPE_QUALITY, CreateFontIndirectW, CreateFontW, DEFAULT_CHARSET, DeleteObject, FW_BOLD, FW_NORMAL,
+    GetMonitorInfoW, HFONT, HGDIOBJ, LOGFONTW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow,
+    OUT_DEFAULT_PRECIS,
 };
 use windows::Win32::System::DataExchange::{CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData};
 use windows::Win32::System::Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock};
@@ -62,7 +63,10 @@ pub fn wide(s: &str) -> Vec<u16> {
 
 /// A pointer to `buf` for a Win32 call: `buf` must end in a NUL (as `wide` makes it) and
 /// outlive the call. The pointer carries no lifetime, so keep the buffer in a named
-/// variable — `pcwstr(&wide(s))` would dangle by the time the call reads it.
+/// variable: `let p = pcwstr(&wide(s));` dangles as soon as that statement ends (the
+/// temporary buffer is dropped there). Inside the call itself — `Api(pcwstr(&wide(s)))` —
+/// the temporary lives to the end of the statement and is safe, but a named buffer keeps
+/// the code from turning into the first form in a later edit.
 pub fn pcwstr(buf: &[u16]) -> PCWSTR {
     debug_assert_eq!(buf.last(), Some(&0), "pcwstr needs a NUL-terminated buffer");
     PCWSTR(buf.as_ptr())
@@ -123,6 +127,36 @@ pub fn window_text(hwnd: HWND) -> String {
         }
         String::from_utf16_lossy(&buf[..(n.max(0) as usize).min(buf.len())])
     }
+}
+
+/// Where a `w`×`h` dialog goes: centered over `owner`, then moved fully onto the work
+/// area of the owner's monitor. An owner dragged mostly off screen would otherwise put
+/// the dialog's title bar out of reach.
+pub fn centered_over(owner: HWND, w: i32, h: i32) -> (i32, i32) {
+    let mut owner_rect = RECT::default();
+    unsafe {
+        crate::log::if_err(
+            "GetWindowRect",
+            windows::Win32::UI::WindowsAndMessaging::GetWindowRect(owner, &mut owner_rect),
+        );
+    }
+    let x = owner_rect.left + (width(&owner_rect) - w) / 2;
+    let y = owner_rect.top + (height(&owner_rect) - h) / 2;
+    let mut info = MONITORINFO { cbSize: size_of::<MONITORINFO>() as u32, ..Default::default() };
+    let monitor = unsafe { MonitorFromWindow(owner, MONITOR_DEFAULTTONEAREST) };
+    if !unsafe { GetMonitorInfoW(monitor, &mut info) }.as_bool() {
+        crate::log::error("GetMonitorInfoW", "no work area; the dialog stays centered on its owner");
+        return (x, y);
+    }
+    fit_in(x, y, w, h, &info.rcWork)
+}
+
+/// `(x, y)` moved as little as possible to put the `w`×`h` box inside `area`; a box
+/// larger than `area` keeps its top-left corner (and so its title bar) inside.
+fn fit_in(x: i32, y: i32, w: i32, h: i32, area: &RECT) -> (i32, i32) {
+    let x = x.min(area.right - w).max(area.left);
+    let y = y.min(area.bottom - h).max(area.top);
+    (x, y)
 }
 
 pub fn width(r: &RECT) -> i32 {
@@ -300,6 +334,20 @@ pub fn hiword(v: usize) -> u16 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_dialog_is_moved_onto_the_work_area() {
+        use super::fit_in;
+        use windows::Win32::Foundation::RECT;
+        let work = RECT { left: 0, top: 0, right: 1920, bottom: 1040 };
+        assert_eq!(fit_in(100, 100, 400, 300, &work), (100, 100), "already inside: unchanged");
+        assert_eq!(fit_in(1800, -50, 400, 300, &work), (1520, 0));
+        assert_eq!(fit_in(-300, 900, 400, 300, &work), (0, 740));
+        // Taller than the screen: the top (title bar) stays reachable.
+        assert_eq!(fit_in(10, 500, 400, 2000, &work), (10, 0));
+        let second = RECT { left: 1920, top: 0, right: 3840, bottom: 1040 };
+        assert_eq!(fit_in(1700, 100, 400, 300, &second), (1920, 100), "a monitor to the right");
+    }
+
     #[test]
     #[should_panic(expected = "NUL-terminated")]
     fn pcwstr_refuses_a_buffer_without_its_nul() {

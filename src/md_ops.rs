@@ -6,7 +6,7 @@
 //! Positions are UTF-16 code units, which is what the editor's selection uses, and the
 //! line breaks written are lone `\r`, which is what the editor stores.
 
-use crate::line_endings::is_break;
+use crate::line_endings::{is_break, skip_break};
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct Edit {
@@ -52,16 +52,9 @@ pub fn line_start_of(text: &[u16], n: usize) -> usize {
         if end >= text.len() {
             break;
         }
-        start = skip_line_break(text, end);
+        start = skip_break(text, end);
     }
     start
-}
-
-fn skip_line_break(text: &[u16], at: usize) -> usize {
-    if at >= text.len() {
-        return at;
-    }
-    if text[at] == b'\r' as u16 && text.get(at + 1) == Some(&(b'\n' as u16)) { at + 2 } else { at + 1 }
 }
 
 /// Bold / italic / strikethrough / inline code: wrap the selection (keeping the original
@@ -169,7 +162,7 @@ fn line_block(text: &[u16], start: usize, len: usize, single_line_only: bool) ->
     if len > 0 {
         let first_line_end = find_line_end(text, block_start);
         if first_line_end <= start {
-            block_start = skip_line_break(text, first_line_end);
+            block_start = skip_break(text, first_line_end);
         }
     }
 
@@ -183,7 +176,7 @@ fn line_block(text: &[u16], start: usize, len: usize, single_line_only: bool) ->
             if line_end >= text.len() {
                 break;
             }
-            let next = skip_line_break(text, line_end);
+            let next = skip_break(text, line_end);
             if next >= selection_end {
                 break;
             }
@@ -200,7 +193,7 @@ fn lines_in(text: &[u16], block_start: usize, block_end: usize) -> impl Iterator
     std::iter::from_fn(move || {
         let i = next?;
         let line_end = find_line_end(text, i).min(block_end);
-        next = (line_end < block_end).then(|| skip_line_break(text, line_end));
+        next = (line_end < block_end).then(|| skip_break(text, line_end));
         Some((i, line_end))
     })
 }
@@ -440,7 +433,7 @@ pub fn headings(text: &[u16]) -> Vec<Heading> {
         if line_end >= text.len() {
             break;
         }
-        i = skip_line_break(text, line_end);
+        i = skip_break(text, line_end);
     }
     out
 }
