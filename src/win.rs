@@ -37,7 +37,8 @@ const fn app_message(m: AppMessage) -> u32 {
 pub const WM_APP_FOLDER_PROBED: u32 = app_message(AppMessage::FolderProbed);
 /// Re-render the preview (coalesces edits).
 pub const WM_APP_RENDER: u32 = app_message(AppMessage::Render);
-/// A WebView2 process died (wparam: 0 renderer, 1 browser).
+/// A WebView2 process died (wparam: 0 renderer, 1 browser; lparam: the preview
+/// generation whose controller reported it).
 pub const WM_APP_PREVIEW_FAILED: u32 = app_message(AppMessage::PreviewFailed);
 /// The window was activated: look for changes to the open file.
 pub const WM_APP_CHECK_DISK: u32 = app_message(AppMessage::CheckDisk);
