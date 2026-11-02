@@ -15,8 +15,8 @@ use windows::Win32::UI::Controls::{
 };
 use windows::Win32::UI::Shell::Common::COMDLG_FILTERSPEC;
 use windows::Win32::UI::Shell::{
-    FOLDERID_Documents, FileOpenDialog, FileSaveDialog, IFileDialog, IFileOpenDialog, IFileSaveDialog, IShellItem,
-    KF_FLAG_DEFAULT, SHCreateItemFromParsingName, SHGetKnownFolderItem, SIGDN_FILESYSPATH,
+    FOLDERID_Documents, FOS_FORCEFILESYSTEM, FileOpenDialog, FileSaveDialog, IFileDialog, IFileOpenDialog,
+    IFileSaveDialog, IShellItem, KF_FLAG_DEFAULT, SHCreateItemFromParsingName, SHGetKnownFolderItem, SIGDN_FILESYSPATH,
 };
 use windows::Win32::UI::Shell::{SEE_MASK_FLAG_NO_UI, SEE_MASK_NOASYNC, SHELLEXECUTEINFOW, ShellExecuteExW};
 use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
@@ -29,9 +29,16 @@ fn is_cancelled(e: &windows::core::Error) -> bool {
     e.code() == HRESULT::from_win32(ERROR_CANCELLED.0)
 }
 
-/// Documents as the folder a file dialog starts in when it has nothing better. A
-/// convenience: without it the dialog picks its own, so a failure is only logged.
-fn set_default_folder(dlg: &IFileDialog) {
+/// What both file dialogs share. Only file-system items: a phone over MTP, a library or
+/// a zip folder has no path, and choosing one would otherwise end in an error after the
+/// user has picked it. Then Documents as the folder to start in when the dialog has
+/// nothing better. Both are conveniences the dialog works without, so failures are only
+/// logged.
+fn prepare(dlg: &IFileDialog) {
+    let options = unsafe { dlg.GetOptions().and_then(|o| dlg.SetOptions(o | FOS_FORCEFILESYSTEM)) };
+    if let Err(e) = options {
+        log::error("SetOptions(FOS_FORCEFILESYSTEM)", &e);
+    }
     let set = unsafe {
         SHGetKnownFolderItem::<IShellItem>(&FOLDERID_Documents, KF_FLAG_DEFAULT, None)
             .and_then(|docs| dlg.SetDefaultFolder(&docs))
@@ -61,7 +68,7 @@ pub fn open_file(owner: HWND, folder: Option<&Path>) -> windows::core::Result<Op
             pszSpec: w!("*.md;*.markdown;*.txt"),
         }];
         dlg.SetFileTypes(&filters)?;
-        set_default_folder(&dlg);
+        prepare(&dlg);
         // Only where the dialog starts: a folder gone since it was checked (or a dropped
         // network drive) is no reason to fail before the user has picked anything.
         if let Some(folder) = folder {
@@ -88,7 +95,7 @@ pub fn save_file(owner: HWND, suggested_name: &str) -> windows::core::Result<Opt
         dlg.SetDefaultExtension(w!("md"))?;
         let stem = Path::new(suggested_name).file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
         dlg.SetFileName(&HSTRING::from(stem))?;
-        set_default_folder(&dlg);
+        prepare(&dlg);
         match dlg.Show(Some(owner)) {
             Err(e) if is_cancelled(&e) => return Ok(None),
             r => r?,
