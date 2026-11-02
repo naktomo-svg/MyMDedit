@@ -756,11 +756,11 @@ impl App {
                 log::if_err("AppendMenuW", AppendMenuW(menu, MF_STRING, id as usize, pcwstr(&t)));
             };
             let sep = |menu: HMENU| {
-                let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
+                log::if_err("AppendMenuW separator", AppendMenuW(menu, MF_SEPARATOR, 0, None));
             };
             let popup = |title: &str, sub: HMENU| {
                 let t = menu_label(title);
-                let _ = AppendMenuW(bar, MF_POPUP, sub.0 as usize, pcwstr(&t));
+                log::if_err("AppendMenuW popup", AppendMenuW(bar, MF_POPUP, sub.0 as usize, pcwstr(&t)));
             };
 
             let file = CreatePopupMenu()?;
@@ -1926,19 +1926,14 @@ impl App {
         let editor = self.editor();
         let text = editor.text();
         let headings = md_ops::headings(&text);
+        let entries = md_ops::outline_entries(&headings, md_ops::OUTLINE_MENU_MAX);
+        // A heading's menu id is its index + 1: TrackPopupMenu returns 0 for "none chosen".
+        let items = entries.iter().map(|e| match e.heading {
+            Some(i) => (MF_STRING, i + 1, e.label.as_str()),
+            None => (MF_STRING | MF_GRAYED, 0, e.label.as_str()),
+        });
+        let Some(menu) = self.popup_menu(items) else { return };
         let cmd = unsafe {
-            let Ok(menu) = CreatePopupMenu() else { return };
-            if headings.is_empty() {
-                let t = wide("見出しがありません");
-                let _ = AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, pcwstr(&t));
-            }
-            for (i, h) in headings.iter().enumerate() {
-                let title = if h.title.is_empty() { "(空の見出し)" } else { &h.title };
-                // `&` would become a mnemonic and a tab would start the shortcut column.
-                let title = title.replace('&', "&&").replace('\t', " ");
-                let t = wide(&format!("{}{title}", "\u{3000}".repeat(h.level - 1)));
-                let _ = AppendMenuW(menu, MF_STRING, i + 1, pcwstr(&t));
-            }
             let mut origin = POINT::default();
             let _ = windows::Win32::Graphics::Gdi::ClientToScreen(editor.hwnd(), &mut origin);
             let cmd = TrackPopupMenu(
@@ -1977,6 +1972,23 @@ impl App {
         editor.focus();
     }
 
+    /// A popup menu of (flags, id, label). A menu that cannot be created is reported —
+    /// the click would otherwise do nothing — and an item that cannot be added is recorded.
+    fn popup_menu<'a>(&self, items: impl IntoIterator<Item = (MENU_ITEM_FLAGS, usize, &'a str)>) -> Option<HMENU> {
+        let menu = match unsafe { CreatePopupMenu() } {
+            Ok(m) => m,
+            Err(e) => {
+                self.report_error("CreatePopupMenu", "メニューを表示できませんでした。", Some(&e));
+                return None;
+            }
+        };
+        for (flags, id, label) in items {
+            let t = wide(label);
+            log::if_err("AppendMenuW", unsafe { AppendMenuW(menu, flags, id, pcwstr(&t)) });
+        }
+        Some(menu)
+    }
+
     fn show_dropdown(&self, button_id: u16) {
         let ui = self.ui.get();
         let Some(index) = TOOL_BUTTONS.iter().position(|b| b.id == button_id) else {
@@ -1996,12 +2008,10 @@ impl App {
                 (ID_TASK, "タスクリスト\t- [ ] タスク"),
             ]
         };
+        let Some(menu) = self.popup_menu(items.iter().map(|(id, text)| (MF_STRING, *id as usize, *text))) else {
+            return;
+        };
         unsafe {
-            let Ok(menu) = CreatePopupMenu() else { return };
-            for (id, text) in items {
-                let t = wide(text);
-                let _ = AppendMenuW(menu, MF_STRING, *id as usize, pcwstr(&t));
-            }
             let mut rc = RECT::default();
             let _ = GetWindowRect(button, &mut rc);
             let cmd = TrackPopupMenu(
@@ -2135,10 +2145,7 @@ impl App {
     fn find_message_box(&self, text: &str) {
         let owner = self.ui.get().find_dialog;
         let owner = if owner.is_invalid() { self.hwnd() } else { owner };
-        let t = wide(text);
-        unsafe {
-            MessageBoxW(Some(owner), pcwstr(&t), w!("MyMDedit"), MB_OK | MB_ICONINFORMATION);
-        }
+        win::message_box(Some(owner), text, MB_OK | MB_ICONINFORMATION);
     }
 
     fn select_and_reveal(&self, start: usize, len: usize) {

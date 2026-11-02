@@ -445,6 +445,44 @@ pub fn headings(text: &[u16]) -> Vec<Heading> {
     out
 }
 
+/// The most headings the 見出しへ移動 menu lists. A popup menu stops accepting items
+/// somewhere past a thousand (1168 measured on build 26300), and the ones after that
+/// would silently be missing; past this cap the menu says how many it left out instead.
+pub const OUTLINE_MENU_MAX: usize = 1000;
+
+/// One line of the 見出しへ移動 menu: the heading it moves to (an index into
+/// `headings`), or `None` for a line that cannot be chosen.
+#[derive(Debug, PartialEq, Eq)]
+pub struct OutlineEntry {
+    pub heading: Option<usize>,
+    pub label: String,
+}
+
+/// The 見出しへ移動 menu's lines for `headings`, at most `max` of them headings.
+pub fn outline_entries(headings: &[Heading], max: usize) -> Vec<OutlineEntry> {
+    if headings.is_empty() {
+        return vec![OutlineEntry { heading: None, label: "見出しがありません".to_string() }];
+    }
+    let mut out: Vec<OutlineEntry> = headings
+        .iter()
+        .take(max)
+        .enumerate()
+        .map(|(i, h)| {
+            let title = if h.title.is_empty() { "(空の見出し)" } else { &h.title };
+            // `&` would become a mnemonic and a tab would start the shortcut column.
+            let title = title.replace('&', "&&").replace('\t', " ");
+            OutlineEntry { heading: Some(i), label: format!("{}{title}", "\u{3000}".repeat(h.level - 1)) }
+        })
+        .collect();
+    if headings.len() > max {
+        let rest = headings.len() - max;
+        out.push(OutlineEntry {
+            heading: None, label: format!("…ほか {rest} 件(行へ移動を使ってください)")
+        });
+    }
+    out
+}
+
 /// Enter at the end of a list line (`- `, `N. `, `- [ ] `, at any indentation) continues
 /// the list at the same indentation (numbers count up, tasks start unchecked); Enter on a
 /// line holding only the marker leaves the list. `None` means "not a list situation —
@@ -750,5 +788,23 @@ mod tests {
         let t = "- [ ] ";
         let e = on_enter(&w(t), 6, 0).unwrap();
         assert_eq!(apply(t, &e).0, "\r");
+    }
+
+    #[test]
+    fn outline_entries_label_and_cap_the_menu() {
+        let h = |level, title: &str| Heading { level, line_start: 0, title: title.to_string() };
+        let none = outline_entries(&[], OUTLINE_MENU_MAX);
+        assert_eq!(none, vec![OutlineEntry { heading: None, label: "見出しがありません".to_string() }]);
+
+        let e = outline_entries(&[h(1, "A&B"), h(3, ""), h(2, "x\ty")], OUTLINE_MENU_MAX);
+        let labels: Vec<_> = e.iter().map(|e| (e.heading, e.label.as_str())).collect();
+        assert_eq!(labels, [(Some(0), "A&&B"), (Some(1), "\u{3000}\u{3000}(空の見出し)"), (Some(2), "\u{3000}x y")]);
+
+        // Past the cap: the first `max` headings, then a line saying how many are left out.
+        let many: Vec<_> = (0..5).map(|i| h(1, &i.to_string())).collect();
+        let e = outline_entries(&many, 3);
+        assert_eq!(e.iter().map(|e| e.heading).collect::<Vec<_>>(), [Some(0), Some(1), Some(2), None]);
+        assert_eq!(e[3].label, "…ほか 2 件(行へ移動を使ってください)");
+        assert_eq!(outline_entries(&many, 5).len(), 5, "exactly at the cap: nothing left out");
     }
 }

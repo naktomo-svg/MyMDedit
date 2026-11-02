@@ -9,7 +9,7 @@
 use std::ffi::c_void;
 use std::sync::OnceLock;
 
-use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Foundation::{COLORREF, ERROR_FILE_NOT_FOUND, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::{DWMWA_USE_IMMERSIVE_DARK_MODE, DwmSetWindowAttribute};
 use windows::Win32::Graphics::Gdi::{
     CreateSolidBrush, DT_CENTER, DT_HIDEPREFIX, DT_SINGLELINE, DT_VCENTER, DeleteObject, DrawTextW, FillRect,
@@ -98,6 +98,11 @@ pub fn system_prefers_dark() -> bool {
             Some(&mut size),
         )
     };
+    // No value is the ordinary answer on a system that never changed the setting; any
+    // other failure (wrong type, access denied) is not, and is recorded. Both read as light.
+    if r.is_err() && r != ERROR_FILE_NOT_FOUND {
+        crate::log::error("system_prefers_dark", windows::core::Error::from(r));
+    }
     r.is_ok() && value == 0
 }
 
@@ -174,7 +179,13 @@ fn dark_mode_api() -> &'static DarkModeApi {
                 return none;
             }
         };
-        let ordinal = |n: u16| unsafe { GetProcAddress(module, PCSTR(n as usize as *const u8)) };
+        let ordinal = |n: u16| {
+            let f = unsafe { GetProcAddress(module, PCSTR(n as usize as *const u8)) };
+            if f.is_none() {
+                crate::log::error("dark_mode_api", format!("uxtheme ordinal {n} is missing"));
+            }
+            f
+        };
         // SAFETY: on the builds `app_mode_api` admits, these ordinals have exactly these
         // signatures (both meanings of 135 take one 32-bit argument and return one).
         unsafe {
@@ -237,7 +248,13 @@ pub fn set_control_theme(hwnd: HWND, dark: bool, dark_class: &str) {
 pub fn fill(hdc: HDC, rect: &RECT, color: COLORREF) {
     unsafe {
         let brush = CreateSolidBrush(color);
-        FillRect(hdc, rect, brush);
+        if brush.is_invalid() {
+            crate::log::error("fill", "CreateSolidBrush failed (out of GDI objects?)");
+            return;
+        }
+        if FillRect(hdc, rect, brush) == 0 {
+            crate::log::error("FillRect", windows::core::Error::from_thread());
+        }
         let _ = DeleteObject(HGDIOBJ(brush.0));
     }
 }
@@ -274,18 +291,18 @@ struct UahDrawMenuItem {
     umi: UahMenuItem,
 }
 
-fn menu_bar_rect_in_window(hwnd: HWND) -> Option<RECT> {
+fn menu_bar_rect_in_window(hwnd: HWND) -> windows::core::Result<RECT> {
     unsafe {
         let mut mbi = MENUBARINFO { cbSize: size_of::<MENUBARINFO>() as u32, ..Default::default() };
-        GetMenuBarInfo(hwnd, OBJID_MENU, 0, &mut mbi).ok()?;
+        GetMenuBarInfo(hwnd, OBJID_MENU, 0, &mut mbi)?;
         let mut win = RECT::default();
-        GetWindowRect(hwnd, &mut win).ok()?;
+        GetWindowRect(hwnd, &mut win)?;
         let mut r = mbi.rcBar;
         r.left -= win.left;
         r.right -= win.left;
         r.top -= win.top;
         r.bottom -= win.top;
-        Some(r)
+        Ok(r)
     }
 }
 
@@ -306,10 +323,17 @@ pub fn handle_menu_bar_message(
         match msg {
             WM_UAHDRAWMENU => {
                 let um = &*(lparam.0 as *const UahMenu);
-                if let Some(r) = menu_bar_rect_in_window(hwnd) {
-                    fill(um.hdc, &r, palette.window_bg);
+                match menu_bar_rect_in_window(hwnd) {
+                    Ok(r) => {
+                        fill(um.hdc, &r, palette.window_bg);
+                        Some(LRESULT(0))
+                    }
+                    // Unpainted is worse than light: let the default painting draw it.
+                    Err(e) => {
+                        crate::log::error("menu_bar_rect", &e);
+                        None
+                    }
                 }
-                Some(LRESULT(0))
             }
             WM_UAHDRAWMENUITEM => {
                 let item = &*(lparam.0 as *const UahDrawMenuItem);
@@ -353,8 +377,12 @@ pub fn handle_menu_bar_message(
                 let top = pts[0].y - win.top;
                 let line = RECT { left: pts[0].x - win.left, top: top - 1, right: pts[0].x - win.left + client.right, bottom: top };
                 let hdc = GetWindowDC(Some(hwnd));
-                fill(hdc, &line, palette.window_bg);
-                ReleaseDC(Some(hwnd), hdc);
+                if hdc.is_invalid() {
+                    crate::log::error("GetWindowDC", "no DC for the menu bar's bottom line");
+                } else {
+                    fill(hdc, &line, palette.window_bg);
+                    ReleaseDC(Some(hwnd), hdc);
+                }
                 Some(result)
             }
             _ => None,

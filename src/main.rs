@@ -28,8 +28,7 @@ use windows::Win32::UI::Controls::{
     ICC_BAR_CLASSES, ICC_STANDARD_CLASSES, ICC_TAB_CLASSES, ICC_UPDOWN_CLASS, INITCOMMONCONTROLSEX,
     InitCommonControlsEx,
 };
-use windows::Win32::UI::WindowsAndMessaging::{MB_ICONERROR, MB_OK, MessageBoxW};
-use windows::core::{HSTRING, w};
+use windows::Win32::UI::WindowsAndMessaging::{MB_ICONERROR, MB_OK};
 
 fn main() {
     // Security, and first on purpose: by default a DLL loaded by name is looked for in
@@ -78,9 +77,7 @@ fn main() {
 
 /// The app cannot run at all: say so in the one UI there is before a window exists.
 fn fatal(message: &str) {
-    unsafe {
-        MessageBoxW(None, &HSTRING::from(message), w!("MyMDedit"), MB_OK | MB_ICONERROR);
-    }
+    win::message_box(None, message, MB_OK | MB_ICONERROR);
 }
 
 #[cfg(test)]
@@ -196,6 +193,44 @@ mod tests {
                 "{} numbers its own WM_APP message: add it to win::AppMessage instead",
                 path.display()
             );
+        }
+    }
+
+    /// Calls whose failure leaves the user looking at nothing — a menu missing items, a
+    /// message never shown — must not drop their error: it goes to `log` (popup menus go
+    /// through `App::popup_menu`, message boxes through `win::message_box`).
+    #[test]
+    fn ui_building_failures_are_not_discarded() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let discarded = [
+            ["let _ = ", "AppendMenuW"].concat(),
+            ["let _ = ", "CreatePopupMenu"].concat(),
+            ["let _ = ", "CreateMenu"].concat(),
+            [" else { return }", ""].concat(),
+        ];
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().is_none_or(|e| e != "rs") {
+                continue;
+            }
+            let code = std::fs::read_to_string(&path).unwrap();
+            for (n, line) in code.lines().enumerate() {
+                let menu_dropped = line.contains("Menu()") && line.contains(&discarded[3]);
+                assert!(
+                    !discarded[..3].iter().any(|d| line.contains(d.as_str())) && !menu_dropped,
+                    "{}:{}: a menu call's error is dropped; log it",
+                    path.display(),
+                    n + 1
+                );
+                if !path.ends_with("win.rs") {
+                    assert!(
+                        !line.contains(&["MessageBox", "W("].concat()),
+                        "{}:{}: use win::message_box, which records a box that could not be shown",
+                        path.display(),
+                        n + 1
+                    );
+                }
+            }
         }
     }
 

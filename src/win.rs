@@ -10,8 +10,8 @@ use windows::Win32::System::Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, Glo
 use windows::Win32::System::Ole::CF_UNICODETEXT;
 use windows::Win32::UI::HiDpi::{GetDpiForWindow, SystemParametersInfoForDpi};
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetWindowTextLengthW, GetWindowTextW, NONCLIENTMETRICSW, SPI_GETNONCLIENTMETRICS,
-    SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SendMessageW,
+    GetWindowTextLengthW, GetWindowTextW, MESSAGEBOX_RESULT, MESSAGEBOX_STYLE, MessageBoxW, NONCLIENTMETRICSW,
+    SPI_GETNONCLIENTMETRICS, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SendMessageW,
 };
 use windows::core::PCWSTR;
 
@@ -65,6 +65,17 @@ pub fn wide(s: &str) -> Vec<u16> {
 pub fn pcwstr(buf: &[u16]) -> PCWSTR {
     debug_assert_eq!(buf.last(), Some(&0), "pcwstr needs a NUL-terminated buffer");
     PCWSTR(buf.as_ptr())
+}
+
+/// A message box titled "MyMDedit". MessageBoxW answers 0 when it cannot show the box
+/// (out of resources, owner gone), and the user then never saw `text`: that is recorded.
+pub fn message_box(owner: Option<HWND>, text: &str, style: MESSAGEBOX_STYLE) -> MESSAGEBOX_RESULT {
+    let (text, caption) = (wide(text), wide("MyMDedit"));
+    let answer = unsafe { MessageBoxW(owner, pcwstr(&text), pcwstr(&caption), style) };
+    if answer.0 == 0 {
+        crate::log::error("MessageBoxW", windows::core::Error::from_thread());
+    }
+    answer
 }
 
 pub const fn rgb(r: u8, g: u8, b: u8) -> COLORREF {
