@@ -1270,12 +1270,16 @@ impl App {
     fn persist_settings(&self, change: impl FnOnce(&mut AppSettings)) {
         let before = self.current_settings();
         let result = self.state.borrow_mut().settings.update(change);
-        if let Err(e) = result {
-            self.report_error(
+        match result {
+            Ok(None) => {}
+            // Saved, but over a file that had gone bad since startup: as at startup, the
+            // user hears what was lost and where the original went.
+            Ok(Some(notice)) => self.report_error("SettingsStore.save backup", &notice, None),
+            Err(e) => self.report_error(
                 "SettingsStore.save",
                 "設定を保存できませんでした。この変更は次回の起動時には元に戻ります。",
                 Some(&e),
-            );
+            ),
         }
         let after = self.current_settings();
         if settings::display_differs(&before, &after) {
