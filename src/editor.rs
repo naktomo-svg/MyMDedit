@@ -10,8 +10,8 @@ use windows::Win32::System::LibraryLoader::{LOAD_LIBRARY_SEARCH_SYSTEM32, LoadLi
 use windows::Win32::UI::Controls::RichEdit::{
     CFM_COLOR, CFM_FACE, CFM_SIZE, CHARFORMAT2W, CHARRANGE, EM_EXGETSEL, EM_EXLIMITTEXT, EM_EXSETSEL, EM_GETTEXTEX,
     EM_GETTEXTLENGTHEX, EM_REDO, EM_SETBKGNDCOLOR, EM_SETCHARFORMAT, EM_SETEVENTMASK, EM_SETTEXTEX, EM_SETTEXTMODE,
-    EM_SETZOOM, ENM_CHANGE, GETTEXTEX, GETTEXTLENGTHEX, GT_DEFAULT, GTL_NUMCHARS, GTL_PRECISE, SCF_ALL, SCF_DEFAULT,
-    SETTEXTEX, ST_DEFAULT, TM_MULTILEVELUNDO, TM_PLAINTEXT,
+    EM_SETZOOM, ENM_CHANGE, ENM_DROPFILES, GETTEXTEX, GETTEXTLENGTHEX, GT_DEFAULT, GTL_NUMCHARS, GTL_PRECISE, SCF_ALL,
+    SCF_DEFAULT, SETTEXTEX, ST_DEFAULT, TM_MULTILEVELUNDO, TM_PLAINTEXT,
 };
 use windows::Win32::UI::Controls::{EM_REPLACESEL, EM_SCROLLCARET, EM_SETRECT, EM_SETSEL, EM_UNDO};
 use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
@@ -71,7 +71,9 @@ impl Editor {
             }
             // The default limit is 32K characters.
             send(hwnd, EM_EXLIMITTEXT, 0, 0x7FFF_FFFE);
-            send(hwnd, EM_SETEVENTMASK, 0, ENM_CHANGE as isize);
+            // ENM_DROPFILES: a file dropped on the editor comes to the main window as
+            // EN_DROPFILES (and is opened there), never into the text.
+            send(hwnd, EM_SETEVENTMASK, 0, (ENM_CHANGE | ENM_DROPFILES) as isize);
             Ok(editor)
         }
     }

@@ -10,11 +10,16 @@ use windows::Win32::System::DataExchange::{CloseClipboard, EmptyClipboard, OpenC
 use windows::Win32::System::Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock};
 use windows::Win32::System::Ole::CF_UNICODETEXT;
 use windows::Win32::UI::HiDpi::{GetDpiForWindow, SystemParametersInfoForDpi};
+use windows::Win32::UI::Shell::{DragQueryFileW, HDROP};
 use windows::Win32::UI::WindowsAndMessaging::{
     GetWindowTextLengthW, GetWindowTextW, MESSAGEBOX_RESULT, MESSAGEBOX_STYLE, MessageBoxW, NONCLIENTMETRICSW,
     SPI_GETNONCLIENTMETRICS, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SendMessageW,
 };
 use windows::core::PCWSTR;
+
+use std::ffi::OsString;
+use std::os::windows::ffi::OsStringExt;
+use std::path::PathBuf;
 
 /// The app's own window messages, all posted to the main window. Numbered by one enum so
 /// that two cannot share a value: the compiler rejects duplicate discriminants, where two
@@ -28,6 +33,7 @@ enum AppMessage {
     CheckDisk,
     PreviewClose,
     DiskChecked,
+    OpenDropped,
 }
 
 const fn app_message(m: AppMessage) -> u32 {
@@ -48,6 +54,9 @@ pub const WM_APP_CHECK_DISK: u32 = app_message(AppMessage::CheckDisk);
 pub const WM_APP_PREVIEW_CLOSE: u32 = app_message(AppMessage::PreviewClose);
 /// The open file's disk check finished (the result waits in a channel).
 pub const WM_APP_DISK_CHECKED: u32 = app_message(AppMessage::DiskChecked);
+/// A file was dropped on the window (the path waits in `App`): open it — never from
+/// inside the drop itself, which the dragging program is still waiting on.
+pub const WM_APP_OPEN_DROPPED: u32 = app_message(AppMessage::OpenDropped);
 
 /// 64 bits from the system's cryptographic RNG, for values that must not be guessed.
 pub fn secure_random_u64() -> windows::core::Result<u64> {
@@ -324,6 +333,32 @@ fn open_clipboard(hwnd: HWND) -> windows::core::Result<()> {
     Err(last.unwrap_or_else(windows::core::Error::from_thread))
 }
 
+/// The file to open out of a drop: the first name, as the dragging program listed them.
+/// The others are ignored (one window, one document). `None` when there is no first name
+/// or it could not be read (an empty name). `names` is consumed lazily, so only the first
+/// name is ever fetched.
+pub fn pick_dropped(names: impl IntoIterator<Item = Vec<u16>>) -> Option<PathBuf> {
+    let name = names.into_iter().next()?;
+    let len = name.iter().position(|&c| c == 0).unwrap_or(name.len());
+    if len == 0 {
+        return None;
+    }
+    Some(PathBuf::from(OsString::from_wide(&name[..len])))
+}
+
+/// The first file named in a drop (`pick_dropped`). The caller still owns `hdrop`.
+pub fn dropped_file(hdrop: HDROP) -> Option<PathBuf> {
+    let names = (0..unsafe { DragQueryFileW(hdrop, u32::MAX, None) }).map(|i| {
+        // The length without the NUL; 0 is also what a failure answers.
+        let len = unsafe { DragQueryFileW(hdrop, i, None) } as usize;
+        let mut buf = vec![0u16; len + 1];
+        let copied = if len > 0 { unsafe { DragQueryFileW(hdrop, i, Some(&mut buf)) as usize } } else { 0 };
+        buf.truncate(copied.min(len));
+        buf
+    });
+    pick_dropped(names)
+}
+
 pub fn loword(v: usize) -> u16 {
     (v & 0xFFFF) as u16
 }
@@ -367,6 +402,27 @@ mod tests {
         assert_eq!(super::group_thousands(0), "0");
         assert_eq!(super::group_thousands(999), "999");
         assert_eq!(super::group_thousands(1234567), "1,234,567");
+    }
+
+    #[test]
+    fn a_drop_opens_its_first_file_only() {
+        use super::pick_dropped;
+        use std::path::PathBuf;
+        let w = |s: &str| s.encode_utf16().collect::<Vec<u16>>();
+        assert_eq!(pick_dropped(Vec::new()), None, "nothing dropped");
+        assert_eq!(pick_dropped(vec![w(r"C:\d\a.md"), w(r"C:\d\b.md")]), Some(PathBuf::from(r"C:\d\a.md")));
+        assert_eq!(pick_dropped(vec![w("C:\\d\\a.md\0junk")]), Some(PathBuf::from(r"C:\d\a.md")), "cut at the NUL");
+        // An unreadable first name is not replaced by the second: the user dropped the first.
+        assert_eq!(pick_dropped(vec![Vec::new(), w(r"C:\d\b.md")]), None);
+        assert_eq!(pick_dropped(vec![vec![0u16, 0x41]]), None, "empty before the NUL");
+        // Only the first name is fetched.
+        let mut fetched = 0;
+        let names = (0..3).map(|i| {
+            fetched += 1;
+            w(&format!(r"C:\d\{i}.md"))
+        });
+        assert_eq!(pick_dropped(names), Some(PathBuf::from(r"C:\d\0.md")));
+        assert_eq!(fetched, 1);
     }
 
     #[test]

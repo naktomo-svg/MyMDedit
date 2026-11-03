@@ -22,15 +22,18 @@ use windows::Win32::UI::Controls::Dialogs::{
     CommDlgExtendedError, FINDMSGSTRINGW, FINDREPLACE_FLAGS, FINDREPLACEW, FR_DIALOGTERM, FR_DOWN, FR_FINDNEXT,
     FR_MATCHCASE, FR_REPLACE, FR_REPLACEALL, FR_WHOLEWORD, FindTextW, ReplaceTextW,
 };
+use windows::Win32::UI::Controls::RichEdit::{EN_DROPFILES, ENDROPFILES};
 use windows::Win32::UI::Controls::{
-    DRAWITEMSTRUCT, ODS_SELECTED, TOOLTIPS_CLASSW, TTF_IDISHWND, TTF_SUBCLASS, TTM_ADDTOOLW, TTM_SETMAXTIPWIDTH,
+    DRAWITEMSTRUCT, NMHDR, ODS_SELECTED, TOOLTIPS_CLASSW, TTF_IDISHWND, TTF_SUBCLASS, TTM_ADDTOOLW, TTM_SETMAXTIPWIDTH,
     TTTOOLINFOW,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, SetFocus, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent, VK_ADD, VK_CONTROL, VK_MENU, VK_NUMPAD0,
     VK_OEM_MINUS, VK_OEM_PLUS, VK_RETURN, VK_SHIFT, VK_SUBTRACT, VK_TAB,
 };
-use windows::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
+use windows::Win32::UI::Shell::{
+    DefSubclassProc, DragAcceptFiles, DragFinish, HDROP, RemoveWindowSubclass, SetWindowSubclass,
+};
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{PCWSTR, PWSTR, w};
 
@@ -48,8 +51,8 @@ use crate::settings::{self, AppSettings, SettingsStore, Theme};
 use crate::settings_dialog;
 use crate::theme::{self, Palette, fill};
 use crate::win::{
-    self, WM_APP_CHECK_DISK, WM_APP_DISK_CHECKED, WM_APP_FOLDER_PROBED, WM_APP_PREVIEW_CLOSE, WM_APP_PREVIEW_FAILED,
-    WM_APP_RENDER, group_thousands, hiword, loword, pcwstr, scale, send, wide,
+    self, WM_APP_CHECK_DISK, WM_APP_DISK_CHECKED, WM_APP_FOLDER_PROBED, WM_APP_OPEN_DROPPED, WM_APP_PREVIEW_CLOSE,
+    WM_APP_PREVIEW_FAILED, WM_APP_RENDER, group_thousands, hiword, loword, pcwstr, scale, send, wide,
 };
 
 const SAMPLE_CONTENT: &str = "# Hello, Markdown!\n\nここに Markdown を入力すると、右側にプレビューが表示されます。\n\n- リスト項目 1\n- リスト項目 2\n\n```csharp\nConsole.WriteLine(\"Hello, world!\");\n```";
@@ -469,6 +472,9 @@ pub struct App {
     /// popup menu, a message box owned by the find dialog), so the activation that
     /// follows cannot be relied on to do it.
     disk_recheck: Cell<bool>,
+    /// The file of the last drop, waiting for `WM_APP_OPEN_DROPPED`. Only a slot, not a
+    /// queue: a second drop before it is opened replaces the first.
+    dropped: RefCell<Option<PathBuf>>,
 }
 
 thread_local! {
@@ -543,6 +549,7 @@ pub fn run(launch_file: Option<PathBuf>) -> windows::core::Result<()> {
         disk_rx,
         disk_check_running: Cell::new(false),
         disk_recheck: Cell::new(false),
+        dropped: RefCell::new(None),
     });
     APP.with(|a| *a.borrow_mut() = Some(app.clone()));
 
@@ -698,6 +705,9 @@ impl App {
             // Without it list continuation, Tab indenting and the app-wide Ctrl+wheel zoom are
             // silently gone; the log says why.
             install_subclass(editor.hwnd(), editor_proc, "editor");
+            // Files dropped anywhere on the window but the editor (which reports its own
+            // as EN_DROPFILES) arrive as WM_DROPFILES.
+            DragAcceptFiles(hwnd, true);
 
             let mut buttons = [HWND::default(); TOOL_BUTTON_COUNT];
             for (slot, b) in buttons.iter_mut().zip(TOOL_BUTTONS.iter()) {
@@ -1690,6 +1700,44 @@ impl App {
         self.read_and_apply(path, "OpenFile", &format!("ファイルを開けませんでした: {}", path.display()));
     }
 
+    /// A file dropped on the window. Opened later, from `WM_APP_OPEN_DROPPED`: an editor
+    /// drop arrives from inside the dragging program's drag loop, which must not wait on
+    /// the discard prompt. A drop while a modal of ours is up is refused, not deferred —
+    /// the user can drop it again once the dialog is gone.
+    fn on_file_dropped(&self, path: Option<PathBuf>) {
+        let Some(path) = path else {
+            log::error("FileDrop", "could not read the dropped file's name");
+            return;
+        };
+        if self.busy.get() {
+            log::error("FileDrop", format!("ignored a drop while a dialog is open: {}", path.display()));
+            return;
+        }
+        *self.dropped.borrow_mut() = Some(path);
+        unsafe {
+            if let Err(e) = PostMessageW(Some(self.hwnd()), WM_APP_OPEN_DROPPED, WPARAM(0), LPARAM(0)) {
+                log::error("FileDrop PostMessage", &e);
+                self.dropped.borrow_mut().take();
+            }
+        }
+    }
+
+    /// Opens the dropped file the way 開く does (`open_path`): the same discard prompt
+    /// and the same read, so the same errors.
+    fn open_dropped(&self) {
+        let Some(path) = self.dropped.borrow_mut().take() else { return };
+        if self.close_confirmed.get() {
+            return;
+        }
+        let Some(busy) = self.try_busy() else {
+            log::error("FileDrop", format!("ignored a drop while a dialog is open: {}", path.display()));
+            return;
+        };
+        self.open_path(&path);
+        drop(busy);
+        self.deliver_deferred();
+    }
+
     /// On failure the current document is deliberately left untouched.
     fn read_and_apply(&self, path: &Path, context: &str, message: &str) {
         match document::read(path) {
@@ -2525,6 +2573,29 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
         WM_APP_RENDER => {
             app.render_pending.set(false);
             app.rerender();
+            LRESULT(0)
+        }
+        WM_DROPFILES => {
+            let hdrop = HDROP(wparam.0 as *mut _);
+            let path = win::dropped_file(hdrop);
+            // Ours to free (the editor's EN_DROPFILES handle is not).
+            unsafe { DragFinish(hdrop) };
+            app.on_file_dropped(path);
+            LRESULT(0)
+        }
+        WM_NOTIFY => {
+            let header = unsafe { &*(lparam.0 as *const NMHDR) };
+            if header.hwndFrom == app.ui.get().editor && header.code == EN_DROPFILES {
+                let info = unsafe { &*(lparam.0 as *const ENDROPFILES) };
+                // The editor's handle, freed by the editor: no DragFinish here.
+                app.on_file_dropped(win::dropped_file(HDROP(info.hDrop.0)));
+                // 0: the editor does nothing with the files itself (no text inserted).
+                return LRESULT(0);
+            }
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+        }
+        WM_APP_OPEN_DROPPED => {
+            app.open_dropped();
             LRESULT(0)
         }
         WM_APP_FOLDER_PROBED => {
