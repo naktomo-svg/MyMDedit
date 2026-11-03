@@ -706,7 +706,9 @@ impl App {
             // silently gone; the log says why.
             install_subclass(editor.hwnd(), editor_proc, "editor");
             // Files dropped anywhere on the window but the editor (which reports its own
-            // as EN_DROPFILES) arrive as WM_DROPFILES.
+            // as EN_DROPFILES) arrive as WM_DROPFILES. Not those dropped on the preview:
+            // WebView2 takes the drop in its own process and refuses it (AllowExternalDrop
+            // is off), so nothing reaches this window and nothing is opened.
             DragAcceptFiles(hwnd, true);
 
             let mut buttons = [HWND::default(); TOOL_BUTTON_COUNT];

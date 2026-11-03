@@ -528,7 +528,8 @@ fn install_protections(
             );
         }
         // A file dropped on the preview would otherwise be navigated to (a page change the
-        // navigation guard then has to stop) — and the app opens dropped files itself.
+        // navigation guard then has to stop). Refused, the drop ends here: it does not
+        // reach the main window either, so a file dropped on the preview is not opened.
         if let Ok(c4) = controller.cast::<ICoreWebView2Controller4>() {
             c4.SetAllowExternalDrop(false)?;
         } else {
