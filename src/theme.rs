@@ -318,7 +318,8 @@ pub fn handle_menu_bar_message(
     unsafe {
         match msg {
             WM_UAHDRAWMENU => {
-                let um = &*(lparam.0 as *const UahMenu);
+                // None: left to the default painting, as for any unhandled message.
+                let um = crate::win::lparam_ref::<UahMenu>(lparam)?;
                 match menu_bar_rect_in_window(hwnd) {
                     Ok(r) => {
                         fill(um.hdc, &r, palette.window_bg);
@@ -332,7 +333,7 @@ pub fn handle_menu_bar_message(
                 }
             }
             WM_UAHDRAWMENUITEM => {
-                let item = &*(lparam.0 as *const UahDrawMenuItem);
+                let item = crate::win::lparam_ref::<UahDrawMenuItem>(lparam)?;
                 let mut buf = [0u16; 256];
                 let mut mii = MENUITEMINFOW {
                     cbSize: size_of::<MENUITEMINFOW>() as u32,

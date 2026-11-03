@@ -573,7 +573,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             LRESULT(state.field_brush.0 as isize)
         },
         WM_DRAWITEM => {
-            let dis = unsafe { &*(lparam.0 as *const DRAWITEMSTRUCT) };
+            let Some(dis) = (unsafe { crate::win::lparam_ref::<DRAWITEMSTRUCT>(lparam) }) else {
+                return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
+            };
             if dis.CtlID == IDC_SWATCH as u32 {
                 fill(dis.hDC, &dis.rcItem, state.bg_color.get());
                 unsafe {

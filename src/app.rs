@@ -2508,10 +2508,13 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
             }
             LRESULT(0)
         }
-        WM_DRAWITEM => {
-            app.draw_button(unsafe { &*(lparam.0 as *const DRAWITEMSTRUCT) });
-            LRESULT(1)
-        }
+        WM_DRAWITEM => match unsafe { win::lparam_ref::<DRAWITEMSTRUCT>(lparam) } {
+            Some(dis) => {
+                app.draw_button(dis);
+                LRESULT(1)
+            }
+            None => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
+        },
         WM_PAINT => {
             app.paint();
             LRESULT(0)
@@ -2526,12 +2529,14 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
             preview::notify_moved(&app);
             unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
         }
-        WM_GETMINMAXINFO => {
-            let info = unsafe { &mut *(lparam.0 as *mut MINMAXINFO) };
-            let dpi = app.ui.get().dpi.max(96);
-            info.ptMinTrackSize = POINT { x: scale(640, dpi), y: scale(400, dpi) };
-            LRESULT(0)
-        }
+        WM_GETMINMAXINFO => match unsafe { win::lparam_mut::<MINMAXINFO>(lparam) } {
+            Some(info) => {
+                let dpi = app.ui.get().dpi.max(96);
+                info.ptMinTrackSize = POINT { x: scale(640, dpi), y: scale(400, dpi) };
+                LRESULT(0)
+            }
+            None => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
+        },
         WM_SETFOCUS => {
             app.editor().focus();
             LRESULT(0)
@@ -2586,9 +2591,10 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
             LRESULT(0)
         }
         WM_NOTIFY => {
-            let header = unsafe { &*(lparam.0 as *const NMHDR) };
-            if header.hwndFrom == app.ui.get().editor && header.code == EN_DROPFILES {
-                let info = unsafe { &*(lparam.0 as *const ENDROPFILES) };
+            let header = unsafe { win::lparam_ref::<NMHDR>(lparam) };
+            if header.is_some_and(|h| h.hwndFrom == app.ui.get().editor && h.code == EN_DROPFILES)
+                && let Some(info) = unsafe { win::lparam_ref::<ENDROPFILES>(lparam) }
+            {
                 // The editor's handle, freed by the editor: no DragFinish here.
                 app.on_file_dropped(win::dropped_file(HDROP(info.hDrop.0)));
                 // 0: the editor does nothing with the files itself (no text inserted).
@@ -2608,21 +2614,19 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
         }
         WM_SETTINGCHANGE => {
             // Follow the OS light/dark switch when the theme is システムの既定.
-            let area = if lparam.0 != 0 {
-                unsafe { PCWSTR(lparam.0 as *const u16).to_string().unwrap_or_default() }
-            } else {
-                String::new()
-            };
+            let area = unsafe { win::lparam_string(lparam) };
             if area == "ImmersiveColorSet" && app.current_settings().theme == Theme::System {
                 app.reapply_display();
             }
             unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
         }
-        WM_DPICHANGED => {
-            let rect = unsafe { &*(lparam.0 as *const RECT) };
-            app.on_dpi_changed(hiword(wparam.0) as u32, rect);
-            LRESULT(0)
-        }
+        WM_DPICHANGED => match unsafe { win::lparam_ref::<RECT>(lparam) } {
+            Some(rect) => {
+                app.on_dpi_changed(hiword(wparam.0) as u32, rect);
+                LRESULT(0)
+            }
+            None => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
+        },
         WM_CLOSE => {
             app.on_close_request();
             LRESULT(0)

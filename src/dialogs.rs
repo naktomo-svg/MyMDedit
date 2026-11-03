@@ -286,7 +286,7 @@ unsafe extern "system" fn about_callback(
 ) -> HRESULT {
     if msg == TDN_HYPERLINK_CLICKED {
         // The href as written in about_text; anything else is not followed.
-        let href = unsafe { PCWSTR(lparam.0 as *const u16).to_string() }.unwrap_or_default();
+        let href = unsafe { crate::win::lparam_string(lparam) };
         if href == ProjectPage::Repository.url()
             && let Err(e) = open_project_page(hwnd, ProjectPage::Repository)
         {

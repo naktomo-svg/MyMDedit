@@ -359,6 +359,43 @@ pub fn dropped_file(hdrop: HDROP) -> Option<PathBuf> {
     pick_dropped(names)
 }
 
+// ---- lparam as a pointer ------------------------------------------------------------
+//
+// Every window procedure that reads a message's lparam as a pointer goes through these,
+// so a null lparam falls back to the message's default handling instead of crashing:
+// another process of the same user can SendMessage any message with lparam 0. Only null
+// is caught — a non-null address that points nowhere cannot be told from a real one, and
+// for messages Windows does not marshal across processes there is no way to check it.
+
+/// The `T` a message's lparam points at; `None` for a null lparam.
+///
+/// # Safety
+/// A non-null `lparam` must point at a valid `T` for `'a` (in practice, the window
+/// procedure call that received it).
+pub unsafe fn lparam_ref<'a, T>(lparam: LPARAM) -> Option<&'a T> {
+    unsafe { (lparam.0 as *const T).as_ref() }
+}
+
+/// `lparam_ref` for a struct the message expects to be filled in.
+///
+/// # Safety
+/// As `lparam_ref`, and nothing else may refer to the `T` during `'a`.
+pub unsafe fn lparam_mut<'a, T>(lparam: LPARAM) -> Option<&'a mut T> {
+    unsafe { (lparam.0 as *mut T).as_mut() }
+}
+
+/// The NUL-terminated UTF-16 string a message's lparam points at; empty for a null
+/// lparam or text that is not valid UTF-16.
+///
+/// # Safety
+/// A non-null `lparam` must point at a NUL-terminated UTF-16 string.
+pub unsafe fn lparam_string(lparam: LPARAM) -> String {
+    if lparam.0 == 0 {
+        return String::new();
+    }
+    unsafe { PCWSTR(lparam.0 as *const u16).to_string() }.unwrap_or_default()
+}
+
 pub fn loword(v: usize) -> u16 {
     (v & 0xFFFF) as u16
 }
@@ -423,6 +460,27 @@ mod tests {
         });
         assert_eq!(pick_dropped(names), Some(PathBuf::from(r"C:\d\0.md")));
         assert_eq!(fetched, 1);
+    }
+
+    #[test]
+    fn a_null_lparam_is_none() {
+        use super::{lparam_mut, lparam_ref, lparam_string};
+        use windows::Win32::Foundation::{LPARAM, RECT};
+        let null = LPARAM(0);
+        assert!(unsafe { lparam_ref::<RECT>(null) }.is_none());
+        assert!(unsafe { lparam_mut::<RECT>(null) }.is_none());
+        assert_eq!(unsafe { lparam_string(null) }, "", "null reads as no text");
+
+        let mut rect = RECT { left: 1, top: 2, right: 3, bottom: 4 };
+        let lparam = LPARAM(&raw mut rect as isize);
+        assert_eq!(unsafe { lparam_ref::<RECT>(lparam) }.map(|r| r.right), Some(3));
+        if let Some(r) = unsafe { lparam_mut::<RECT>(lparam) } {
+            r.bottom = 40;
+        }
+        assert_eq!(rect.bottom, 40);
+
+        let text = super::wide("ImmersiveColorSet");
+        assert_eq!(unsafe { lparam_string(LPARAM(text.as_ptr() as isize)) }, "ImmersiveColorSet");
     }
 
     #[test]
