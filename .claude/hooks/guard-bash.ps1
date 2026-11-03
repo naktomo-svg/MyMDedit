@@ -25,7 +25,8 @@ $rules = @(
     @{ re = '\bgit\s+push\b[^|;&]*(\s--force\b|\s-f\b|\s--force-with-lease\b|\s\+\S)'; why = '強制 push は禁止です' }
     @{ re = '\bgit\s+reset\s+[^|;&]*--hard';                                          why = 'git reset --hard は作業を消すため禁止です。git revert で戻してください' }
     @{ re = '\bgit\s+clean\s+-[a-z]*f';                                               why = 'git clean -f は追跡外のファイルを消すため禁止です' }
-    @{ re = '\bgit\s+branch\s+[^|;&]*(-D\b|--delete\s+--force)';                      why = 'ブランチの強制削除は人の承認が必要です' }
+    # 照合は大文字小文字を区別しないため、-D だけは (?-i:) で区別する(-d はマージ済みのブランチしか消さないので通す)
+    @{ re = '\bgit\s+branch\s+[^|;&]*((?-i:-D)\b|--delete\s+--force|(?<!\S)-d\s+(-f|--force)\b|(?<!\S)(-f|--force)\s+-d\b)'; why = 'ブランチの強制削除は人の承認が必要です' }
     @{ re = '\bgit\s+worktree\s+remove\b[^|;&]*--force';                              why = '変更が残った worktree の強制削除は人の承認が必要です' }
     @{ re = '\bgit\s+checkout\s+[^|;&]*\s--\s+\.';                                    why = '作業ツリー全体の変更を捨てる操作は禁止です' }
     @{ re = '\bgit\s+(rebase|filter-branch|filter-repo)\b';                           why = '履歴の書き換えは人の承認が必要です' }
