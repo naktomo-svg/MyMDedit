@@ -67,3 +67,6 @@ Generating the AI tech-debt report (`scripts/Analyze-TechDebt.ps1`) has its own 
 - Before acting on a technical-debt, clippy or code-review finding (e.g. from `docs/tech-debt/`), invoke the `verify-then-fix` skill.
 - Before fixing a confirmed-real bug or tech-debt finding, invoke the `why5-and-horizontal-check` skill.
 - Security re-audit triggers (record results in the commit message or PR description): bumping `webview2-com` or `comrak`; any change to a handler or setting in `preview.rs`; any new way content or a path enters the app (a new file source, drag-and-drop, clipboard format, IPC); a major WebView2 Runtime update. At minimum, run `run-all.ps1`, `cargo deny check` and the fuzz targets that cover the changed module.
+- Agent team (coordinator = main session, `implementer` and `reviewer` subagents in `.claude/agents/`, git worktrees under `.claude/worktrees/`, guard hooks in `.claude/hooks/`): the workflow and rules are in the file imported below.
+
+@CLAUDE.team.md

@@ -2,3 +2,8 @@
 
 # tech-debt analyzer output (reports and resume cache); kept local, docs/ holds only the spec
 docs/tech-debt/
+
+# agent team: per-task worktrees and the coordinator's task records (CLAUDE.team.md)
+.claude/worktrees/
+.claude/team/tasks/
+.claude/team/board.md
