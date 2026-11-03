@@ -25,6 +25,8 @@ Formatting is `rustfmt.toml` at the root: `max_width = 120` and `use_small_heuri
 
 Fuzzing needs the nightly toolchain, `cargo install cargo-fuzz`, and the MSVC ASan runtime directory (`…\VC\Tools\MSVC\<ver>\bin\Hostx64\x64`, holding `clang_rt.asan_dynamic-x86_64.dll`) on `PATH`; `-s none` does not link on MSVC. `cd fuzz; cargo +nightly test --lib` checks that the fuzz checkers catch what they guard against.
 
+Run `run-all.ps1` with `pwsh` (PowerShell 7), from a shell or as `pwsh -File …`: Windows PowerShell 5.1 (`powershell.exe`) reads the BOM-less UTF-8 script in the ANSI code page, fails to parse it, and still exits 0 with no payload run.
+
 **This section is the only place this repo's tooling state is asserted.** Skills under `.claude/skills/` refer to "the commands CLAUDE.md lists" rather than naming them, so adding a tool means editing here and nowhere else.
 
 Verification for every change is: `cargo build` with 0 errors, `cargo test` all passing, `cargo clippy --all-targets` with no new warnings, and `cargo fmt --check` with no diff (in `fuzz/` too when it changed). Tests cover the pure-logic modules only (`md_ops`, `search`, `document`, `line_endings`, `settings`, `render`, `dialogs`' parsers, `settings_dialog::DialogEdits`). Anything behind a Win32 or WebView2 call needs manual QA in the running app (`winapp ui` can drive it; toolbar buttons carry accessible names, the editor's control id is 300).
