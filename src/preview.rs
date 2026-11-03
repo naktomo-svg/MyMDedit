@@ -55,9 +55,10 @@ use crate::win::{WM_APP_PREVIEW_CLOSE, WM_APP_PREVIEW_FAILED};
 #[derive(Default)]
 pub struct Preview {
     controller: Option<ICoreWebView2Controller>,
-    webview: Option<ICoreWebView2>,
-    /// Set last in initialization, only once every protection is in place.
-    ready: bool,
+    /// The WebView, set last in initialization and only once every protection is in
+    /// place — the single gate for loading anything. There is no separate flag, so
+    /// "ready without a WebView" cannot be represented.
+    ready: Option<ICoreWebView2>,
     /// A protection failed to act (`stop_preview`): no document is loaded again for the
     /// rest of the session. Unlike `ready`, nothing ever clears it — not a crash restart,
     /// which would otherwise configure a fresh controller and set `ready` once more.
@@ -288,7 +289,7 @@ fn stop_preview(context: &str, e: &windows::core::Error) {
     let app = app();
     let controller = {
         let mut p = app.preview.borrow_mut();
-        p.ready = false;
+        p.ready = None;
         p.stopped = true;
         p.controller.clone()
     };
@@ -747,8 +748,7 @@ fn show(controller: &ICoreWebView2Controller, webview: ICoreWebView2, generation
     }
     let previous = {
         let mut p = app.preview.borrow_mut();
-        p.webview = Some(webview);
-        p.ready = true;
+        p.ready = Some(webview);
         p.controller.replace(controller.clone())
     };
     // A controller from an earlier start that nobody closed: its child window would
@@ -857,16 +857,9 @@ fn on_accelerator_key(args: &ICoreWebView2AcceleratorKeyPressedEventArgs) -> win
 
 /// Pushes `html` into the preview. The single place that calls NavigateToString.
 pub fn navigate(app: &App, html: &str) {
-    let webview = {
-        let p = app.preview.borrow();
-        // Security: gate on `ready`, not merely on the WebView existing — a half-
-        // configured WebView must never load a hostile document.
-        if !p.ready {
-            return;
-        }
-        p.webview.clone()
-    };
-    let Some(webview) = webview else { return };
+    // Security: `ready` only holds the WebView once every protection is in place — a
+    // half-configured WebView must never load a hostile document.
+    let Some(webview) = app.preview.borrow().ready.clone() else { return };
 
     // Counted immediately before the call; the guard consumes it.
     {
@@ -908,21 +901,13 @@ pub fn navigate(app: &App, html: &str) {
 pub fn sync_view(this: &App) {
     let webview = {
         let mut p = this.preview.borrow_mut();
-        if !p.ready {
-            return;
-        }
+        let Some(webview) = p.ready.clone() else { return };
         if p.script_busy {
             p.script_again = true;
             return;
         }
         p.script_busy = true;
-        p.webview.clone()
-    };
-    let Some(webview) = webview else {
-        // Not reachable while `ready` implies a webview, but a stuck flag would end zoom
-        // and scroll sync for good.
-        this.preview.borrow_mut().script_busy = false;
-        return;
+        webview
     };
     let (zoom, ratio) = this.view_state();
     let script = format!(
@@ -1009,8 +994,7 @@ pub fn notify_moved(app: &App) {
 pub fn close(app: &App) {
     let controller = {
         let mut p = app.preview.borrow_mut();
-        p.ready = false;
-        p.webview = None;
+        p.ready = None;
         // Whatever was in flight goes with the controller.
         p.reset_in_flight();
         p.controller.take()
