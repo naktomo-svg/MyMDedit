@@ -33,8 +33,8 @@ use webview2_com::Microsoft::Web::WebView2::Win32::{
     CreateCoreWebView2EnvironmentWithOptions, GetAvailableCoreWebView2BrowserVersionString, ICoreWebView2,
     ICoreWebView2_4, ICoreWebView2_5, ICoreWebView2_10, ICoreWebView2_18, ICoreWebView2_22,
     ICoreWebView2AcceleratorKeyPressedEventArgs, ICoreWebView2Controller, ICoreWebView2Controller2,
-    ICoreWebView2CreateCoreWebView2ControllerCompletedHandler, ICoreWebView2Environment, ICoreWebView2Environment10,
-    ICoreWebView2EnvironmentOptions, ICoreWebView2NavigationCompletedEventArgs,
+    ICoreWebView2Controller4, ICoreWebView2CreateCoreWebView2ControllerCompletedHandler, ICoreWebView2Environment,
+    ICoreWebView2Environment10, ICoreWebView2EnvironmentOptions, ICoreWebView2NavigationCompletedEventArgs,
     ICoreWebView2NavigationStartingEventArgs, ICoreWebView2ProcessFailedEventArgs, ICoreWebView2Settings4,
     ICoreWebView2WebResourceRequestedEventArgs,
 };
@@ -525,6 +525,17 @@ fn install_protections(
             log::error(
                 "ConfigureWebView2",
                 "ICoreWebView2Settings4 unavailable; autofill stays at the runtime default",
+            );
+        }
+        // A file dropped on the preview would otherwise be navigated to (a page change the
+        // navigation guard then has to stop). Refused, the drop ends here: it does not
+        // reach the main window either, so a file dropped on the preview is not opened.
+        if let Ok(c4) = controller.cast::<ICoreWebView2Controller4>() {
+            c4.SetAllowExternalDrop(false)?;
+        } else {
+            log::error(
+                "ConfigureWebView2",
+                "ICoreWebView2Controller4 unavailable; a file dropped on the preview is left to the navigation guard",
             );
         }
 
