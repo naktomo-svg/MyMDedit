@@ -11,8 +11,9 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_ABANDONED, WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows::Win32::Globalization::{CSTR_EQUAL, CompareStringOrdinal};
+use windows::Win32::Storage::FileSystem::{MOVEFILE_WRITE_THROUGH, MoveFileExW};
 use windows::Win32::System::Threading::{CreateMutexW, ReleaseMutex, WaitForSingleObject};
-use windows::core::w;
+use windows::core::HSTRING;
 
 use crate::document::{self, DocumentFormat};
 use crate::line_endings::LineEnding;
@@ -25,8 +26,14 @@ pub mod limits {
     pub const CUSTOM_COLOR_COUNT: usize = 16;
     pub const RECENT_FOLDER_COUNT: usize = 3;
     /// A real settings file is well under 4KB. The file is writable from outside the
-    /// app, and one too big to read would abort every launch, not just this one.
+    /// app, and one too big to read would abort every launch, not just this one. Also the
+    /// most a backup copies (and compares): a bigger file is set aside by renaming it, so
+    /// its size costs no time on the UI thread or while the lock is held.
     pub const MAX_FILE_BYTES: u64 = 1024 * 1024;
+    /// How long reading or saving waits for another instance's to finish before going
+    /// ahead unserialized: a wedged instance must not freeze this one. The UI thread is
+    /// what waits.
+    pub const LOCK_TIMEOUT_MS: u32 = 2000;
 
     pub fn clamp_font_size(v: f64) -> f64 {
         if v.is_nan() { MIN_FONT_SIZE } else { v.clamp(MIN_FONT_SIZE, MAX_FONT_SIZE) }
@@ -186,11 +193,20 @@ pub fn parse_settings(text: &str) -> Parsed {
 pub struct SettingsStore {
     path: Option<PathBuf>,
     current: AppSettings,
-    /// False when the file on disk could not be read: writing would replace settings
-    /// we never saw, so this session leaves the file alone.
-    writable: bool,
     /// Something the user should be told at startup about how the settings were loaded.
     load_warning: Option<String>,
+    /// The named mutex that serializes reading and writing the file across instances.
+    lock_name: HSTRING,
+}
+
+const LOCK_NAME: &str = "Local\\MyMDedit.Settings";
+
+/// What [`SettingsStore::write_with`] did besides writing.
+struct Saved {
+    /// The file had gone bad and was backed up first; what the user is told about it.
+    backup_notice: Option<String>,
+    /// The lock could not be had in time, so this write raced any other instance's.
+    unserialized: bool,
 }
 
 impl SettingsStore {
@@ -204,25 +220,34 @@ impl SettingsStore {
     }
 
     pub fn open(path: Option<PathBuf>) -> Self {
-        let mut store =
-            Self { path: path.clone(), current: AppSettings::default(), writable: true, load_warning: None };
+        Self::with_lock(path, HSTRING::from(LOCK_NAME))
+    }
+
+    /// `open`, serialized by the mutex `lock_name` (tests use their own, so holding one
+    /// does not stall the others).
+    fn with_lock(path: Option<PathBuf>, lock_name: HSTRING) -> Self {
+        let mut store = Self { path: path.clone(), current: AppSettings::default(), load_warning: None, lock_name };
         if let Some(path) = path {
             store.read(&path);
         }
         store
     }
 
+    /// Under the same lock as `update`: reading and backing up race another instance's
+    /// startup or save just as writing does (two instances started together would each
+    /// find no backup yet and make one).
     fn read(&mut self, path: &Path) {
+        let _lock = SettingsLock::acquire(&self.lock_name);
         let parsed = match read_disk(path) {
             Ok(Some(parsed)) => parsed,
             Ok(None) => return,
             Err(e) => {
                 // Probably transient (a lock, a permission glitch). The file may be
-                // perfectly good, so it must not be overwritten with defaults.
+                // perfectly good, so it must not be overwritten with defaults — which
+                // `update` sees to by reading it again before every write.
                 log::error("SettingsStore.load", &e);
-                self.writable = false;
                 self.load_warning = Some(format!(
-                    "設定ファイルを読み込めなかったため、既定の設定で起動しました。元のファイルを守るため、この起動中は設定を保存しません。({e})"
+                    "設定ファイルを読み込めなかったため、既定の設定で起動しました。元のファイルを守るため、読み込めるようになるまで設定は保存しません。({e})"
                 ));
                 return;
             }
@@ -243,12 +268,13 @@ impl SettingsStore {
         self.current = settings;
         if let Some(problem) = problem {
             // The next save will drop whatever could not be read, so keep the original.
+            // A failed backup needs no flag: `update` finds the same file, tries again,
+            // and writes nothing until it succeeds.
             self.load_warning = Some(match back_up(path) {
                 Ok(backup) => format!("{problem}元のファイルは {} に保存してあります。", backup.display()),
                 Err(e) => {
                     log::error("SettingsStore.load backup", &e);
-                    self.writable = false;
-                    format!("{problem}元のファイルを退避できなかったため、この起動中は設定を保存しません。")
+                    format!("{problem}元のファイルを退避できなかったため、退避できるまで設定は保存しません。")
                 }
             });
         }
@@ -269,17 +295,27 @@ impl SettingsStore {
     /// `current` agree. A file that is now partly or wholly unreadable is backed up first,
     /// as at startup; one that cannot be read at all, or backed up, is left alone. The
     /// error is the reason nothing was written, already logged. `Ok(Some(notice))` means
-    /// written, but only after backing up a file that had gone bad: what could not be read
-    /// from it is gone from the settings, and `notice` tells the user where the original is.
+    /// written, with something the user should hear: the file had gone bad and was backed
+    /// up first (what could not be read from it was rewritten from `current`; the notice
+    /// says where the original is), or the write could not wait for another instance's
+    /// and may have raced it.
     pub fn update(&mut self, change: impl FnOnce(&mut AppSettings)) -> std::io::Result<Option<String>> {
         let result = self.write_with(change);
         if let Err(e) = &result {
             log::error("SettingsStore.update", e);
         }
-        result
+        result.map(|saved| {
+            let unserialized = saved.unserialized.then(|| {
+                "別の MyMDedit が設定を保存し終えるのを待ち切れなかったため、待たずに保存しました。同じときにそちらで変えた設定は、残っていないことがあります。".to_string()
+            });
+            match (saved.backup_notice, unserialized) {
+                (Some(a), Some(b)) => Some(format!("{a}{b}")),
+                (a, b) => a.or(b),
+            }
+        })
     }
 
-    fn write_with(&mut self, change: impl FnOnce(&mut AppSettings)) -> std::io::Result<Option<String>> {
+    fn write_with(&mut self, change: impl FnOnce(&mut AppSettings)) -> std::io::Result<Saved> {
         let apply = |mut base: AppSettings| {
             change(&mut base);
             base.sanitized()
@@ -288,24 +324,23 @@ impl SettingsStore {
             self.current = apply(self.current.clone());
             return Err(std::io::Error::other("APPDATA is not set"));
         };
-        if !self.writable {
-            self.current = apply(self.current.clone());
-            return Err(std::io::Error::other("skipped: the settings file could not be read at startup"));
-        }
-        let _lock = SettingsLock::acquire();
-        let mut notice = None;
+        let lock = SettingsLock::acquire(&self.lock_name);
+        let mut backup_notice = None;
+        // Read again every time, under the lock: this, not anything remembered from
+        // startup, decides whether the file may be replaced.
         let base = match read_disk(&path) {
             Ok(None) => self.current.clone(),
             Ok(Some(Parsed::Clean(s))) => s,
-            // What could be read is newer than our view; the rest is about to be dropped.
+            // What could be read is newer than our view; what could not is filled in from
+            // our view rather than the defaults, once the original is safe.
             Ok(Some(Parsed::Partial(s, fields))) => match back_up(&path) {
                 Ok(backup) => {
-                    notice = Some(format!(
-                        "設定ファイルの一部の項目（{}）を読み込めなかったため、既定値に戻しました。元のファイルは {} に保存してあります。",
+                    backup_notice = Some(format!(
+                        "設定ファイルの一部の項目（{}）を読み込めなかったため、その項目はいま画面にある値で書き直しました。元のファイルは {} に保存してあります。",
                         fields.join(", "),
                         backup.display()
                     ));
-                    s
+                    with_fields_from(s, &self.current, &fields)
                 }
                 Err(e) => {
                     self.current = apply(self.current.clone());
@@ -318,7 +353,7 @@ impl SettingsStore {
                 log::error("SettingsStore.update parse", &reason);
                 match back_up(&path) {
                     Ok(backup) => {
-                        notice = Some(format!(
+                        backup_notice = Some(format!(
                             "設定ファイルを読み込めなくなっていたため、いま画面にある設定で書き直しました。元のファイルは {} に保存してあります。",
                             backup.display()
                         ))
@@ -342,8 +377,27 @@ impl SettingsStore {
         }
         let json = serde_json::to_string_pretty(&self.current).map_err(std::io::Error::other)?;
         document::save_atomic(&path, &json, &SETTINGS_FILE_FORMAT)?;
-        Ok(notice)
+        Ok(Saved { backup_notice, unserialized: !lock.owned })
     }
+}
+
+/// `base` with the `fields` (JSON keys) taken from `from`: a partly unreadable file's lost
+/// fields filled in from what this instance has, instead of from the defaults.
+fn with_fields_from(base: AppSettings, from: &AppSettings, fields: &[String]) -> AppSettings {
+    let (Ok(serde_json::Value::Object(mut merged)), Ok(serde_json::Value::Object(ours))) =
+        (serde_json::to_value(&base), serde_json::to_value(from))
+    else {
+        log::error("settings merge", "the settings did not serialize to an object");
+        return base;
+    };
+    for key in fields {
+        if let Some(value) = ours.get(key) {
+            merged.insert(key.clone(), value.clone());
+        }
+    }
+    serde_json::from_value(serde_json::Value::Object(merged))
+        .inspect_err(|e| log::error("settings merge", e))
+        .unwrap_or(base)
 }
 
 const BACKUP_PREFIX: &str = "settings.broken-";
@@ -353,13 +407,18 @@ const BACKUP_PREFIX: &str = "settings.broken-";
 /// that has it either way. Checking the backups on disk (not a memory of the last one)
 /// is what keeps a file left broken from gaining a new backup on every launch.
 ///
-/// Streams rather than reads: the file may be far over `limits::MAX_FILE_BYTES` (that is
-/// one way to land here), and reading it whole could exhaust memory, which aborts the
-/// process with no crash log, on every launch.
+/// A file over `limits::MAX_FILE_BYTES` (one way to land here) is renamed instead, never
+/// copied or compared: copying gigabytes, and on the next launch comparing them, would
+/// keep the window from appearing, and hold the lock other instances wait on. Renamed
+/// away, it is not found again either.
 fn back_up(path: &Path) -> std::io::Result<PathBuf> {
     use std::io::Seek;
     let mut source = document::open_disk_file(path)?;
     let len = source.metadata()?.len();
+    if len > limits::MAX_FILE_BYTES {
+        drop(source);
+        return move_aside(path);
+    }
     if let Some(at) = existing_backup(path, &mut source, len) {
         return Ok(at);
     }
@@ -427,11 +486,7 @@ fn fill(r: &mut impl std::io::Read, buf: &mut [u8]) -> std::io::Result<usize> {
 /// the caller replaces the original next, and after a power cut an unflushed backup
 /// could be empty while the original is already gone.
 fn write_backup(path: &Path, source: &mut std::fs::File) -> std::io::Result<PathBuf> {
-    let secs = unix_seconds();
-    for n in 1..100 {
-        let name =
-            if n == 1 { format!("{BACKUP_PREFIX}{secs}.json") } else { format!("{BACKUP_PREFIX}{secs}-{n}.json") };
-        let backup = path.with_file_name(name);
+    for backup in backup_names(path) {
         match std::fs::File::create_new(&backup) {
             Ok(mut f) => {
                 if let Err(e) = std::io::copy(source, &mut f).and_then(|_| f.sync_all()) {
@@ -448,6 +503,35 @@ fn write_backup(path: &Path, source: &mut std::fs::File) -> std::io::Result<Path
         }
     }
     Err(std::io::Error::other("no free name for the settings backup"))
+}
+
+/// Renames `path` to the first free backup name; never replaces an earlier backup. Write
+/// through, as the copy is flushed: the caller writes a new file in its place next.
+fn move_aside(path: &Path) -> std::io::Result<PathBuf> {
+    for backup in backup_names(path) {
+        let moved = unsafe {
+            MoveFileExW(&HSTRING::from(path.as_os_str()), &HSTRING::from(backup.as_os_str()), MOVEFILE_WRITE_THROUGH)
+        }
+        .map_err(|e| std::io::Error::from_raw_os_error(e.code().0 & 0xFFFF));
+        match moved {
+            Ok(()) => return Ok(backup),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(std::io::Error::other("no free name for the settings backup"))
+}
+
+/// `settings.broken-<time>.json`, then `-2`, `-3`… for backups made within one second.
+fn backup_names(path: &Path) -> impl Iterator<Item = PathBuf> + '_ {
+    let secs = unix_seconds();
+    (1..100).map(move |n| {
+        path.with_file_name(if n == 1 {
+            format!("{BACKUP_PREFIX}{secs}.json")
+        } else {
+            format!("{BACKUP_PREFIX}{secs}-{n}.json")
+        })
+    })
 }
 
 /// What is on disk right now. `Ok(None)` = no file yet.
@@ -469,7 +553,8 @@ fn read_disk(path: &Path) -> std::io::Result<Option<Parsed>> {
 
 /// Serializes read-modify-write across running instances. Waiting is bounded: a
 /// wedged instance must not freeze this one, so after the timeout the write proceeds
-/// unserialized (still atomic per file; at worst the old last-writer-wins race).
+/// unserialized (still atomic per file; at worst the old last-writer-wins race), and
+/// `owned` says so, for `update` to tell the user.
 struct SettingsLock {
     handle: Option<HANDLE>,
     /// Whether the wait gave us the mutex: only then may it be released.
@@ -477,11 +562,11 @@ struct SettingsLock {
 }
 
 impl SettingsLock {
-    fn acquire() -> Self {
+    fn acquire(name: &HSTRING) -> Self {
         unsafe {
-            match CreateMutexW(None, false, w!("Local\\MyMDedit.Settings")) {
+            match CreateMutexW(None, false, name) {
                 Ok(h) => {
-                    let wait = WaitForSingleObject(h, 2000);
+                    let wait = WaitForSingleObject(h, limits::LOCK_TIMEOUT_MS);
                     // An abandoned mutex is ours all the same; its last owner died mid-write,
                     // which the atomic save already makes harmless.
                     let owned = wait == WAIT_OBJECT_0 || wait == WAIT_ABANDONED;
@@ -677,18 +762,23 @@ mod tests {
         let dir = test_dir("partial-update");
         let path = dir.join("settings.json");
         let mut store = SettingsStore::open(Some(path.clone()));
+        assert_eq!(store.update(|s| s.theme = Theme::Dark).unwrap(), None);
         // Hand-edited (or written by another version) after startup.
         std::fs::write(&path, r#"{"theme": "dark", "editor_font_size": 20}"#).unwrap();
         let notice = store.update(|s| s.recent_folders = vec!["C:\\x".into()]).unwrap();
         let reloaded = SettingsStore::open(Some(path.clone()));
         assert_eq!(reloaded.current().editor_font_size, 20.0);
         assert_eq!(reloaded.current().recent_folders, vec!["C:\\x"]);
+        // The field that could not be read keeps what this instance had, not the default.
+        assert_eq!(reloaded.current().theme, Theme::Dark);
+        assert_eq!(store.current().theme, Theme::Dark);
         assert_eq!(backups(&dir).len(), 1);
-        // The user hears that a field went back to its default, and where the original is.
+        // The user hears which field was rewritten from the screen, and where the original is.
         let notice = notice.expect("a backup is reported");
         assert!(notice.contains("theme") && notice.contains(&backups(&dir)[0]), "{notice}");
+        assert!(notice.contains("画面"), "{notice}");
         // Written clean now: the next change has nothing to report.
-        assert_eq!(store.update(|s| s.theme = Theme::Dark).unwrap(), None);
+        assert_eq!(store.update(|s| s.theme = Theme::Light).unwrap(), None);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -747,17 +837,120 @@ mod tests {
     }
 
     #[test]
-    fn an_oversized_file_is_backed_up_whole() {
+    fn an_oversized_file_is_moved_aside_whole_not_copied() {
         let dir = test_dir("oversized-backup");
         let path = dir.join("settings.json");
         let mut big = vec![b' '; limits::MAX_FILE_BYTES as usize * 3];
         big.extend_from_slice(b"tail");
         std::fs::write(&path, &big).unwrap();
-        SettingsStore::open(Some(path.clone()));
-        SettingsStore::open(Some(path.clone()));
+        let warning = SettingsStore::open(Some(path.clone())).take_load_warning().unwrap();
         let names = backups(&dir);
         assert_eq!(names.len(), 1);
+        assert!(warning.contains(&names[0]), "{warning}");
+        // Renamed rather than copied: nothing is left to compare against on the next launch.
+        assert!(!path.exists());
         assert!(std::fs::read(dir.join(&names[0])).unwrap() == big);
+        let mut again = SettingsStore::open(Some(path.clone()));
+        assert_eq!(again.take_load_warning(), None);
+        assert_eq!(backups(&dir).len(), 1);
+        // The next save starts a fresh file beside the backup.
+        assert_eq!(again.update(|s| s.theme = Theme::Dark).unwrap(), None);
+        assert_eq!(SettingsStore::open(Some(path)).current().theme, Theme::Dark);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn an_oversized_file_is_moved_aside_on_update_too() {
+        let dir = test_dir("oversized-update");
+        let path = dir.join("settings.json");
+        let mut store = SettingsStore::open(Some(path.clone()));
+        let big = vec![b' '; limits::MAX_FILE_BYTES as usize + 1];
+        std::fs::write(&path, &big).unwrap();
+        let notice = store.update(|s| s.theme = Theme::Dark).unwrap().expect("the backup is reported");
+        let names = backups(&dir);
+        assert_eq!(names.len(), 1);
+        assert!(notice.contains(&names[0]), "{notice}");
+        assert!(std::fs::read(dir.join(&names[0])).unwrap() == big);
+        assert_eq!(SettingsStore::open(Some(path)).current().theme, Theme::Dark);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_file_unreadable_only_at_startup_is_saved_to_once_it_is_readable() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let dir = test_dir("transient");
+        let path = dir.join("settings.json");
+        std::fs::write(&path, r#"{"editor_font_size": 20, "table_row_striping": true}"#).unwrap();
+        // Opened with no sharing: the startup read fails as it would under another
+        // program's lock.
+        let held = std::fs::OpenOptions::new().read(true).share_mode(0).open(&path).unwrap();
+        let mut store = SettingsStore::open(Some(path.clone()));
+        assert!(store.take_load_warning().is_some());
+        assert_eq!(store.current(), &AppSettings::default());
+        drop(held);
+        assert_eq!(store.update(|s| s.theme = Theme::Dark).unwrap(), None);
+        // Built on the file, not on the defaults this instance started with.
+        let reloaded = SettingsStore::open(Some(path));
+        assert_eq!(reloaded.current().theme, Theme::Dark);
+        assert_eq!(reloaded.current().editor_font_size, 20.0);
+        assert!(reloaded.current().table_row_striping);
+        assert_eq!(store.current(), reloaded.current());
+        assert!(backups(&dir).is_empty());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn instances_starting_together_back_up_a_broken_file_once() {
+        for round in 0..10 {
+            let dir = test_dir(&format!("startup-race-{round}"));
+            let path = dir.join("settings.json");
+            std::fs::write(&path, "{\"theme\": \"Dark\",}").unwrap();
+            let start = std::sync::Arc::new(std::sync::Barrier::new(4));
+            let threads: Vec<_> = (0..4)
+                .map(|_| {
+                    let (path, start) = (path.clone(), start.clone());
+                    std::thread::Builder::new()
+                        .spawn(move || {
+                            start.wait();
+                            SettingsStore::open(Some(path)).take_load_warning()
+                        })
+                        .unwrap()
+                })
+                .collect();
+            for t in threads {
+                assert!(t.join().unwrap().is_some());
+            }
+            assert_eq!(backups(&dir).len(), 1, "round {round}: {:?}", backups(&dir));
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_save_that_could_not_wait_for_the_lock_says_so() {
+        let dir = test_dir("lock-timeout");
+        let path = dir.join("settings.json");
+        let name = HSTRING::from(format!("Local\\MyMDedit.Settings.test-{}-{}", std::process::id(), unix_seconds()));
+        let mut store = SettingsStore::with_lock(Some(path.clone()), name.clone());
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::Builder::new()
+            .spawn(move || {
+                // A wedged instance: holds the mutex past the timeout.
+                let lock = SettingsLock::acquire(&name);
+                held_tx.send(lock.owned).unwrap();
+                let _ = done_rx.recv();
+                drop(lock);
+            })
+            .unwrap();
+        assert!(held_rx.recv().unwrap());
+        let notice = store.update(|s| s.theme = Theme::Dark).unwrap();
+        done_tx.send(()).unwrap();
+        holder.join().unwrap();
+        // Written all the same, and the caller is told it was not serialized.
+        assert!(notice.as_deref().is_some_and(|n| n.contains("待ち切れ")), "{notice:?}");
+        assert_eq!(SettingsStore::open(Some(path)).current().theme, Theme::Dark);
+        // Once the lock is free again, a save has nothing to report.
+        assert_eq!(store.update(|s| s.theme = Theme::Light).unwrap(), None);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
