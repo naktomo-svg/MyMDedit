@@ -114,7 +114,7 @@ pub fn system_prefers_dark() -> bool {
 enum AppModeApi {
     /// 1903 (18362) and later: SetPreferredAppMode(AppMode); 2 = ForceDark, 3 = ForceLight.
     PreferredAppMode,
-    /// 1809 (17763): AllowDarkModeForApp(BOOL).
+    /// 1809 (17763): AllowDarkModeForApp(bool).
     AllowDarkModeForApp,
     /// Older, or unknown: the ordinals are not the functions this code means.
     None,
@@ -201,10 +201,15 @@ struct DarkModeApi {
 fn dark_mode_api() -> &'static DarkModeApi {
     static API: OnceLock<DarkModeApi> = OnceLock::new();
     API.get_or_init(|| {
-        let app_mode = windows_build().map_or(AppModeApi::None, app_mode_api);
+        let build = windows_build();
+        let app_mode = build.map_or(AppModeApi::None, app_mode_api);
         let none = DarkModeApi { set_app_mode: None, flush_menu_themes: None, allow_for_window: None };
         if app_mode == AppModeApi::None {
-            crate::log::error("dark_mode_api", "unknown Windows build; menus and scrollbars stay light");
+            let why = match build {
+                Some(b) => format!("Windows build {b} predates 1809 (17763)"),
+                None => "the Windows build number could not be read".to_owned(),
+            };
+            crate::log::error("dark_mode_api", format!("{why}; menus and scrollbars stay light"));
             return none;
         }
         // Never freed: the pointers are used for the life of the process.
