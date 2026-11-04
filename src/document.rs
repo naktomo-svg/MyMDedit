@@ -6,9 +6,11 @@
 //! loses its BOM and a LF file comes back from a one-line edit with every line changed —
 //! so do not add a read or save path that drops it.
 
+use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs;
 use std::io::{self, Write};
+use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::os::windows::io::AsRawHandle;
 use std::path::{Path, PathBuf};
 
@@ -316,10 +318,10 @@ pub fn save_atomic(path: &Path, content: &str, format: &DocumentFormat) -> io::R
     let dir = full
         .parent()
         .ok_or_else(|| io::Error::other(format!("保存先のフォルダを特定できませんでした: {}", path.display())))?;
-    let file_name = full.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    let temp = dir.join(format!("{file_name}.{:016x}.tmp", random_u64()));
+    let file_name = full.file_name().unwrap_or_default();
+    let temp = dir.join(sibling_name(file_name, &format!(".{:016x}.tmp", random_u64())));
 
-    let backup = dir.join(format!("{file_name}.{:016x}.bak", random_u64()));
+    let backup = dir.join(sibling_name(file_name, &format!(".{:016x}.bak", random_u64())));
 
     let bytes = encode(&line_endings::normalize(content, format.line_ending), format);
     let existed = full.exists();
@@ -346,6 +348,25 @@ pub fn save_atomic(path: &Path, content: &str, format: &DocumentFormat) -> io::R
         _ => remove_if_exists(&temp),
     }
     result
+}
+
+/// The longest a single path component may be (NTFS, FAT32, exFAT), in UTF-16 units.
+/// `longPathAware` lifts the limit on the whole path only, not this one.
+const MAX_COMPONENT_UNITS: usize = 255;
+
+/// `file_name` followed by `suffix`, as the name of a file next to it. The original name
+/// is cut short (counted in UTF-16 units, never between the halves of a surrogate pair) so
+/// the result never exceeds a path component's limit: a name that is already near the
+/// limit must still be savable, and appending to it in full made that impossible.
+fn sibling_name(file_name: &OsStr, suffix: &str) -> OsString {
+    let suffix: Vec<u16> = suffix.encode_utf16().collect();
+    let mut units: Vec<u16> = file_name.encode_wide().collect();
+    units.truncate(MAX_COMPONENT_UNITS.saturating_sub(suffix.len()));
+    if units.last().is_some_and(|u| (0xD800..0xDC00).contains(u)) {
+        units.pop();
+    }
+    units.extend(suffix);
+    OsString::from_wide(&units)
 }
 
 /// The file a symbolic link at `full` points to, or `full` itself. The save swaps a new
@@ -627,5 +648,39 @@ mod tests {
         save_atomic(&new_path, "x", &DocumentFormat::default()).unwrap();
         assert_eq!(fs::read(&new_path).unwrap(), b"x");
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_file_with_a_long_name_can_be_saved_over() {
+        // NTFS caps each path component at 255 UTF-16 units; the temp and backup names
+        // used to be the whole name plus 21, so any name past 234 could not be saved.
+        let dir = temp_dir();
+        let path = dir.join(format!("{}.md", "a".repeat(237)));
+        assert_eq!(path.file_name().unwrap().len(), 240);
+        fs::write(&path, "old").unwrap();
+        save_atomic(&path, "new", &DocumentFormat::default()).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"new");
+        // Neither the temp file nor the backup is left behind.
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn sibling_names_stay_within_the_component_limit() {
+        let suffix = ".0123456789abcdef.tmp";
+        // A short name is kept whole.
+        assert_eq!(sibling_name(OsStr::new("a.md"), suffix), OsString::from(format!("a.md{suffix}")));
+        // A long one is cut so the result is exactly at the limit.
+        let long = sibling_name(OsStr::new(&"a".repeat(255)), suffix);
+        assert_eq!(long.encode_wide().count(), MAX_COMPONENT_UNITS);
+        assert!(long.to_str().unwrap().ends_with(suffix));
+        // Counted in UTF-16 units: each 日 is one unit (three UTF-8 bytes).
+        let cjk = sibling_name(OsStr::new(&"日".repeat(250)), suffix);
+        assert_eq!(cjk.encode_wide().count(), MAX_COMPONENT_UNITS);
+        // A surrogate pair straddling the cut is dropped whole, never halved.
+        let cut = MAX_COMPONENT_UNITS - suffix.len();
+        let name = format!("{}😀b", "a".repeat(cut - 1));
+        let s = sibling_name(OsStr::new(&name), suffix).into_string().expect("a surrogate pair was split");
+        assert_eq!(s, format!("{}{suffix}", "a".repeat(cut - 1)));
     }
 }
