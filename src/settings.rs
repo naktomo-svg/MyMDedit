@@ -197,6 +197,10 @@ pub struct SettingsStore {
     load_warning: Option<String>,
     /// The named mutex that serializes reading and writing the file across instances.
     lock_name: HSTRING,
+    /// Whether the user has heard that the mutex itself could not be used. Unlike a wait
+    /// that ran out, that is no passing event and would recur on every save, so it is
+    /// said once per session (and logged every time).
+    told_lock_unavailable: bool,
 }
 
 const LOCK_NAME: &str = "Local\\MyMDedit.Settings";
@@ -205,8 +209,8 @@ const LOCK_NAME: &str = "Local\\MyMDedit.Settings";
 struct Saved {
     /// The file had gone bad and was backed up first; what the user is told about it.
     backup_notice: Option<String>,
-    /// The lock could not be had in time, so this write raced any other instance's.
-    unserialized: bool,
+    /// Anything but `Owned`: this write was not serialized with other instances'.
+    lock: LockState,
 }
 
 impl SettingsStore {
@@ -226,7 +230,13 @@ impl SettingsStore {
     /// `open`, serialized by the mutex `lock_name` (tests use their own, so holding one
     /// does not stall the others).
     fn with_lock(path: Option<PathBuf>, lock_name: HSTRING) -> Self {
-        let mut store = Self { path: path.clone(), current: AppSettings::default(), load_warning: None, lock_name };
+        let mut store = Self {
+            path: path.clone(),
+            current: AppSettings::default(),
+            load_warning: None,
+            lock_name,
+            told_lock_unavailable: false,
+        };
         if let Some(path) = path {
             store.read(&path);
         }
@@ -236,6 +246,11 @@ impl SettingsStore {
     /// Under the same lock as `update`: reading and backing up race another instance's
     /// startup or save just as writing does (two instances started together would each
     /// find no backup yet and make one).
+    ///
+    /// A lock not had here is logged but not shown: unserialized, a startup read can at
+    /// worst add a second backup holding the same content (saves are atomic, so what is
+    /// read is a whole file), and loses no setting. The save that could lose one is the
+    /// one `update` reports.
     fn read(&mut self, path: &Path) {
         let _lock = SettingsLock::acquire(&self.lock_name);
         let parsed = match read_disk(path) {
@@ -297,17 +312,28 @@ impl SettingsStore {
     /// error is the reason nothing was written, already logged. `Ok(Some(notice))` means
     /// written, with something the user should hear: the file had gone bad and was backed
     /// up first (what could not be read from it was rewritten from `current`; the notice
-    /// says where the original is), or the write could not wait for another instance's
-    /// and may have raced it.
+    /// says where the original is), or the write was not serialized with other instances'
+    /// and may have raced one: because the wait for the lock ran out (said every time), or
+    /// because the lock could not be used at all (said once per session).
     pub fn update(&mut self, change: impl FnOnce(&mut AppSettings)) -> std::io::Result<Option<String>> {
         let result = self.write_with(change);
         if let Err(e) = &result {
             log::error("SettingsStore.update", e);
         }
         result.map(|saved| {
-            let unserialized = saved.unserialized.then(|| {
-                "別の MyMDedit が設定を保存し終えるのを待ち切れなかったため、待たずに保存しました。同じときにそちらで変えた設定は、残っていないことがあります。".to_string()
-            });
+            let unserialized = match saved.lock {
+                LockState::Owned => None,
+                LockState::TimedOut => Some(
+                    "別の MyMDedit が設定を保存し終えるのを待ち切れなかったため、待たずに保存しました。同じときにそちらで変えた設定は、残っていないことがあります。".to_string(),
+                ),
+                LockState::Unavailable if self.told_lock_unavailable => None,
+                LockState::Unavailable => {
+                    self.told_lock_unavailable = true;
+                    Some(
+                        "ほかの MyMDedit と設定の保存の順番をそろえる仕組みを使えなかったため、順番を待たずに保存しました。この起動中はこのまま保存します(このお知らせは一度だけ出します)。複数の MyMDedit で同時に設定を変えると、一方の変更が残らないことがあります。".to_string(),
+                    )
+                }
+            };
             match (saved.backup_notice, unserialized) {
                 (Some(a), Some(b)) => Some(format!("{a}{b}")),
                 (a, b) => a.or(b),
@@ -377,7 +403,7 @@ impl SettingsStore {
         }
         let json = serde_json::to_string_pretty(&self.current).map_err(std::io::Error::other)?;
         document::save_atomic(&path, &json, &SETTINGS_FILE_FORMAT)?;
-        Ok(Saved { backup_notice, unserialized: !lock.owned })
+        Ok(Saved { backup_notice, lock: lock.state })
     }
 }
 
@@ -554,11 +580,20 @@ fn read_disk(path: &Path) -> std::io::Result<Option<Parsed>> {
 /// Serializes read-modify-write across running instances. Waiting is bounded: a
 /// wedged instance must not freeze this one, so after the timeout the write proceeds
 /// unserialized (still atomic per file; at worst the old last-writer-wins race), and
-/// `owned` says so, for `update` to tell the user.
+/// `state` says so — and why — for `update` to tell the user.
 struct SettingsLock {
     handle: Option<HANDLE>,
-    /// Whether the wait gave us the mutex: only then may it be released.
-    owned: bool,
+    state: LockState,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LockState {
+    /// The wait gave us the mutex: only then may it be released.
+    Owned,
+    /// Another instance held it past `limits::LOCK_TIMEOUT_MS`.
+    TimedOut,
+    /// The mutex could not be created or waited on at all (not a wait that ran out).
+    Unavailable,
 }
 
 impl SettingsLock {
@@ -569,20 +604,20 @@ impl SettingsLock {
                     let wait = WaitForSingleObject(h, limits::LOCK_TIMEOUT_MS);
                     // An abandoned mutex is ours all the same; its last owner died mid-write,
                     // which the atomic save already makes harmless.
-                    let owned = wait == WAIT_OBJECT_0 || wait == WAIT_ABANDONED;
-                    if !owned {
-                        let reason = if wait == WAIT_TIMEOUT {
-                            "timed out; writing unserialized".to_string()
-                        } else {
-                            windows::core::Error::from_thread().to_string()
-                        };
-                        log::error("SettingsLock wait", reason);
-                    }
-                    Self { handle: Some(h), owned }
+                    let state = if wait == WAIT_OBJECT_0 || wait == WAIT_ABANDONED {
+                        LockState::Owned
+                    } else if wait == WAIT_TIMEOUT {
+                        log::error("SettingsLock wait", "timed out; writing unserialized");
+                        LockState::TimedOut
+                    } else {
+                        log::error("SettingsLock wait", windows::core::Error::from_thread());
+                        LockState::Unavailable
+                    };
+                    Self { handle: Some(h), state }
                 }
                 Err(e) => {
                     log::error("SettingsLock", &e);
-                    Self { handle: None, owned: false }
+                    Self { handle: None, state: LockState::Unavailable }
                 }
             }
         }
@@ -593,7 +628,7 @@ impl Drop for SettingsLock {
     fn drop(&mut self) {
         if let Some(h) = self.handle {
             unsafe {
-                if self.owned
+                if self.state == LockState::Owned
                     && let Err(e) = ReleaseMutex(h)
                 {
                     log::error("SettingsLock release", &e);
@@ -900,6 +935,90 @@ mod tests {
     }
 
     #[test]
+    fn a_file_still_unreadable_at_update_is_left_alone() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let dir = test_dir("still-unreadable");
+        let path = dir.join("settings.json");
+        let original = r#"{"editor_font_size": 20}"#;
+        std::fs::write(&path, original).unwrap();
+        let held = std::fs::OpenOptions::new().read(true).share_mode(0).open(&path).unwrap();
+        let mut store = SettingsStore::open(Some(path.clone()));
+        assert!(store.take_load_warning().is_some());
+        assert!(store.update(|s| s.theme = Theme::Dark).is_err());
+        // The screen keeps the change; the file we never saw is not replaced.
+        assert_eq!(store.current().theme, Theme::Dark);
+        drop(held);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        assert!(backups(&dir).is_empty());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn an_oversized_file_that_cannot_be_moved_aside_is_not_overwritten() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let dir = test_dir("oversized-held");
+        let path = dir.join("settings.json");
+        let big = vec![b' '; limits::MAX_FILE_BYTES as usize + 10];
+        std::fs::write(&path, &big).unwrap();
+        // Read and write sharing but no FILE_SHARE_DELETE: the rename must fail.
+        const FILE_SHARE_READ_WRITE: u32 = 1 | 2;
+        let held = std::fs::OpenOptions::new().read(true).share_mode(FILE_SHARE_READ_WRITE).open(&path).unwrap();
+        let mut store = SettingsStore::open(Some(path.clone()));
+        assert!(store.take_load_warning().is_some_and(|w| w.contains("退避できなかった")));
+        assert!(store.update(|s| s.theme = Theme::Dark).is_err());
+        assert!(std::fs::read(&path).unwrap() == big);
+        assert!(backups(&dir).is_empty());
+        drop(held);
+        // Once it can be moved, the next save does so and writes.
+        assert!(store.update(|s| s.theme = Theme::Light).unwrap().is_some());
+        assert_eq!(backups(&dir).len(), 1);
+        assert_eq!(SettingsStore::open(Some(path)).current().theme, Theme::Light);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn moving_aside_skips_names_already_taken() {
+        let dir = test_dir("move-names");
+        let path = dir.join("settings.json");
+        // Both this second and the next are taken twice, in case the clock ticks over.
+        let secs = unix_seconds();
+        for s in [secs, secs + 1] {
+            std::fs::write(dir.join(format!("{BACKUP_PREFIX}{s}.json")), "a").unwrap();
+            std::fs::write(dir.join(format!("{BACKUP_PREFIX}{s}-2.json")), "b").unwrap();
+        }
+        let big = vec![b' '; limits::MAX_FILE_BYTES as usize + 10];
+        std::fs::write(&path, &big).unwrap();
+        let moved = back_up(&path).unwrap();
+        let name = moved.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(name.ends_with("-3.json"), "{name}");
+        assert!(std::fs::read(&moved).unwrap() == big);
+        for s in [secs, secs + 1] {
+            assert_eq!(std::fs::read_to_string(dir.join(format!("{BACKUP_PREFIX}{s}.json"))).unwrap(), "a");
+            assert_eq!(std::fs::read_to_string(dir.join(format!("{BACKUP_PREFIX}{s}-2.json"))).unwrap(), "b");
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_lock_that_cannot_be_used_is_reported_once_not_as_a_timeout() {
+        use windows::Win32::System::Threading::CreateEventW;
+        let dir = test_dir("lock-unavailable");
+        let path = dir.join("settings.json");
+        let name = HSTRING::from(format!("Local\\MyMDedit.Settings.test-ev-{}-{}", std::process::id(), unix_seconds()));
+        // An event already holding the name: CreateMutexW fails (ERROR_INVALID_HANDLE).
+        let event = unsafe { CreateEventW(None, true, false, &name) }.unwrap();
+        assert_eq!(SettingsLock::acquire(&name).state, LockState::Unavailable);
+        let mut store = SettingsStore::with_lock(Some(path.clone()), name);
+        let first = store.update(|s| s.theme = Theme::Dark).unwrap();
+        assert!(first.as_deref().is_some_and(|n| n.contains("仕組み") && !n.contains("待ち切れ")), "{first:?}");
+        // Written all the same, and not said again on every save.
+        assert_eq!(store.update(|s| s.theme = Theme::Light).unwrap(), None);
+        assert_eq!(SettingsStore::open(Some(path)).current().theme, Theme::Light);
+        unsafe { CloseHandle(event) }.unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn instances_starting_together_back_up_a_broken_file_once() {
         for round in 0..10 {
             let dir = test_dir(&format!("startup-race-{round}"));
@@ -937,7 +1056,7 @@ mod tests {
             .spawn(move || {
                 // A wedged instance: holds the mutex past the timeout.
                 let lock = SettingsLock::acquire(&name);
-                held_tx.send(lock.owned).unwrap();
+                held_tx.send(lock.state == LockState::Owned).unwrap();
                 let _ = done_rx.recv();
                 drop(lock);
             })
