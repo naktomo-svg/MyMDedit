@@ -41,6 +41,29 @@ function Write-CacheEntry {
     Move-Item -LiteralPath $tempPath -Destination $Path -Force
 }
 
+# Runs $Action with UTF-8 on both sides of a native command's pipes, then restores the
+# previous encodings (also on throw). PowerShell decodes a native command's stdout/stderr
+# with [Console]::OutputEncoding (the console code page, e.g. shift_jis) and encodes what
+# it pipes in with $OutputEncoding; claude and cargo speak UTF-8, so anything else garbles
+# non-ASCII text and can break the JSON claude returns.
+function Invoke-WithUtf8Console {
+    param(
+        [Parameter(Mandatory)] [scriptblock]$Action
+    )
+    $savedConsoleEncoding = [Console]::OutputEncoding
+    $savedPipeEncoding = $global:OutputEncoding
+    $utf8 = [System.Text.UTF8Encoding]::new($false)
+    try {
+        [Console]::OutputEncoding = $utf8
+        $global:OutputEncoding = $utf8
+        & $Action
+    }
+    finally {
+        [Console]::OutputEncoding = $savedConsoleEncoding
+        $global:OutputEncoding = $savedPipeEncoding
+    }
+}
+
 function Get-TargetFiles {
     param(
         [Parameter(Mandatory)] [string]$RepoRoot
@@ -139,7 +162,9 @@ function Get-ClippyFindings {
     Push-Location $RepoRoot
     try {
         # cargo prints diagnostics on stderr; merge it so they are captured.
-        $output = & $cargo clippy --all-targets --message-format short --color never 2>&1 | ForEach-Object { "$_" }
+        $output = Invoke-WithUtf8Console {
+            & $cargo clippy --all-targets --message-format short --color never 2>&1 | ForEach-Object { "$_" }
+        }
         $exitCode = $LASTEXITCODE
     }
     finally {
@@ -192,7 +217,9 @@ function Invoke-ClaudeReview {
         [string]$ClaudeCommand = 'claude'
     )
 
-    $raw = $Content | & $ClaudeCommand --print --output-format json --model $Model --effort $Effort $Prompt
+    $raw = Invoke-WithUtf8Console {
+        $Content | & $ClaudeCommand --print --output-format json --model $Model --effort $Effort $Prompt
+    }
     if ($LASTEXITCODE -ne 0) {
         throw "$ClaudeCommand exited with code $LASTEXITCODE"
     }
