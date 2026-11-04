@@ -403,18 +403,16 @@ enum OpenBlock {
 }
 
 /// HTML block type 1's tag names. Its other types are not tracked (see `headings`).
-const HTML_RAW_TAGS: [&str; 4] = ["pre", "script", "style", "textarea"];
+const HTML_RAW_TAGS: [&[u8]; 4] = [b"pre", b"script", b"style", b"textarea"];
 
 fn is_space_or_tab(c: u16) -> bool {
     c == b' ' as u16 || c == b'\t' as u16
 }
 
-/// Whether `hay` holds the ASCII `needle`, ignoring ASCII case.
-fn contains_ascii_ci(hay: &[u16], needle: &str) -> bool {
-    let needle: Vec<u16> = needle.encode_utf16().collect();
-    hay.windows(needle.len()).any(|win| {
-        win.iter().zip(&needle).all(|(&h, &n)| u8::try_from(h).is_ok_and(|h| h.eq_ignore_ascii_case(&(n as u8))))
-    })
+/// Whether `text` starts with the ASCII `prefix`, ignoring ASCII case.
+fn starts_with_ascii_ci(text: &[u16], prefix: &[u8]) -> bool {
+    text.len() >= prefix.len()
+        && text.iter().zip(prefix).all(|(&c, p)| u8::try_from(c).is_ok_and(|c| c.eq_ignore_ascii_case(p)))
 }
 
 /// Whether `rest` (a line from its first non-space) starts an HTML block of type 1:
@@ -423,23 +421,44 @@ fn starts_raw_html(rest: &[u16]) -> bool {
     rest.first() == Some(&(b'<' as u16))
         && HTML_RAW_TAGS.iter().any(|tag| {
             let name = &rest[1..];
-            name.len() >= tag.len()
-                && name.iter().zip(tag.bytes()).all(|(&c, t)| u8::try_from(c).is_ok_and(|c| c.eq_ignore_ascii_case(&t)))
+            starts_with_ascii_ci(name, tag)
                 && name.get(tag.len()).is_none_or(|&c| is_space_or_tab(c) || c == b'>' as u16)
         })
 }
 
+/// Whether `line` holds an end tag of HTML block type 1 (`</pre>` and the like). One pass
+/// over the line and no allocation: it runs on every line of an open block.
 fn ends_raw_html(line: &[u16]) -> bool {
-    HTML_RAW_TAGS.iter().any(|tag| contains_ascii_ci(line, &format!("</{tag}>")))
+    (0..line.len()).any(|p| {
+        line[p] == b'<' as u16
+            && line.get(p + 1) == Some(&(b'/' as u16))
+            && HTML_RAW_TAGS.iter().any(|tag| {
+                let name = &line[p + 2..];
+                starts_with_ascii_ci(name, tag) && name.get(tag.len()) == Some(&(b'>' as u16))
+            })
+    })
 }
 
-/// Whether `rest` is a thematic break (`- - -`, `***`, `___`), which is not a list item
-/// even though it can start with `- `.
-fn is_thematic_break(rest: &[u16]) -> bool {
-    b"-*_".iter().any(|&c| {
-        rest.iter().all(|&x| x == c as u16 || is_space_or_tab(x))
-            && rest.iter().filter(|&&x| x == c as u16).count() >= 3
-    })
+/// The offsets in `line` from which the rest of the line is a thematic break (`- - -`,
+/// `***`, `___`): those are not list items even though they can start with `- `. Found
+/// once per line, from its end, so asking at each of the line's list markers stays O(1)
+/// (`- - - … - a` is one line with as many markers as it likes).
+fn thematic_break_starts(line: &[u16]) -> Option<std::ops::RangeInclusive<usize>> {
+    let end = line.len() - line.iter().rev().take_while(|&&c| is_space_or_tab(c)).count();
+    let c = *line[..end].last().filter(|&&c| b"-*_".iter().any(|&b| u16::from(b) == c))?;
+    // Walking back: where the run of `c`s and blanks begins, and where the third `c` from
+    // the end is (a break needs three).
+    let (mut start, mut count, mut third) = (end, 0, None);
+    while start > 0 && (line[start - 1] == c || is_space_or_tab(line[start - 1])) {
+        start -= 1;
+        if line[start] == c {
+            count += 1;
+            if count == 3 {
+                third = Some(start);
+            }
+        }
+    }
+    Some(start..=third?)
 }
 
 /// If `rest` (a line from its first non-space) starts a list item, how far from its
@@ -447,13 +466,10 @@ fn is_thematic_break(rest: &[u16]) -> bool {
 /// `)`), then 1 to 4 spaces; just one when there are 5 or more (the content is indented
 /// code) or the line ends after the marker.
 fn list_item_content(rest: &[u16]) -> Option<usize> {
-    if is_thematic_break(rest) {
-        return None;
-    }
     let marker = match rest.first().and_then(|&c| char::from_u32(c.into())) {
         Some('-' | '+' | '*') => 1,
         Some('0'..='9') => {
-            let digits = rest.iter().take_while(|&&c| (b'0' as u16..=b'9' as u16).contains(&c)).count();
+            let digits = rest.iter().take(10).take_while(|&&c| (b'0' as u16..=b'9' as u16).contains(&c)).count();
             if digits > 9 || !matches!(rest.get(digits), Some(&c) if c == b'.' as u16 || c == b')' as u16) {
                 return None;
             }
@@ -461,7 +477,7 @@ fn list_item_content(rest: &[u16]) -> Option<usize> {
         }
         _ => return None,
     };
-    let spaces = rest[marker..].iter().take_while(|&&c| c == b' ' as u16).count();
+    let spaces = rest[marker..].iter().take(5).take_while(|&&c| c == b' ' as u16).count();
     match rest.get(marker) {
         None => Some(marker + 1),
         Some(&c) if c == b' ' as u16 => {
@@ -531,6 +547,7 @@ fn scan_line(
     // From the innermost item's content column, past any list markers that start items
     // on this line (`- - # a`); `None` when what is left is indented code.
     let mut col = items.last().copied().unwrap_or(0);
+    let thematic = thematic_break_starts(line);
     let rest = loop {
         let from = line.get(col..).unwrap_or(&[]);
         let indent = from.iter().take(4).take_while(|&&c| c == b' ' as u16).count();
@@ -539,6 +556,7 @@ fn scan_line(
         }
         let rest = &from[indent..];
         if open.is_none()
+            && !thematic.as_ref().is_some_and(|t| t.contains(&(col + indent)))
             && let Some(content) = list_item_content(rest)
         {
             col += indent + content;
@@ -926,6 +944,24 @@ mod tests {
         assert_eq!(outline_as_preview("-# a\r1234567890. # b\r# yes"), ["yes"]);
         // Five spaces after the marker make the content indented code.
         assert_eq!(outline_as_preview("-     # not\r# yes"), ["yes"]);
+        // A thematic break after a marker is the item's content, not another item.
+        assert_eq!(outline_as_preview("* - - -\r      # not\r  # in item\r# yes"), ["in item", "yes"]);
+    }
+
+    #[test]
+    fn a_line_of_many_list_markers_takes_linear_time() {
+        // Each marker used to rescan the rest of the line for a thematic break: 100000 of
+        // them took 6 s in a release build, on the UI thread. Linear, the whole text takes
+        // about 60 ms in a debug build; the bound leaves a slow machine 50 times that and
+        // is still half of what the quadratic version needed optimized.
+        let n = 100_000;
+        let t = ["- ".repeat(n) + "# a", "- ".repeat(n) + "* * *", "<pre>".to_string(), "</pre> ".repeat(n)].join("\r");
+        let t = w(&t);
+        let started = std::time::Instant::now();
+        let found = headings(&t);
+        let elapsed = started.elapsed();
+        assert_eq!(found.into_iter().map(|h| h.title).collect::<Vec<_>>(), ["a"]);
+        assert!(elapsed < std::time::Duration::from_secs(3), "{n} markers took {elapsed:?}");
     }
 
     #[test]
