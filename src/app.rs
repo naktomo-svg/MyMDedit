@@ -1525,8 +1525,18 @@ impl App {
         // only covers the case where no notification came.
         self.request_render();
         drop(suppress);
-        self.state.borrow_mut().doc.mark_clean();
+        self.mark_clean();
         self.update_title();
+    }
+
+    /// The document no longer has unsaved changes (read, saved, or replaced). Every such
+    /// change comes through here, so a shutdown block reason registered while it was
+    /// dirty (`on_query_end_session`) never outlives the changes it was about.
+    fn mark_clean(&self) {
+        let was_dirty = self.state.borrow_mut().doc.mark_clean();
+        if was_dirty {
+            self.release_shutdown_block();
+        }
     }
 
     fn set_zoom(&self, zoom: i32) {
@@ -2054,9 +2064,8 @@ impl App {
     /// is now ours.
     fn record_saved(&self, path: &Path, format: DocumentFormat) {
         let stamp = document::stamp(path).inspect_err(|e| log::error("record_saved stamp", e)).ok();
-        let mut st = self.state.borrow_mut();
-        st.doc.set_document(Some(path.to_path_buf()), format, stamp);
-        st.doc.mark_clean();
+        self.state.borrow_mut().doc.set_document(Some(path.to_path_buf()), format, stamp);
+        self.mark_clean();
     }
 
     /// The window was activated: has another program changed or removed the open file?
@@ -2153,7 +2162,8 @@ impl App {
                 .inspect_err(|e| log::error("ShutdownBlockReasonCreate", e));
         }
         // Another modal dialog is already up: don't stack a prompt on it. The block
-        // reason stays, so the user sees why and can choose there.
+        // reason stays, so the user sees why and can choose there; it goes once the
+        // document is clean again (`mark_clean`) or the session is cancelled.
         let Some(busy) = self.try_busy() else { return false };
         // An undisplayable prompt blocks rather than discards: the shutdown screen still
         // lets the user end the session deliberately.
