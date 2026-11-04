@@ -63,9 +63,9 @@ pub struct Preview {
     /// rest of the session. Unlike `ready`, nothing ever clears it — not a crash restart,
     /// which would otherwise configure a fresh controller and set `ready` once more.
     stopped: bool,
-    /// Counts `start` calls. Creating a controller is asynchronous, so a second start
-    /// (a duplicated crash notice, say) can be in flight beside the first; only the
-    /// controller of the newest one is kept.
+    /// Counts `start` and `close` calls. Creating a controller is asynchronous, so a
+    /// second start (a duplicated crash notice, say) can be in flight beside the first;
+    /// only the controller of the newest one is kept, and none after a close.
     generation: u32,
     /// Navigations this app started that have not reached NavigationStarting yet — the
     /// only signal the guard trusts. A count, not a bool: a render per keystroke can put
@@ -81,29 +81,63 @@ pub struct Preview {
     latest_id: u64,
     update_failure_reported: bool,
     navigation_failure_reported: bool,
-    script_busy: bool,
+    /// The ticket of the zoom/scroll script in flight, if any. A ticket rather than a
+    /// bool: a completion that arrives after the state was reset (a crash, a close)
+    /// carries an older ticket and must not mark a newer script as done.
+    script_in_flight: Option<u32>,
+    /// The last ticket handed out.
+    script_ticket: u32,
     script_again: bool,
     bounds: RECT,
     background: COREWEBVIEW2_COLOR,
     /// Browser-process restarts so far this session; capped so a crash loop ends.
     restarts: u32,
-    /// Renderer crashes since the last successful render; capped so a document that
-    /// kills the renderer is not re-rendered forever.
-    renderer_crashes: u32,
-    /// The renderer-crash give-up has been reported; cleared by a successful render, so
-    /// a document that keeps killing the renderer raises the banner once, not per edit.
-    renderer_crash_reported: bool,
+    renderer: RendererCrashes,
 }
 
 impl Preview {
     /// Forgets everything in flight: it died with the process or the controller. One
     /// place, so a new in-flight flag cannot be reset on one path and left set on the
-    /// other (a stale `script_busy` stops zoom and scroll sync for good).
+    /// other (a stale busy script stops zoom and scroll sync for good).
     fn reset_in_flight(&mut self) {
         self.pending_self = 0;
         self.pending_since = None;
-        self.script_busy = false;
+        self.script_in_flight = None;
         self.script_again = false;
+    }
+
+    /// A zoom/scroll script may start: its ticket, or `None` when one is already in
+    /// flight (the request then collapses into one re-run after it completes).
+    fn begin_script(&mut self) -> Option<u32> {
+        if self.script_in_flight.is_some() {
+            self.script_again = true;
+            return None;
+        }
+        self.script_ticket = self.script_ticket.wrapping_add(1);
+        self.script_in_flight = Some(self.script_ticket);
+        Some(self.script_ticket)
+    }
+
+    /// The script holding `ticket` completed (or failed to start). Whether to run the
+    /// script again. A ticket that is no longer the one in flight — a completion from
+    /// before a reset — changes nothing.
+    fn finish_script(&mut self, ticket: u32) -> bool {
+        if self.script_in_flight != Some(ticket) {
+            log::error("ExecuteScript", format!("ignored the completion of a superseded script {ticket}"));
+            return false;
+        }
+        self.script_in_flight = None;
+        std::mem::take(&mut self.script_again)
+    }
+
+    /// Drops the controller: nothing is loaded into it again, nothing in flight is
+    /// waited for, and a `start` still creating its controller is superseded (its
+    /// `show` would otherwise install one after the close).
+    fn forget_controller(&mut self) -> Option<ICoreWebView2Controller> {
+        self.ready = None;
+        self.reset_in_flight();
+        self.generation = self.generation.wrapping_add(1);
+        self.controller.take()
     }
 
     /// `pending_self`, after dropping a count that has outlived `PENDING_EXPIRY`. Only
@@ -122,6 +156,53 @@ impl Preview {
     fn take_back_permission(&mut self) {
         self.pending_self = self.pending_self.saturating_sub(1);
     }
+}
+
+/// Renderer crashes, counted per rendered content: a document that kills the renderer
+/// is not re-rendered forever, even when it only does so after loading (a lazy https
+/// image that runs out of memory, say). A successful load proves nothing about that.
+#[derive(Default)]
+struct RendererCrashes {
+    /// `content_hash` of the HTML last handed to NavigateToString.
+    content: Option<u64>,
+    /// Crashes since `content` was first rendered.
+    count: u32,
+    /// The give-up has been reported in the current streak of content that gave up, so
+    /// edits to a document that keeps killing the renderer raise the banner once.
+    reported: bool,
+}
+
+impl RendererCrashes {
+    /// `content` was handed to the WebView. The same content again (a re-render after a
+    /// crash, a restart) keeps the count; different content starts it afresh, and if
+    /// the previous content never gave up, the streak — and its banner — ends too.
+    fn rendering(&mut self, content: u64) {
+        if self.content == Some(content) {
+            return;
+        }
+        if self.count <= MAX_CRASH_RETRIES {
+            self.reported = false;
+        }
+        self.content = Some(content);
+        self.count = 0;
+    }
+
+    /// The renderer died: what to do, and whether this give-up is the streak's first
+    /// (the one to put up the banner for).
+    fn crashed(&mut self) -> (CrashResponse, bool) {
+        let response = crash_response(CrashedProcess::Renderer, self.count, 0);
+        self.count = self.count.saturating_add(1);
+        let report = response == CrashResponse::GiveUp && !std::mem::replace(&mut self.reported, true);
+        (response, report)
+    }
+}
+
+/// Identifies rendered HTML for `RendererCrashes`. Only compared within one process.
+fn content_hash(html: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::hash::DefaultHasher::new();
+    html.hash(&mut h);
+    h.finish()
 }
 
 /// How long a navigation we started may take to reach NavigationStarting. WebView2 is
@@ -171,7 +252,7 @@ fn crash_response(process: CrashedProcess, renderer_crashes: u32, browser_restar
 /// WebView2 callback that reported it).
 pub fn on_process_failed(app: &App, browser: bool, generation: u32) {
     let process = if browser { CrashedProcess::Browser } else { CrashedProcess::Renderer };
-    let response = {
+    let (response, report) = {
         let mut p = app.preview.borrow_mut();
         if p.stopped {
             // Recovery would bring the preview back; it stays stopped.
@@ -189,12 +270,14 @@ pub fn on_process_failed(app: &App, browser: bool, generation: u32) {
         }
         // Whatever was in flight died with the process.
         p.reset_in_flight();
-        let response = crash_response(process, p.renderer_crashes, p.restarts);
         match process {
-            CrashedProcess::Renderer => p.renderer_crashes += 1,
-            _ => p.restarts += 1,
+            CrashedProcess::Renderer => p.renderer.crashed(),
+            _ => {
+                let response = crash_response(process, 0, p.restarts);
+                p.restarts += 1;
+                (response, true)
+            }
         }
-        response
     };
     match response {
         CrashResponse::Rerender => {
@@ -214,10 +297,10 @@ pub fn on_process_failed(app: &App, browser: bool, generation: u32) {
                 None,
             );
         }
-        // Not re-rendered automatically; the next edit tries again, and a successful
-        // render resets the count. Reported once per streak: every edit lands here again.
+        // Not re-rendered automatically; the next edit renders different content, which
+        // starts the count afresh. Reported once per streak: every edit can land here again.
         CrashResponse::GiveUp => {
-            if std::mem::replace(&mut app.preview.borrow_mut().renderer_crash_reported, true) {
+            if !report {
                 log::error("PreviewProcessFailed", "render process exited again; still not re-rendering");
             } else {
                 app.report_error(
@@ -460,7 +543,6 @@ fn create_controller(
     }
 }
 
-#[allow(unused_unsafe)]
 /// Why `configure` did not install a controller. Its own decisions to stop are not
 /// errors from WebView2: a dedicated type, rather than an HRESULT such as E_ABORT that
 /// a WebView2 call could also return, keeps a real failure from passing for one.
@@ -751,10 +833,7 @@ fn show(controller: &ICoreWebView2Controller, webview: ICoreWebView2, generation
     }
     unsafe {
         log::if_err("ConfigureWebView2 SetBounds", controller.SetBounds(bounds));
-        match controller.cast::<ICoreWebView2Controller2>() {
-            Ok(c2) => log::if_err("ConfigureWebView2 background", c2.SetDefaultBackgroundColor(background)),
-            Err(e) => log::error("ConfigureWebView2 ICoreWebView2Controller2", e),
-        }
+        apply_background(controller, background);
         controller.SetIsVisible(true)?;
     }
     let previous = {
@@ -833,10 +912,9 @@ fn on_navigation_completed(args: &ICoreWebView2NavigationCompletedEventArgs) -> 
         return Ok(());
     }
     {
-        let mut p = app.preview.borrow_mut();
-        p.navigation_failure_reported = false;
-        p.renderer_crashes = 0;
-        p.renderer_crash_reported = false;
+        // Not a reason to reset the renderer-crash count: a document can kill the
+        // renderer after loading (`RendererCrashes`).
+        app.preview.borrow_mut().navigation_failure_reported = false;
     }
     sync_view(&app);
     Ok(())
@@ -881,7 +959,10 @@ pub fn navigate(app: &App, html: &str) {
     let result = unsafe { webview.NavigateToString(&HSTRING::from(html)) };
     let mut p = app.preview.borrow_mut();
     match result {
-        Ok(()) => p.update_failure_reported = false,
+        Ok(()) => {
+            p.update_failure_reported = false;
+            p.renderer.rendering(content_hash(html));
+        }
         Err(e) => {
             // No navigation will start, so nothing would consume the count — leaving it
             // raised would hand the permission to whatever navigates next.
@@ -910,31 +991,25 @@ pub fn navigate(app: &App, html: &str) {
 /// While a script is in flight, further requests collapse into one re-run after it
 /// completes, which paces the updates to whatever the WebView can absorb.
 pub fn sync_view(this: &App) {
-    let webview = {
+    let (webview, ticket) = {
         let mut p = this.preview.borrow_mut();
         let Some(webview) = p.ready.clone() else { return };
-        if p.script_busy {
-            p.script_again = true;
-            return;
-        }
-        p.script_busy = true;
-        webview
+        let Some(ticket) = p.begin_script() else { return };
+        (webview, ticket)
     };
     let (zoom, ratio) = this.view_state();
     let script = format!(
         "document.body.style.zoom='{zoom}%';(function(){{var e=document.scrollingElement||document.documentElement;\
          var m=e.scrollHeight-e.clientHeight;e.scrollTop=m>0?m*{ratio}:0;}})()"
     );
-    let handler = ExecuteScriptCompletedHandler::create(Box::new(|result, _| {
+    // The ticket travels with the completion, as the generation does with ProcessFailed:
+    // one that arrives after a crash or close is about a script already forgotten.
+    let handler = ExecuteScriptCompletedHandler::create(Box::new(move |result, _| {
         if let Err(e) = result {
             log::error("ExecuteScript", e);
         }
         let app = app();
-        let again = {
-            let mut p = app.preview.borrow_mut();
-            p.script_busy = false;
-            std::mem::take(&mut p.script_again)
-        };
+        let again = app.preview.borrow_mut().finish_script(ticket);
         if again {
             sync_view(&app);
         }
@@ -944,7 +1019,10 @@ pub fn sync_view(this: &App) {
     // own, and a banner per scroll tick would be noise.
     if let Err(e) = unsafe { webview.ExecuteScript(&HSTRING::from(script), &handler) } {
         log::error("ExecuteScript", e);
-        this.preview.borrow_mut().script_busy = false;
+        let mut p = this.preview.borrow_mut();
+        if p.script_in_flight == Some(ticket) {
+            p.script_in_flight = None;
+        }
     }
 }
 
@@ -986,10 +1064,17 @@ pub fn set_background(app: &App, color: COLORREF) {
         p.background = c;
         p.controller.clone()
     };
-    if let Some(controller) = controller.and_then(|c| c.cast::<ICoreWebView2Controller2>().ok()) {
-        unsafe {
-            log::if_err("Preview SetDefaultBackgroundColor", controller.SetDefaultBackgroundColor(c));
-        }
+    if let Some(controller) = controller {
+        apply_background(&controller, c);
+    }
+}
+
+/// Sets the color the preview shows before (and around) the document. The one place
+/// for it, so a failure is recorded the same way from `show` and `set_background`.
+fn apply_background(controller: &ICoreWebView2Controller, color: COREWEBVIEW2_COLOR) {
+    match controller.cast::<ICoreWebView2Controller2>() {
+        Ok(c2) => log::if_err("Preview SetDefaultBackgroundColor", unsafe { c2.SetDefaultBackgroundColor(color) }),
+        Err(e) => log::error("Preview ICoreWebView2Controller2", e),
     }
 }
 
@@ -1003,13 +1088,9 @@ pub fn notify_moved(app: &App) {
 }
 
 pub fn close(app: &App) {
-    let controller = {
-        let mut p = app.preview.borrow_mut();
-        p.ready = None;
-        // Whatever was in flight goes with the controller.
-        p.reset_in_flight();
-        p.controller.take()
-    };
+    // Whatever was in flight goes with the controller, including a start still creating
+    // its own.
+    let controller = app.preview.borrow_mut().forget_controller();
     if let Some(c) = controller {
         unsafe {
             log::if_err("Preview Close", c.Close());
@@ -1083,6 +1164,77 @@ mod tests {
         assert_eq!(crash_response(CrashedProcess::Browser, 0, 3), CrashResponse::GiveUp);
         // GPU/utility exits and a hung renderer leave our navigations alive: touch nothing.
         assert_eq!(crash_response(CrashedProcess::Other, 0, 0), CrashResponse::Ignore);
+    }
+
+    #[test]
+    fn a_document_that_crashes_after_loading_still_hits_the_cap() {
+        // load succeeds → renderer dies → re-render (same content) → load succeeds → …
+        // A successful load is not a reason to start counting again (B3-1).
+        let mut r = RendererCrashes::default();
+        let doc = content_hash("<p>huge lazy image</p>");
+        r.rendering(doc);
+        for _ in 0..MAX_CRASH_RETRIES {
+            assert_eq!(r.crashed(), (CrashResponse::Rerender, false));
+            r.rendering(doc); // the re-render hands over the very same HTML
+        }
+        assert_eq!(r.crashed(), (CrashResponse::GiveUp, true));
+        // Still the same content: no more re-renders, and the banner is not raised again.
+        r.rendering(doc);
+        assert_eq!(r.crashed(), (CrashResponse::GiveUp, false));
+    }
+
+    #[test]
+    fn changed_content_is_rendered_again_without_a_second_banner() {
+        let mut r = RendererCrashes::default();
+        let a = content_hash("a");
+        r.rendering(a);
+        for _ in 0..=MAX_CRASH_RETRIES {
+            r.crashed();
+        }
+        assert!(r.reported);
+        // An edit: new content gets its retries back, but the streak's banner was shown.
+        let b = content_hash("ab");
+        r.rendering(b);
+        assert_eq!(r.crashed(), (CrashResponse::Rerender, false));
+        for _ in 1..MAX_CRASH_RETRIES {
+            r.crashed();
+        }
+        assert_eq!(r.crashed(), (CrashResponse::GiveUp, false));
+        // Content that did not give up ends the streak: the next give-up is reported.
+        let c = content_hash("abc");
+        r.rendering(c);
+        let d = content_hash("abcd");
+        r.rendering(d);
+        assert!(!r.reported);
+        for _ in 0..MAX_CRASH_RETRIES {
+            assert_eq!(r.crashed().0, CrashResponse::Rerender);
+        }
+        assert_eq!(r.crashed(), (CrashResponse::GiveUp, true));
+    }
+
+    #[test]
+    fn a_stale_script_completion_leaves_the_current_script_alone() {
+        let mut p = Preview::default();
+        let old = p.begin_script().unwrap();
+        // A crash or close forgets it; a script on the new state is started.
+        p.reset_in_flight();
+        let new = p.begin_script().unwrap();
+        // The old one's completion arrives late: the new script is still in flight.
+        assert!(!p.finish_script(old));
+        assert!(p.begin_script().is_none(), "busy must not be lowered by a stale completion");
+        // The current one completes: the request collapsed meanwhile runs once more.
+        assert!(p.finish_script(new));
+        assert!(p.begin_script().is_some());
+    }
+
+    #[test]
+    fn closing_supersedes_a_start_in_flight() {
+        let mut p = Preview { generation: 7, ..Default::default() };
+        let in_flight = p.generation;
+        let ticket = p.begin_script().unwrap();
+        assert!(p.forget_controller().is_none());
+        assert_ne!(p.generation, in_flight, "show() of the start in flight must see Superseded");
+        assert!(!p.finish_script(ticket));
     }
 
     #[test]
