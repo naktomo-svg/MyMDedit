@@ -430,8 +430,8 @@ Ctrl+Enter はアクセラレータに登録してあるので、WebView にフ�
 
 - 設定は「システムの既定 / ライト / ダーク」。「システムの既定」では、レジストリの`AppsUseLightTheme`が0のときだけダークにする(読めなければライト)。
 - 色はダーク・ライトそれぞれ固定のパレットで決める。Win32 には一度に切り替えるスイッチがないので、部位ごとに別の仕組みで追従させる。
-  - **タイトルバー**: DWM の`DWMWA_USE_IMMERSIVE_DARK_MODE`。
-  - **ポップアップメニュー・スクロールバー**: uxtheme の序数135`SetPreferredAppMode`と序数136`FlushMenuThemes`(非公開。古い OS では黙って効かない)。
+  - **タイトルバー**: DWM の`DwmSetWindowAttribute`。属性の番号はビルドで変わる: ビルド18985以降は`DWMWA_USE_IMMERSIVE_DARK_MODE`(20)、1809〜1909(17763〜18984)は番号が変わる前の19を使う。1809より前では呼ばない。ビルド番号が読めないときは20を試す。
+  - **ポップアップメニュー・スクロールバー**: uxtheme の序数135と序数136`FlushMenuThemes`(どちらも非公開)。序数135の意味はビルドで変わる: 1903(18362)以降は`SetPreferredAppMode`、1809(17763)は`AllowDarkModeForApp`として呼ぶ。1809より前やビルド番号が読めないときは、序数を使わずにライトのままにして、そのことを記録する。
   - **メニューバー**: どのテーマも面倒を見ないので、ダークのときだけ非公開のメッセージ`WM_UAHDRAWMENU`/`WM_UAHDRAWMENUITEM`で自前で描く。メニューバーの下に非クライアント描画が引く明るい1px線は、`WM_NCPAINT`/`WM_NCACTIVATE`の後で塗りつぶす。
   - **エディタ・ツールチップ**: `AllowDarkModeForWindow`(序数133)と`SetWindowTheme`(`DarkMode_Explorer`など)。
   - ツールバー・通知バー・フッターは自前描画でパレットの色を使う。エディタの背景と文字色、WebView2 の既定の背景色(ダーク`#1E1E1E`、ライト`#FFFFFF`)、プレビューの CSS(4.2)、自前のダイアログ(設定・行へ移動)もパレットに従う。
