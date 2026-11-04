@@ -328,10 +328,8 @@ struct Layout {
 }
 
 pub struct State {
-    file_path: Option<PathBuf>,
-    format: DocumentFormat,
-    file_name: String,
-    dirty: bool,
+    /// The open document and what is known about its file (`doc_state`).
+    doc: DocState,
     zoom: i32,
     settings: SettingsStore,
     /// What the error banner shows, oldest first.
@@ -351,39 +349,264 @@ pub struct State {
     find_is_replace: bool,
     /// The folder a recent-folder click is waiting on the background probe for.
     probing_folder: Option<String>,
-    /// The open file as last read, saved or acknowledged, to notice another program
-    /// changing it. `None` for an untitled document.
-    disk_stamp: Option<FileStamp>,
-    /// The file's disappearance has been reported; don't repeat it on every activation.
-    missing_reported: bool,
-    /// The on-disk version the user just declined to overwrite. Closing that prompt
-    /// reactivates the window; asking 読み込み直しますか about the very same change right
-    /// after would be a second prompt for one decision.
-    declined_overwrite: Option<FileStamp>,
 }
 
-impl State {
-    /// The document is now `path` (`None`: untitled) in `format`, as on disk at `stamp`.
-    /// Everything that described the previous document goes with it.
-    fn set_document(&mut self, path: Option<PathBuf>, format: DocumentFormat, stamp: Option<FileStamp>) {
-        self.file_name = path
-            .as_deref()
-            .and_then(Path::file_name)
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| UNTITLED.into());
-        self.file_path = path;
-        self.format = format;
-        self.set_disk_stamp(stamp);
+/// The open document and its file. A module of its own so that its fields are private to
+/// it: `App` and `State` live in the same module and could otherwise write them directly,
+/// bypassing the methods that keep them consistent (a direct `disk_stamp` write once left
+/// `missing_reported` set, so a second deletion went unreported).
+mod doc_state {
+    use std::path::{Path, PathBuf};
+
+    use super::UNTITLED;
+    use crate::document::{DiskChange, DocumentFormat, FileStamp};
+
+    pub(super) struct DocState {
+        path: Option<PathBuf>,
+        format: DocumentFormat,
+        /// What the title shows: `path`'s file name, or `UNTITLED`.
+        name: String,
+        dirty: bool,
+        /// The open file as last read, saved or acknowledged, to notice another program
+        /// changing it. `None` for an untitled document.
+        disk_stamp: Option<FileStamp>,
+        /// The file's disappearance has been reported; don't repeat it on every activation.
+        missing_reported: bool,
+        /// The on-disk version the user just declined to overwrite. Closing that prompt
+        /// reactivates the window; asking 読み込み直しますか about the very same change right
+        /// after would be a second prompt for one decision.
+        declined_overwrite: Option<FileStamp>,
     }
 
-    /// What is on disk is now known to be ours (read or just written): what was said
-    /// about the earlier version — gone, or declined to overwrite — no longer applies.
-    fn set_disk_stamp(&mut self, stamp: Option<FileStamp>) {
-        self.disk_stamp = stamp;
-        self.missing_reported = false;
-        self.declined_overwrite = None;
+    /// What `DocState::on_disk_checked` leaves for the caller to do (the state is already
+    /// updated).
+    #[derive(Debug, PartialEq, Eq)]
+    pub(super) enum DiskAction {
+        Nothing,
+        /// Tell the user the file at this path is gone.
+        ReportMissing(PathBuf),
+        /// Ask whether to reload the file at `path` (already acknowledged either way).
+        AskReload {
+            path: PathBuf,
+            name: String,
+            dirty: bool,
+        },
+    }
+
+    impl Default for DocState {
+        fn default() -> Self {
+            DocState {
+                path: None,
+                format: DocumentFormat::default(),
+                name: UNTITLED.into(),
+                dirty: false,
+                disk_stamp: None,
+                missing_reported: false,
+                declined_overwrite: None,
+            }
+        }
+    }
+
+    impl DocState {
+        pub(super) fn path(&self) -> Option<&Path> {
+            self.path.as_deref()
+        }
+
+        pub(super) fn format(&self) -> DocumentFormat {
+            self.format
+        }
+
+        pub(super) fn name(&self) -> &str {
+            &self.name
+        }
+
+        pub(super) fn dirty(&self) -> bool {
+            self.dirty
+        }
+
+        pub(super) fn disk_stamp(&self) -> Option<FileStamp> {
+            self.disk_stamp
+        }
+
+        /// The document is now `path` (`None`: untitled) in `format`, as on disk at `stamp`.
+        /// Everything that described the previous document goes with it.
+        pub(super) fn set_document(&mut self, path: Option<PathBuf>, format: DocumentFormat, stamp: Option<FileStamp>) {
+            self.name = path
+                .as_deref()
+                .and_then(Path::file_name)
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| UNTITLED.into());
+            self.path = path;
+            self.format = format;
+            self.set_disk_stamp(stamp);
+        }
+
+        /// What is on disk is now known to be ours (read or just written): what was said
+        /// about the earlier version — gone, or declined to overwrite — no longer applies.
+        pub(super) fn set_disk_stamp(&mut self, stamp: Option<FileStamp>) {
+            self.disk_stamp = stamp;
+            self.missing_reported = false;
+            self.declined_overwrite = None;
+        }
+
+        /// The user declined to overwrite the on-disk version `now`.
+        pub(super) fn decline_overwrite(&mut self, now: FileStamp) {
+            self.declined_overwrite = Some(now);
+        }
+
+        /// The user edited the text. True when that is the change from clean to dirty.
+        pub(super) fn mark_dirty(&mut self) -> bool {
+            !std::mem::replace(&mut self.dirty, true)
+        }
+
+        /// The text no longer has unsaved changes (read, saved, or replaced). True when
+        /// that is the change from dirty to clean.
+        pub(super) fn mark_clean(&mut self) -> bool {
+            std::mem::replace(&mut self.dirty, false)
+        }
+
+        /// A worker found `change` comparing `checked_path` with `checked_stamp`. Acted on
+        /// only if that still describes the document (another file may have been opened,
+        /// or this one saved, while it looked).
+        pub(super) fn on_disk_checked(
+            &mut self,
+            checked_path: &Path,
+            checked_stamp: FileStamp,
+            change: DiskChange,
+        ) -> DiskAction {
+            let (Some(path), Some(recorded)) = (self.path.clone(), self.disk_stamp) else {
+                return DiskAction::Nothing;
+            };
+            if path != checked_path || recorded != checked_stamp {
+                return DiskAction::Nothing;
+            }
+            match change {
+                DiskChange::Unchanged => DiskAction::Nothing,
+                DiskChange::Missing if !self.missing_reported => {
+                    self.missing_reported = true;
+                    DiskAction::ReportMissing(path)
+                }
+                DiskChange::Missing => DiskAction::Nothing,
+                DiskChange::Modified(now) if self.declined_overwrite == Some(now) => DiskAction::Nothing,
+                DiskChange::Modified(now) => {
+                    // Acknowledged either way: a reload that fails (say, the file is no
+                    // longer UTF-8) must not ask again on every activation. Through
+                    // `set_disk_stamp`: this is a new version, so a later deletion is news.
+                    self.set_disk_stamp(Some(now));
+                    DiskAction::AskReload { path, name: self.name.clone(), dirty: self.dirty }
+                }
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::{DiskAction, DocState};
+        use crate::document::{self, DiskChange, DocumentFormat, FileStamp};
+        use std::path::{Path, PathBuf};
+
+        /// Two different stamps of a real file (`FileStamp` has no public constructor).
+        fn two_stamps() -> (PathBuf, FileStamp, FileStamp) {
+            let dir = std::env::temp_dir().join(format!(
+                "mymdedit-docstate-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("a.md");
+            std::fs::write(&path, "a").unwrap();
+            let first = document::stamp(&path).unwrap();
+            std::fs::write(&path, "abc").unwrap();
+            let second = document::stamp(&path).unwrap();
+            std::fs::remove_dir_all(&dir).unwrap();
+            assert_ne!(first, second);
+            (path, first, second)
+        }
+
+        fn opened(path: &Path, stamp: FileStamp) -> DocState {
+            let mut d = DocState::default();
+            d.set_document(Some(path.to_path_buf()), DocumentFormat::default(), Some(stamp));
+            d
+        }
+
+        #[test]
+        fn missing_is_reported_once_per_disappearance() {
+            let (path, first, _) = two_stamps();
+            let mut d = opened(&path, first);
+            assert_eq!(d.on_disk_checked(&path, first, DiskChange::Missing), DiskAction::ReportMissing(path.clone()));
+            assert_eq!(d.on_disk_checked(&path, first, DiskChange::Missing), DiskAction::Nothing);
+        }
+
+        /// B2-1: kept after a reload prompt, then deleted again — the second deletion
+        /// must be reported too.
+        #[test]
+        fn acknowledging_a_change_rearms_the_missing_report() {
+            let (path, first, second) = two_stamps();
+            let mut d = opened(&path, first);
+            assert_eq!(d.on_disk_checked(&path, first, DiskChange::Missing), DiskAction::ReportMissing(path.clone()));
+            let action = d.on_disk_checked(&path, first, DiskChange::Modified(second));
+            assert_eq!(action, DiskAction::AskReload { path: path.clone(), name: "a.md".into(), dirty: false });
+            assert_eq!(d.disk_stamp(), Some(second));
+            assert_eq!(d.on_disk_checked(&path, second, DiskChange::Missing), DiskAction::ReportMissing(path.clone()));
+        }
+
+        #[test]
+        fn a_declined_version_is_not_asked_about_until_it_changes_again() {
+            let (path, first, second) = two_stamps();
+            let mut d = opened(&path, first);
+            d.decline_overwrite(second);
+            assert_eq!(d.on_disk_checked(&path, first, DiskChange::Modified(second)), DiskAction::Nothing);
+            assert_eq!(d.disk_stamp(), Some(first));
+            // Saving over it makes the disk ours again; the decline no longer applies.
+            d.set_disk_stamp(Some(first));
+            assert!(matches!(
+                d.on_disk_checked(&path, first, DiskChange::Modified(second)),
+                DiskAction::AskReload { .. }
+            ));
+        }
+
+        #[test]
+        fn a_stale_result_is_ignored() {
+            let (path, first, second) = two_stamps();
+            let mut d = opened(&path, second);
+            assert_eq!(d.on_disk_checked(&path, first, DiskChange::Missing), DiskAction::Nothing);
+            assert_eq!(
+                d.on_disk_checked(&path.with_file_name("b.md"), second, DiskChange::Missing),
+                DiskAction::Nothing
+            );
+            let mut untitled = DocState::default();
+            assert_eq!(untitled.on_disk_checked(&path, first, DiskChange::Missing), DiskAction::Nothing);
+        }
+
+        /// B2-10: a path without a file name still titles the document, never as "".
+        #[test]
+        fn name_follows_the_path_or_falls_back_to_untitled() {
+            let mut d = DocState::default();
+            assert_eq!(d.name(), super::UNTITLED);
+            d.set_document(Some(PathBuf::from(r"C:\notes\a.md")), DocumentFormat::default(), None);
+            assert_eq!(d.name(), "a.md");
+            d.set_document(Some(PathBuf::from(r"C:\")), DocumentFormat::default(), None);
+            assert_eq!(d.name(), super::UNTITLED);
+            d.set_document(None, DocumentFormat::default(), None);
+            assert_eq!((d.name(), d.path()), (super::UNTITLED, None));
+        }
+
+        /// B2-3: the caller releases the shutdown block on the dirty-to-clean change only.
+        #[test]
+        fn dirty_transitions_are_reported_once() {
+            let mut d = DocState::default();
+            assert!(!d.mark_clean());
+            assert!(d.mark_dirty());
+            assert!(!d.mark_dirty());
+            assert!(d.dirty());
+            assert!(d.mark_clean());
+            assert!(!d.mark_clean());
+            assert!(!d.dirty());
+        }
     }
 }
+
+use doc_state::{DiskAction, DocState};
 
 /// Find/replace dialog data. Leaked once: the modeless common dialog keeps pointers
 /// into it for as long as it is open.
@@ -507,10 +730,7 @@ pub fn run(launch_file: Option<PathBuf>) -> windows::core::Result<()> {
     let app = Rc::new(App {
         ui: Cell::new(Ui::default()),
         state: RefCell::new(State {
-            file_path: None,
-            format: DocumentFormat::default(),
-            file_name: UNTITLED.into(),
-            dirty: false,
+            doc: DocState::default(),
             zoom: 100,
             settings,
             errors: Vec::new(),
@@ -526,9 +746,6 @@ pub fn run(launch_file: Option<PathBuf>) -> windows::core::Result<()> {
             icon_face,
             find_is_replace: false,
             probing_folder: None,
-            disk_stamp: None,
-            missing_reported: false,
-            declined_overwrite: None,
         }),
         preview: RefCell::new(Preview::default()),
         suppress_dirty: Cell::new(false),
@@ -1180,7 +1397,7 @@ impl App {
     fn update_title(&self) {
         let title = {
             let st = self.state.borrow();
-            if st.dirty { format!("{} *", st.file_name) } else { st.file_name.clone() }
+            if st.doc.dirty() { format!("{} *", st.doc.name()) } else { st.doc.name().to_owned() }
         };
         let t = wide(&title);
         unsafe {
@@ -1219,8 +1436,8 @@ impl App {
     fn on_text_changed(&self) {
         self.request_render();
         if !self.suppress_dirty.get() {
-            let was_dirty = std::mem::replace(&mut self.state.borrow_mut().dirty, true);
-            if !was_dirty {
+            let became_dirty = self.state.borrow_mut().doc.mark_dirty();
+            if became_dirty {
                 self.update_title();
             }
         }
@@ -1308,7 +1525,7 @@ impl App {
         // only covers the case where no notification came.
         self.request_render();
         drop(suppress);
-        self.state.borrow_mut().dirty = false;
+        self.state.borrow_mut().doc.mark_clean();
         self.update_title();
     }
 
@@ -1657,13 +1874,13 @@ impl App {
     /// `fail_open` decides what an undisplayable prompt means (true only for closing
     /// the window, so it can never become unclosable).
     fn confirm_discard(&self, fail_open: bool) -> bool {
-        if !self.state.borrow().dirty {
+        if !self.state.borrow().doc.dirty() {
             return true;
         }
         match dialogs::confirm_discard(self.hwnd()) {
             Ok(DiscardChoice::Save) => {
                 self.save();
-                !self.state.borrow().dirty
+                !self.state.borrow().doc.dirty()
             }
             Ok(DiscardChoice::Discard) => true,
             Ok(DiscardChoice::Cancel) => false,
@@ -1678,7 +1895,7 @@ impl App {
         if !self.confirm_discard(false) {
             return;
         }
-        self.state.borrow_mut().set_document(None, DocumentFormat::default(), None);
+        self.state.borrow_mut().doc.set_document(None, DocumentFormat::default(), None);
         self.load_content(SAMPLE_CONTENT);
     }
 
@@ -1751,7 +1968,7 @@ impl App {
     /// Every read funnels through here, so the path, the on-disk format and the text
     /// can never describe different files.
     fn apply_opened(&self, doc: OpenedDocument) {
-        self.state.borrow_mut().set_document(Some(doc.path.clone()), doc.format, doc.stamp);
+        self.state.borrow_mut().doc.set_document(Some(doc.path.clone()), doc.format, doc.stamp);
         self.load_content(&doc.content);
         self.record_recent_folder(&doc.path);
     }
@@ -1759,7 +1976,7 @@ impl App {
     fn save(&self) {
         let (path, format, recorded, name) = {
             let st = self.state.borrow();
-            (st.file_path.clone(), st.format, st.disk_stamp, st.file_name.clone())
+            (st.doc.path().map(Path::to_path_buf), st.doc.format(), st.doc.disk_stamp(), st.doc.name().to_owned())
         };
         let Some(path) = path else {
             self.save_as();
@@ -1775,7 +1992,7 @@ impl App {
                 true
             });
             if !overwrite {
-                self.state.borrow_mut().declined_overwrite = Some(now);
+                self.state.borrow_mut().doc.decline_overwrite(now);
                 return; // Still dirty, so a discard gate reads this as "not safe".
             }
         }
@@ -1785,7 +2002,7 @@ impl App {
             self.report_error("Save", &format!("保存できませんでした: {} ({e})", path.display()), Some(&e));
             return;
         }
-        self.record_saved(&path);
+        self.record_saved(&path, format);
         self.warn_if_replaced(replaced);
         self.update_title();
         self.record_recent_folder(&path);
@@ -1794,7 +2011,7 @@ impl App {
     fn save_as(&self) {
         let (name, format) = {
             let st = self.state.borrow();
-            (st.file_name.clone(), st.format)
+            (st.doc.name().to_owned(), st.doc.format())
         };
         let path = match dialogs::save_file(self.hwnd(), &name) {
             Ok(Some(p)) => p,
@@ -1814,12 +2031,7 @@ impl App {
             self.report_error("SaveAs", &format!("保存できませんでした: {} ({e})", path.display()), Some(&e));
             return;
         }
-        {
-            let mut st = self.state.borrow_mut();
-            st.file_name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-            st.file_path = Some(path.clone());
-        }
-        self.record_saved(&path);
+        self.record_saved(&path, format);
         self.warn_if_replaced(replaced);
         self.update_title();
         self.record_recent_folder(&path);
@@ -1837,12 +2049,14 @@ impl App {
         }
     }
 
-    /// After a successful write to `path`: clean, and what is on disk is now ours.
-    fn record_saved(&self, path: &Path) {
+    /// After a successful write to `path` in `format`: the document is that file (a save
+    /// as switches to it; a save names the same one again), clean, and what is on disk
+    /// is now ours.
+    fn record_saved(&self, path: &Path, format: DocumentFormat) {
         let stamp = document::stamp(path).inspect_err(|e| log::error("record_saved stamp", e)).ok();
         let mut st = self.state.borrow_mut();
-        st.dirty = false;
-        st.set_disk_stamp(stamp);
+        st.doc.set_document(Some(path.to_path_buf()), format, stamp);
+        st.doc.mark_clean();
     }
 
     /// The window was activated: has another program changed or removed the open file?
@@ -1857,7 +2071,7 @@ impl App {
         }
         let (path, recorded) = {
             let st = self.state.borrow();
-            (st.file_path.clone(), st.disk_stamp)
+            (st.doc.path().map(Path::to_path_buf), st.doc.disk_stamp())
         };
         let (Some(path), Some(recorded)) = (path, recorded) else { return };
         self.disk_check_running.set(true);
@@ -1893,49 +2107,22 @@ impl App {
             self.disk_recheck.set(true);
             return;
         };
-        let (path, recorded, name, dirty, missing_reported, declined) = {
-            let st = self.state.borrow();
-            (
-                st.file_path.clone(),
-                st.disk_stamp,
-                st.file_name.clone(),
-                st.dirty,
-                st.missing_reported,
-                st.declined_overwrite,
-            )
-        };
-        if let (Some(path), Some(recorded)) = (path, recorded)
-            && path == checked_path
-            && recorded == checked_stamp
-        {
-            match change {
-                DiskChange::Unchanged => {}
-                DiskChange::Missing if !missing_reported => {
-                    self.state.borrow_mut().missing_reported = true;
-                    self.report_error(
-                        "check_external_change",
-                        &format!("開いているファイルが見つかりません（別のアプリで削除または移動されました）: {}  保存すると作り直します。", path.display()),
-                        None,
-                    );
-                }
-                DiskChange::Missing => {}
-                DiskChange::Modified(now) if declined == Some(now) => {}
-                DiskChange::Modified(now) => {
-                    // Acknowledged either way: a reload that fails (say, the file is no
-                    // longer UTF-8) must not ask again on every activation.
-                    self.state.borrow_mut().disk_stamp = Some(now);
-                    // An undisplayable prompt keeps the editor's text: nothing is lost.
-                    let reload = dialogs::confirm_reload(self.hwnd(), &name, dirty).unwrap_or_else(|e| {
-                        log::error("confirm_reload", &e);
-                        false
-                    });
-                    if reload {
-                        self.read_and_apply(
-                            &path,
-                            "Reload",
-                            &format!("ファイルを読み込み直せませんでした: {}", path.display()),
-                        );
-                    }
+        let action = self.state.borrow_mut().doc.on_disk_checked(&checked_path, checked_stamp, change);
+        match action {
+            DiskAction::Nothing => {}
+            DiskAction::ReportMissing(path) => self.report_error(
+                "check_external_change",
+                &format!("開いているファイルが見つかりません（別のアプリで削除または移動されました）: {}  保存すると作り直します。", path.display()),
+                None,
+            ),
+            DiskAction::AskReload { path, name, dirty } => {
+                // An undisplayable prompt keeps the editor's text: nothing is lost.
+                let reload = dialogs::confirm_reload(self.hwnd(), &name, dirty).unwrap_or_else(|e| {
+                    log::error("confirm_reload", &e);
+                    false
+                });
+                if reload {
+                    self.read_and_apply(&path, "Reload", &format!("ファイルを読み込み直せませんでした: {}", path.display()));
                 }
             }
         }
@@ -1957,7 +2144,7 @@ impl App {
     /// reason (so it explains what is holding it up) and the user gets the same
     /// 保存する / 保存しない / キャンセル prompt as closing the window.
     fn on_query_end_session(&self) -> bool {
-        if self.close_confirmed.get() || !self.state.borrow().dirty {
+        if self.close_confirmed.get() || !self.state.borrow().doc.dirty() {
             return true;
         }
         let reason = wide("保存されていない変更があります");
