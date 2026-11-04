@@ -391,44 +391,119 @@ pub struct Heading {
     pub title: String,
 }
 
+/// The block that hides `#` lines from the outline while it is open.
+#[derive(Clone, Copy)]
+enum OpenBlock {
+    /// A fenced code block: the fence's character and length; it closes on a run at
+    /// least as long.
+    Fence(u16, usize),
+    /// An HTML block of CommonMark's type 1 (`<pre>`, `<script>`, `<style>`,
+    /// `<textarea>`), which runs to the first line holding any of their end tags.
+    Html,
+}
+
+/// HTML block type 1's tag names. Its other types are not tracked (see `headings`).
+const HTML_RAW_TAGS: [&str; 4] = ["pre", "script", "style", "textarea"];
+
+fn is_space_or_tab(c: u16) -> bool {
+    c == b' ' as u16 || c == b'\t' as u16
+}
+
+/// Whether `hay` holds the ASCII `needle`, ignoring ASCII case.
+fn contains_ascii_ci(hay: &[u16], needle: &str) -> bool {
+    let needle: Vec<u16> = needle.encode_utf16().collect();
+    hay.windows(needle.len()).any(|win| {
+        win.iter().zip(&needle).all(|(&h, &n)| u8::try_from(h).is_ok_and(|h| h.eq_ignore_ascii_case(&(n as u8))))
+    })
+}
+
+/// Whether `rest` (a line from its first non-space) starts an HTML block of type 1:
+/// `<` and one of the tag names, then a space, a tab, `>` or the end of the line.
+fn starts_raw_html(rest: &[u16]) -> bool {
+    rest.first() == Some(&(b'<' as u16))
+        && HTML_RAW_TAGS.iter().any(|tag| {
+            let name = &rest[1..];
+            name.len() >= tag.len()
+                && name.iter().zip(tag.bytes()).all(|(&c, t)| u8::try_from(c).is_ok_and(|c| c.eq_ignore_ascii_case(&t)))
+                && name.get(tag.len()).is_none_or(|&c| is_space_or_tab(c) || c == b'>' as u16)
+        })
+}
+
+fn ends_raw_html(line: &[u16]) -> bool {
+    HTML_RAW_TAGS.iter().any(|tag| contains_ascii_ci(line, &format!("</{tag}>")))
+}
+
+/// Whether `rest` is a thematic break (`- - -`, `***`, `___`), which is not a list item
+/// even though it can start with `- `.
+fn is_thematic_break(rest: &[u16]) -> bool {
+    b"-*_".iter().any(|&c| {
+        rest.iter().all(|&x| x == c as u16 || is_space_or_tab(x))
+            && rest.iter().filter(|&&x| x == c as u16).count() >= 3
+    })
+}
+
+/// If `rest` (a line from its first non-space) starts a list item, how far from its
+/// start the item's content begins: the marker (`-`, `+`, `*`, or 1-9 digits and `.` or
+/// `)`), then 1 to 4 spaces; just one when there are 5 or more (the content is indented
+/// code) or the line ends after the marker.
+fn list_item_content(rest: &[u16]) -> Option<usize> {
+    if is_thematic_break(rest) {
+        return None;
+    }
+    let marker = match rest.first().and_then(|&c| char::from_u32(c.into())) {
+        Some('-' | '+' | '*') => 1,
+        Some('0'..='9') => {
+            let digits = rest.iter().take_while(|&&c| (b'0' as u16..=b'9' as u16).contains(&c)).count();
+            if digits > 9 || !matches!(rest.get(digits), Some(&c) if c == b'.' as u16 || c == b')' as u16) {
+                return None;
+            }
+            digits + 1
+        }
+        _ => return None,
+    };
+    let spaces = rest[marker..].iter().take_while(|&&c| c == b' ' as u16).count();
+    match rest.get(marker) {
+        None => Some(marker + 1),
+        Some(&c) if c == b' ' as u16 => {
+            Some(marker + if spaces > 4 || marker + spaces == rest.len() { 1 } else { spaces })
+        }
+        Some(_) => None,
+    }
+}
+
 /// The ATX headings (`#`..`######`) in `text`, in order, leaving out lines inside fenced
-/// code blocks (``` or ~~~), where a `#` is code rather than a heading.
+/// code blocks (``` or ~~~) and HTML blocks of type 1 (`<pre>` .. `</pre>` and the like),
+/// where a `#` is code or raw HTML rather than a heading.
+///
+/// List items are followed far enough for a fence or a heading inside one to be read the
+/// way the preview (CommonMark) reads it: a line indented at least to an item's content
+/// column continues the item and is read from that column, and any other non-blank line
+/// ends the item, and with it a fence or HTML block opened inside it. This is not the full
+/// CommonMark algorithm, and the outline can disagree with the preview on: block quotes
+/// (`> # a` is not listed), tabs in indentation or after a list marker, a lazy
+/// continuation line followed by more of the item, list items that cannot interrupt a
+/// paragraph, and HTML blocks other than type 1 (`<!-- # a -->` across lines, `<div>`).
 pub fn headings(text: &[u16]) -> Vec<Heading> {
     let mut out = Vec::new();
-    // The open fence's character and length; it closes on a run at least as long.
-    let mut fence: Option<(u16, usize)> = None;
+    // The content columns of the list items the current line is inside, outermost first.
+    let mut items: Vec<usize> = Vec::new();
+    // The open block, and how many list items it is inside: it ends with the innermost.
+    let mut open: Option<(OpenBlock, usize)> = None;
     let mut i = 0;
     while i <= text.len() {
         let line_end = find_line_end(text, i);
         let line = &text[i..line_end];
-        let indent = line.iter().take(4).take_while(|&&c| c == b' ' as u16).count();
-        let rest = if indent < 4 { &line[indent..] } else { &[][..] };
-        let run = |c: u16| rest.iter().take_while(|&&x| x == c).count();
-
-        // CommonMark: a closing fence is the run and nothing but spaces after it (```js
-        // inside a ``` block is code), and a backtick fence's info string has no backtick
-        // (```a``` is inline code, not a fence) — so the outline matches the preview.
-        let only_spaces_after = |n: usize| rest[n..].iter().all(|&x| x == b' ' as u16 || x == b'\t' as u16);
-        if let Some((c, n)) = fence {
-            if run(c) >= n && only_spaces_after(run(c)) {
-                fence = None;
-            }
-        } else if let Some(c) = [b'`' as u16, b'~' as u16]
-            .into_iter()
-            .find(|&c| run(c) >= 3 && (c == b'~' as u16 || !rest[run(c)..].contains(&c)))
-        {
-            fence = Some((c, run(c)));
+        let spaces = line.iter().take_while(|&&c| c == b' ' as u16).count();
+        if line.iter().all(|&c| is_space_or_tab(c)) {
+            // A blank line neither ends a list item nor closes a fence or a type-1 block.
         } else {
-            let level = run(b'#' as u16);
-            if (1..=6).contains(&level) && rest.get(level).is_none_or(|&c| c == b' ' as u16 || c == b'\t' as u16) {
-                let title = String::from_utf16_lossy(&rest[level..]);
-                let title = title.trim();
-                // A closing run of #s is decoration, but only after a space: `# C#` is "C#".
-                let stripped = title.trim_end_matches('#');
-                let title =
-                    if stripped.is_empty() || stripped.ends_with([' ', '\t']) { stripped.trim_end() } else { title };
-                out.push(Heading { level, line_start: i, title: title.to_string() });
+            while items.last().is_some_and(|&col| col > spaces) {
+                items.pop();
             }
+            if open.is_some_and(|(_, depth)| depth > items.len()) {
+                open = None;
+            }
+            scan_line(line, i, &mut items, &mut open, &mut out);
         }
         if line_end >= text.len() {
             break;
@@ -436,6 +511,74 @@ pub fn headings(text: &[u16]) -> Vec<Heading> {
         i = skip_break(text, line_end);
     }
     out
+}
+
+/// `headings`' work on one non-blank `line` (starting at `line_start`), once the list
+/// items it does not continue are gone from `items`.
+fn scan_line(
+    line: &[u16],
+    line_start: usize,
+    items: &mut Vec<usize>,
+    open: &mut Option<(OpenBlock, usize)>,
+    out: &mut Vec<Heading>,
+) {
+    if let Some((OpenBlock::Html, _)) = *open {
+        if ends_raw_html(line) {
+            *open = None;
+        }
+        return;
+    }
+    // From the innermost item's content column, past any list markers that start items
+    // on this line (`- - # a`); `None` when what is left is indented code.
+    let mut col = items.last().copied().unwrap_or(0);
+    let rest = loop {
+        let from = line.get(col..).unwrap_or(&[]);
+        let indent = from.iter().take(4).take_while(|&&c| c == b' ' as u16).count();
+        if indent >= 4 {
+            break &[][..];
+        }
+        let rest = &from[indent..];
+        if open.is_none()
+            && let Some(content) = list_item_content(rest)
+        {
+            col += indent + content;
+            items.push(col);
+            continue;
+        }
+        break rest;
+    };
+    let run = |c: u16| rest.iter().take_while(|&&x| x == c).count();
+
+    // CommonMark: a closing fence is the run and nothing but spaces after it (```js
+    // inside a ``` block is code), and a backtick fence's info string has no backtick
+    // (```a``` is inline code, not a fence) — so the outline matches the preview.
+    let only_spaces_after = |n: usize| rest[n..].iter().all(|&x| is_space_or_tab(x));
+    if let Some((OpenBlock::Fence(c, n), _)) = *open {
+        if run(c) >= n && only_spaces_after(run(c)) {
+            *open = None;
+        }
+    } else if let Some(c) = [b'`' as u16, b'~' as u16]
+        .into_iter()
+        .find(|&c| run(c) >= 3 && (c == b'~' as u16 || !rest[run(c)..].contains(&c)))
+    {
+        *open = Some((OpenBlock::Fence(c, run(c)), items.len()));
+    } else if starts_raw_html(rest) {
+        // The end tag can be on the opening line itself (`<pre>x</pre>`).
+        if !ends_raw_html(rest) {
+            *open = Some((OpenBlock::Html, items.len()));
+        }
+    } else {
+        let level = run(b'#' as u16);
+        if (1..=6).contains(&level) && rest.get(level).is_none_or(|&c| is_space_or_tab(c)) {
+            let title = String::from_utf16_lossy(&rest[level..]);
+            let title = title.trim();
+            // A closing run of #s is decoration, but only after a space: `# C#` is "C#".
+            let stripped = title.trim_end_matches('#');
+            let title =
+                if stripped.is_empty() || stripped.ends_with([' ', '\t']) { stripped.trim_end() } else { title };
+            out.push(Heading { level, line_start, title: title.to_string() });
+        }
+    }
 }
 
 /// The most headings the 見出しへ移動 menu lists. A popup menu stops accepting items
@@ -723,6 +866,105 @@ mod tests {
         // ...and ```a``` with a backtick after the run opens no fence at all.
         assert_eq!(heading_list("```a```\r# yes"), vec![(1, 8, "yes".into())]);
         assert_eq!(heading_list("~~~a~\r# not"), vec![]);
+    }
+
+    /// The headings the preview renders for `t` (level and text), read out of its HTML.
+    fn preview_headings(t: &str) -> Vec<(usize, String)> {
+        let html = crate::render::to_html_document(t, &crate::settings::AppSettings::default(), 0).html;
+        let mut out = Vec::new();
+        let mut at = 0;
+        while let Some(p) = html[at..].find("<h") {
+            let tag = at + p;
+            at = tag + 2;
+            let b = html.as_bytes();
+            let Some(level) = b.get(tag + 2).filter(|c| (b'1'..=b'6').contains(c)).map(|c| usize::from(c - b'0'))
+            else {
+                continue;
+            };
+            if !matches!(b.get(tag + 3), Some(b'>' | b' ')) {
+                continue;
+            }
+            let open_end = tag + html[tag..].find('>').unwrap() + 1;
+            let close = open_end + html[open_end..].find(&format!("</h{level}>")).unwrap();
+            // The text without the anchor and any other tag.
+            let mut title = String::new();
+            let mut in_tag = false;
+            for c in html[open_end..close].chars() {
+                match c {
+                    '<' => in_tag = true,
+                    '>' => in_tag = false,
+                    c if !in_tag => title.push(c),
+                    _ => {}
+                }
+            }
+            out.push((level, title.replace("&amp;", "&")));
+            at = close;
+        }
+        out
+    }
+
+    /// Checks that the outline lists the headings the preview shows, and returns them.
+    fn outline_as_preview(t: &str) -> Vec<String> {
+        let outline: Vec<_> = headings(&w(t)).into_iter().map(|h| (h.level, h.title)).collect();
+        assert_eq!(outline, preview_headings(t), "outline and preview disagree on {t:?}");
+        outline.into_iter().map(|(_, title)| title).collect()
+    }
+
+    #[test]
+    fn headings_follow_fences_inside_list_items() {
+        // The closing ``` used to open a fence and hide every heading after it.
+        assert_eq!(outline_as_preview("- ```\r  # not\r  ```\r# yes"), ["yes"]);
+        // An item ends at a line indented less than its content, and so does its fence.
+        assert_eq!(outline_as_preview("- ```\r  # not\r# yes"), ["yes"]);
+        assert_eq!(outline_as_preview("1. ```\r   # not\r   ```\r\r   # in item\r# yes"), ["in item", "yes"]);
+        // Nested items, and a blank line inside the fence.
+        assert_eq!(outline_as_preview("- a\r  - ~~~\r\r    # not\r    ~~~\r  # in a\r# yes"), ["in a", "yes"]);
+        // A heading inside an item is one in the preview too.
+        assert_eq!(outline_as_preview("- # a\r* ## b\r10) ### c"), ["a", "b", "c"]);
+        // Not list items: a thematic break, a marker without a space, too many digits.
+        assert_eq!(outline_as_preview("- - -\r  # yes"), ["yes"]);
+        assert_eq!(outline_as_preview("-# a\r1234567890. # b\r# yes"), ["yes"]);
+        // Five spaces after the marker make the content indented code.
+        assert_eq!(outline_as_preview("-     # not\r# yes"), ["yes"]);
+    }
+
+    #[test]
+    fn headings_skip_raw_html_blocks() {
+        assert_eq!(outline_as_preview("<pre>\r# not\r</pre>\r\r# yes"), ["yes"]);
+        // A fence inside the block is HTML text too, and does not hide what follows.
+        assert_eq!(outline_as_preview("<PRE class=x>\r```\r</pre>\r# yes"), ["yes"]);
+        // Any of the four end tags ends it, on the opening line as well.
+        assert_eq!(outline_as_preview("<script>\r# not\r</style>\r# yes"), ["yes"]);
+        assert_eq!(outline_as_preview("<textarea>x</textarea>\r# yes"), ["yes"]);
+        assert_eq!(outline_as_preview("<style\r# not\r</STYLE>\r# yes"), ["yes"]);
+        // <prex> is not type 1; a type-1 block inside a list item ends with the item.
+        assert_eq!(outline_as_preview("<prex>\r\r# yes"), ["yes"]);
+        assert_eq!(outline_as_preview("- <pre>\r  # not\r# yes"), ["yes"]);
+    }
+
+    #[test]
+    fn existing_heading_tests_match_the_preview() {
+        for t in [
+            "# 一\rtext\r  ### 三 ##\r####### seven\r#nospace\r##",
+            "# C#\r## #",
+            "```\r# not\r```\r~~~~\r# not\r~~~\r# not\r~~~~\r# yes",
+            "```\r```js\r# not\r```  \r# yes",
+            "```a```\r# yes",
+            "~~~a~\r# not",
+            "#\tTitle\r##\tA\t##",
+        ] {
+            outline_as_preview(t);
+        }
+    }
+
+    #[test]
+    fn headings_can_disagree_with_the_preview_where_documented() {
+        // Not followed, as `headings` says: block quotes, and an item continued after a
+        // lazy line. The outline leaves these out where the preview shows a heading.
+        assert_eq!(heading_list("> # quoted"), vec![]);
+        assert_eq!(preview_headings("> # quoted"), [(1, "quoted".to_string())]);
+        assert_eq!(heading_list("1. a\rb\r    # c"), vec![]);
+        assert_eq!(preview_headings("1. a\rb\r    # c"), [(1, "c".to_string())]);
     }
 
     #[test]
