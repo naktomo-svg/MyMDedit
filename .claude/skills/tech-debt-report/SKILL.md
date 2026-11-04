@@ -11,6 +11,8 @@ Generate an AI tech-debt report (makes real `claude` API calls; defaults to Opus
 pwsh ./scripts/Analyze-TechDebt.ps1 [-DryRun] [-Fresh] [-SkipClippy] [-ReviewModel opus] [-ReviewEffort high] [-MetaModel opus] [-MetaEffort medium]
 ```
 
+Run it with `pwsh` (PowerShell 7): the script is BOM-less UTF-8 with Japanese prompts, which Windows PowerShell 5.1 cannot parse. The console code page does not matter — the script switches `[Console]::OutputEncoding` and `$OutputEncoding` to UTF-8 around each `claude`/`cargo` call (`Invoke-WithUtf8Console`) and restores them afterwards; a new native call added to the script must go through it too, or a shift_jis console garbles its output (an unwrapped `claude` call once broke `ConvertFrom-Json`).
+
 Two independent sources feed the report:
 
 - **AI review** — the Rust sources, `Cargo.toml` and `res/` (excluding `target/`), sent in batches to `claude --print`.
