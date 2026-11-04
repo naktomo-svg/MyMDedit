@@ -10,7 +10,7 @@ use std::ffi::c_void;
 use std::sync::OnceLock;
 
 use windows::Win32::Foundation::{COLORREF, ERROR_FILE_NOT_FOUND, HWND, LPARAM, LRESULT, RECT, WPARAM};
-use windows::Win32::Graphics::Dwm::{DWMWA_USE_IMMERSIVE_DARK_MODE, DwmSetWindowAttribute};
+use windows::Win32::Graphics::Dwm::{DWMWA_USE_IMMERSIVE_DARK_MODE, DWMWINDOWATTRIBUTE, DwmSetWindowAttribute};
 use windows::Win32::Graphics::Gdi::{
     CreateSolidBrush, DT_CENTER, DT_HIDEPREFIX, DT_SINGLELINE, DT_VCENTER, DeleteObject, DrawTextW, FillRect,
     GetWindowDC, HDC, HFONT, HGDIOBJ, MapWindowPoints, ReleaseDC, SelectObject, SetBkMode, SetTextColor, TRANSPARENT,
@@ -128,9 +128,27 @@ fn app_mode_api(build: u32) -> AppModeApi {
     }
 }
 
+/// The `DwmSetWindowAttribute` attribute that darkens the title bar on a given build, or
+/// `None` before 1809 (17763), which has none. Insider build 18985 renumbered it from the
+/// undocumented 19 to 20 (`DWMWA_USE_IMMERSIVE_DARK_MODE`, the first release with it 20H1, 19041);
+/// 1809 to 1909 (17763 to 18363) only know 19 and fail on 20.
+fn title_bar_dark_attribute(build: u32) -> Option<DWMWINDOWATTRIBUTE> {
+    match build {
+        18985.. => Some(DWMWA_USE_IMMERSIVE_DARK_MODE),
+        17763.. => Some(DWMWINDOWATTRIBUTE(19)),
+        _ => None,
+    }
+}
+
+/// The Windows build number, read once for the process.
+fn windows_build() -> Option<u32> {
+    static BUILD: OnceLock<Option<u32>> = OnceLock::new();
+    *BUILD.get_or_init(read_windows_build)
+}
+
 /// The Windows build number, from the registry (GetVersionEx's answer depends on the
 /// manifest, and RtlGetVersion would need ntdll bindings for one number).
-fn windows_build() -> Option<u32> {
+fn read_windows_build() -> Option<u32> {
     let mut buf = [0u16; 32];
     let mut size = size_of_val(&buf) as u32;
     let r = unsafe {
@@ -152,23 +170,39 @@ fn windows_build() -> Option<u32> {
     String::from_utf16_lossy(&buf[..len]).parse().ok()
 }
 
+/// Ordinal 135, typed as what it is on the running build. The C++ declarations (as
+/// reverse-engineered in ysc3839/win32-darkmode's `DarkMode.h`, which Notepad++ and others
+/// follow) are `PreferredAppMode SetPreferredAppMode(PreferredAppMode)` (an `int`-sized
+/// enum) and `bool AllowDarkModeForApp(bool)` (a one-byte C++ `bool`, which is Rust's
+/// `bool` on the same ABI — not the four-byte Win32 `BOOL`).
+#[derive(Clone, Copy)]
+enum AppModeFn {
+    /// 1903 and later: SetPreferredAppMode(AppMode) -> previous AppMode.
+    PreferredAppMode(SetPreferredAppModeFn),
+    /// 1809: AllowDarkModeForApp(bool) -> bool.
+    AllowDarkModeForApp(AllowDarkModeForAppFn),
+}
+
+type SetPreferredAppModeFn = unsafe extern "system" fn(i32) -> i32;
+type AllowDarkModeForAppFn = unsafe extern "system" fn(bool) -> bool;
+type ProcAddress = unsafe extern "system" fn() -> isize;
+
 /// uxtheme's dark-mode ordinals, resolved once for the process — only on builds where
 /// they are known to be the functions they are called as.
 struct DarkModeApi {
-    app_mode: AppModeApi,
-    /// 135: SetPreferredAppMode or AllowDarkModeForApp, as `app_mode` says.
-    set_app_mode: Option<unsafe extern "system" fn(i32) -> i32>,
-    /// 136: FlushMenuThemes().
+    /// 135: SetPreferredAppMode or AllowDarkModeForApp, as the build says.
+    set_app_mode: Option<AppModeFn>,
+    /// 136: void FlushMenuThemes().
     flush_menu_themes: Option<unsafe extern "system" fn()>,
-    /// 133: AllowDarkModeForWindow(HWND, BOOL).
-    allow_for_window: Option<unsafe extern "system" fn(HWND, BOOL) -> BOOL>,
+    /// 133: bool AllowDarkModeForWindow(HWND, bool), C++ `bool` both ways.
+    allow_for_window: Option<unsafe extern "system" fn(HWND, bool) -> bool>,
 }
 
 fn dark_mode_api() -> &'static DarkModeApi {
     static API: OnceLock<DarkModeApi> = OnceLock::new();
     API.get_or_init(|| {
         let app_mode = windows_build().map_or(AppModeApi::None, app_mode_api);
-        let none = DarkModeApi { app_mode, set_app_mode: None, flush_menu_themes: None, allow_for_window: None };
+        let none = DarkModeApi { set_app_mode: None, flush_menu_themes: None, allow_for_window: None };
         if app_mode == AppModeApi::None {
             crate::log::error("dark_mode_api", "unknown Windows build; menus and scrollbars stay light");
             return none;
@@ -188,12 +222,23 @@ fn dark_mode_api() -> &'static DarkModeApi {
             }
             f
         };
-        // SAFETY: on the builds `app_mode_api` admits, these ordinals have exactly these
-        // signatures (both meanings of 135 take one 32-bit argument and return one).
+        // SAFETY: on the builds `app_mode_api` admits, each ordinal is transmuted to its own
+        // signature on that build (see `AppModeFn` and the fields of `DarkModeApi`): 135 is
+        // `int SetPreferredAppMode(int)` from 1903 and `bool AllowDarkModeForApp(bool)` in
+        // 1809; 133 is `bool AllowDarkModeForWindow(HWND, bool)` and 136 is
+        // `void FlushMenuThemes()` on both.
         unsafe {
             DarkModeApi {
-                app_mode,
-                set_app_mode: ordinal(135).map(|f| std::mem::transmute(f)),
+                set_app_mode: ordinal(135).and_then(|f| match app_mode {
+                    AppModeApi::PreferredAppMode => {
+                        Some(AppModeFn::PreferredAppMode(std::mem::transmute::<ProcAddress, SetPreferredAppModeFn>(f)))
+                    }
+                    AppModeApi::AllowDarkModeForApp => Some(AppModeFn::AllowDarkModeForApp(std::mem::transmute::<
+                        ProcAddress,
+                        AllowDarkModeForAppFn,
+                    >(f))),
+                    AppModeApi::None => None,
+                }),
                 flush_menu_themes: ordinal(136).map(|f| std::mem::transmute(f)),
                 allow_for_window: ordinal(133).map(|f| std::mem::transmute(f)),
             }
@@ -205,12 +250,15 @@ fn dark_mode_api() -> &'static DarkModeApi {
 pub fn set_app_dark_mode(dark: bool) {
     let api = dark_mode_api();
     unsafe {
-        if let Some(set) = api.set_app_mode {
-            match api.app_mode {
-                AppModeApi::PreferredAppMode => set(if dark { 2 } else { 3 }),
-                AppModeApi::AllowDarkModeForApp => set(dark.into()),
-                AppModeApi::None => 0,
-            };
+        // Both return the previous state, which nothing here needs.
+        match api.set_app_mode {
+            Some(AppModeFn::PreferredAppMode(set)) => {
+                set(if dark { 2 } else { 3 });
+            }
+            Some(AppModeFn::AllowDarkModeForApp(allow)) => {
+                allow(dark);
+            }
+            None => {}
         }
         if let Some(flush) = api.flush_menu_themes {
             flush();
@@ -221,19 +269,18 @@ pub fn set_app_dark_mode(dark: bool) {
 pub fn allow_dark_for_window(hwnd: HWND, dark: bool) {
     if let Some(allow) = dark_mode_api().allow_for_window {
         // Returns whether it applied, which the window's own theme call then shows anyway.
-        let _ = unsafe { allow(hwnd, dark.into()) };
+        let _ = unsafe { allow(hwnd, dark) };
     }
 }
 
 pub fn set_title_bar_dark(hwnd: HWND, dark: bool) {
+    // An unreadable build number tries the documented attribute, as before there was a choice.
+    let Some(attribute) = windows_build().map_or(Some(DWMWA_USE_IMMERSIVE_DARK_MODE), title_bar_dark_attribute) else {
+        return; // Before 1809 there is no dark title bar to ask for.
+    };
     let value = BOOL::from(dark);
     let r = unsafe {
-        DwmSetWindowAttribute(
-            hwnd,
-            DWMWA_USE_IMMERSIVE_DARK_MODE,
-            &value as *const BOOL as *const c_void,
-            size_of::<BOOL>() as u32,
-        )
+        DwmSetWindowAttribute(hwnd, attribute, &value as *const BOOL as *const c_void, size_of::<BOOL>() as u32)
     };
     crate::log::if_err("DwmSetWindowAttribute", r);
 }
@@ -411,5 +458,20 @@ mod tests {
         assert_eq!(app_mode_api(18361), AppModeApi::AllowDarkModeForApp);
         assert_eq!(app_mode_api(18362), AppModeApi::PreferredAppMode); // 1903
         assert_eq!(app_mode_api(26100), AppModeApi::PreferredAppMode);
+        assert_eq!(app_mode_api(26300), AppModeApi::PreferredAppMode);
+        assert_eq!(app_mode_api(u32::MAX), AppModeApi::PreferredAppMode); // no upper bound
+    }
+
+    #[test]
+    fn title_bar_attribute_follows_the_build() {
+        assert_eq!(title_bar_dark_attribute(17762), None);
+        assert_eq!(title_bar_dark_attribute(17763), Some(DWMWINDOWATTRIBUTE(19))); // 1809
+        assert_eq!(title_bar_dark_attribute(18362), Some(DWMWINDOWATTRIBUTE(19))); // 1903
+        assert_eq!(title_bar_dark_attribute(18363), Some(DWMWINDOWATTRIBUTE(19))); // 1909
+        assert_eq!(title_bar_dark_attribute(18984), Some(DWMWINDOWATTRIBUTE(19)));
+        assert_eq!(title_bar_dark_attribute(18985), Some(DWMWINDOWATTRIBUTE(20)));
+        assert_eq!(title_bar_dark_attribute(19041), Some(DWMWINDOWATTRIBUTE(20))); // 20H1
+        assert_eq!(title_bar_dark_attribute(26300), Some(DWMWA_USE_IMMERSIVE_DARK_MODE));
+        assert_eq!(title_bar_dark_attribute(u32::MAX), Some(DWMWA_USE_IMMERSIVE_DARK_MODE));
     }
 }
