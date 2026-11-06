@@ -2,7 +2,7 @@
 
 機能追加の候補です。まだ設計も着手もしていません。手間は小・中・大の目安で、着手するときに見積もり直します。
 
-「セキュリティ再点検」は、`CLAUDE.md`の「Security re-audit triggers」に当たるものです。着手したら、少なくとも`tests/security/tools/run-all.ps1`・`cargo deny check`・変更したモジュールのファズテストを実行し、結果をコミットメッセージかPRの説明に書きます。
+「セキュリティ再点検」は、`AGENTS.md`の「Security re-audit triggers」に当たるものです。着手したら、少なくとも`tests/security/tools/run-all.ps1`・`cargo deny check`・変更したモジュールのファズテストを実行し、結果をコミットメッセージかPRの説明に書きます。
 
 記録日: 2026-10-30(6〜8と「余裕があれば」の一部は 2026-11-02 に追記。GitHub の Markdown エディタ(Issue・PR のコメント欄)と GitHub Docs の記述を比べて、取り入れる価値があるものを選びました)
 

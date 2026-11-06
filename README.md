@@ -65,7 +65,7 @@ pwsh ./scripts/Analyze-TechDebt.ps1 -DryRun   # 対象ファイルの分け方�
 pwsh ./scripts/Analyze-TechDebt.ps1           # 実行（Opusを使うためAPI費用がかかります。中断しても再実行で続きから再開）
 ```
 
-レポートの指摘に対応するときの手順は`.claude/skills/`（verify-then-fix → why5-and-horizontal-check）と`CLAUDE.md`にまとめてあります。
+レポートの指摘に対応するときの手順は`.claude/skills/`（verify-then-fix → why5-and-horizontal-check）と`AGENTS.md`にまとめてあります。
 
 ## 保存場所
 

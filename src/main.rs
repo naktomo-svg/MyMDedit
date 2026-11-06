@@ -303,7 +303,8 @@ mod tests {
     #[test]
     fn sources_hold_no_stray_control_characters() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        let mut files = vec![root.join("build.rs"), root.join("CLAUDE.md"), root.join("README.md")];
+        let mut files =
+            vec![root.join("build.rs"), root.join("AGENTS.md"), root.join("CLAUDE.md"), root.join("README.md")];
         for dir in ["src", "docs", "fuzz/src", "fuzz/fuzz_targets"] {
             for entry in std::fs::read_dir(root.join(dir)).unwrap() {
                 let path = entry.unwrap().path();
