@@ -12,7 +12,7 @@ Findings from AI-generated tech-debt reports, code reviews and lints are false-p
 ## Verification steps
 
 1. Read the exact file:line the finding cites (`Read`/`Grep`) — confirm the described behavior exists in the code today, not just in the finding's prose. Line numbers drift between the report's commit and now; locate the code by content if the line no longer matches.
-2. Reproduce it: run the test command from CLAUDE.md's Commands section if a test covers this path, or write the smallest failing unit test when the code is a pure function (`md_ops`, `search`, `document`, `line_endings`, `settings`, `render`). Code that only exists behind Win32/WebView2 calls has no test harness — trace the logic by hand or do a manual QA step with the app.
+2. Reproduce it: run the test command from AGENTS.md's Commands section if a test covers this path, or write the smallest failing unit test when the code is a pure function (`md_ops`, `search`, `document`, `line_endings`, `settings`, `render`). Code that only exists behind Win32/WebView2 calls has no test harness — trace the logic by hand or do a manual QA step with the app.
 3. Check `git log -p` / `git blame` on the cited lines — the finding may already be fixed by a commit later than whatever the report was generated against (the report header records its source SHA).
 4. Classify the finding using exactly one of:
    - ✅ 本物 (confirmed real, as described)

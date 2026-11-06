@@ -4,7 +4,7 @@
 
 ## Commands
 
-チームが使ってよい検証コマンドと合格の基準は、CLAUDE.md の「Commands」節と、その直後の検証の基準(build / test / clippy / fmt --check)だけです。ここには書き写しません(ツールの状態を書くのは CLAUDE.md の一か所だけ、という規則のため)。
+チームが使ってよい検証コマンドと合格の基準は、AGENTS.md の「Commands」節と、その直後の検証の基準(build / test / clippy / fmt --check)だけです。ここには書き写しません(ツールの状態を書くのは AGENTS.md の一か所だけ、という規則のため)。
 
 - 各 worktree は自分の `target\` を持つため、初回のビルドは時間がかかります。
 - `cargo` が見つからないときは、`%USERPROFILE%\.cargo\bin` を PATH の先頭に足します。
@@ -12,7 +12,7 @@
 
 ## セキュリティ再監査
 
-条件と最低限のコマンドは、CLAUDE.md の「Development workflow」節にある Security re-audit triggers に従います。
+条件と最低限のコマンドは、AGENTS.md の「Development workflow」節にある Security re-audit triggers に従います。
 - 条件: `webview2-com` や `comrak` の更新、`preview.rs` のハンドラや設定の変更、内容やパスがアプリに入る新しい経路、WebView2 Runtime の大きな更新。
 - 実行するもの: `run-all.ps1`(debug ビルド、約5分。`run_in_background` で回してよい)、`cargo deny check`、変更したモジュールに対応する fuzz ターゲット。
 - 結果はコミットメッセージか PR の説明に残します。
@@ -57,4 +57,4 @@
 ### 記録(共有メモリ)
 - `.claude/team/tasks/<タスクID>.md`: タスクカード、実装報告、レビュー結果、人の判断。書くのは統括役だけ。
 - `.claude/team/board.md`: タスクの一覧と状態(受付 / 実装中 / レビュー中 / 承認待ち / PR / 完了 / 中断)。書くのは統括役だけ。
-- 繰り返し役立つ学び(例: このリポジトリで誤検知しやすいパターン)は、人に確認してから CLAUDE.md かスキルに足す。
+- 繰り返し役立つ学び(例: このリポジトリで誤検知しやすいパターン)は、人に確認してから AGENTS.md(Claude Code だけに関わるものは CLAUDE.md)かスキルに足す。

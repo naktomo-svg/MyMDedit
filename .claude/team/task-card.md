@@ -17,7 +17,7 @@
 - 触らない: <あれば>
 
 ## 検証コマンド
-CLAUDE.md の Commands の build / test / lint / format(+ 必要なら security)
+AGENTS.md の Commands の build / test / lint / format(+ 必要なら security)
 
 ## セキュリティ再監査
 <必要(該当する条件)/ 不要(理由)>
